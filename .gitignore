@@ -1,0 +1,27 @@
+# Data is never committed (submitted once as a Hugging Face dataset)
+data/
+*.tar.gz
+*.parquet
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Jupyter Book build output
+book/_build/
+
+# Secrets / local config
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
