@@ -45,6 +45,24 @@ def test_load_member_range_requires_values(tmp_path):
     assert config.load_member_range("m1", path).count() == 5
 
 
+def test_load_env_file_strips_spaces_and_quotes(tmp_path, monkeypatch):
+    monkeypatch.delenv("S2_API_KEY", raising=False)
+    monkeypatch.delenv("ARXIV_MEMBER", raising=False)
+    env = tmp_path / ".env"
+    env.write_text('S2_API_KEY = "s2k-test"\nexport ARXIV_MEMBER=member5\n', encoding="utf-8")
+    config.load_env_file(env)
+    assert config.os.environ["S2_API_KEY"] == "s2k-test"
+    assert config.os.environ["ARXIV_MEMBER"] == "member5"
+
+
+def test_load_env_file_does_not_override_existing(tmp_path, monkeypatch):
+    monkeypatch.setenv("S2_API_KEY", "from-shell")
+    env = tmp_path / ".env"
+    env.write_text("S2_API_KEY=from-file\n", encoding="utf-8")
+    config.load_env_file(env)
+    assert config.os.environ["S2_API_KEY"] == "from-shell"
+
+
 def test_jsonl_roundtrip_and_resume(tmp_path):
     path = tmp_path / "papers.jsonl"
     utils.append_jsonl(path, {"arxiv_id": "2504_00001", "title": "Tiếng Việt\nxuống dòng"})
