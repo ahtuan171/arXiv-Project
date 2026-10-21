@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 import logging
 from dataclasses import dataclass
@@ -33,27 +32,41 @@ class S2Client:
 
     def __init__(
         self,
-        api_key: str = "",
+        api_key: Optional[str] = None,
         min_interval: float = config.S2_MIN_INTERVAL,
         timeout: int = config.REQUEST_TIMEOUT,
     ):
-        self.api_key = api_key or os.environ.get("S2_API_KEY", "")
+        self.api_key = config.S2_API_KEY if api_key is None else api_key
         self.rate_limiter = RateLimiter(min_interval)
         self.timeout = timeout
         self.session = requests.Session()
         if self.api_key:
             self.session.headers["x-api-key"] = self.api_key
+        else:
+            logger.warning(
+                "S2_API_KEY is not set; Semantic Scholar applies the strict "
+                "unauthenticated rate limit (HTTP 429). Put it in .env or export it."
+            )
 
     def _get(self, endpoint: str, params: dict) -> dict:
         url = f"{self.BASE_URL}{endpoint}"
         self.rate_limiter.wait()
         resp = self.session.get(url, params=params, timeout=self.timeout)
         if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", "60"))
-            logger.warning("Rate limited, waiting %ds", retry_after)
-            time.sleep(retry_after)
-            self.rate_limiter.wait()
-            resp = self.session.get(url, params=params, timeout=self.timeout)
+            retry_after = resp.headers.get("Retry-After")
+            if self.api_key:
+                logger.warning("Rate limited by Semantic Scholar (Retry-After=%s)", retry_after)
+            else:
+                logger.warning(
+                    "Rate limited with no API key; set S2_API_KEY to raise the limit"
+                )
+            if retry_after:
+                try:
+                    time.sleep(float(retry_after))
+                except (TypeError, ValueError):
+                    pass
+                self.rate_limiter.wait()
+                resp = self.session.get(url, params=params, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 
