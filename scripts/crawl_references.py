@@ -46,6 +46,11 @@ def main() -> int:
     logger.info("Member %s: %d paper IDs to process", member, total_ids)
 
     s2 = S2Client()
+    logger.info(
+        "S2 auth: %s; pacing: %.1fs/request",
+        "API key" if s2.api_key else "NO API KEY",
+        config.S2_MIN_INTERVAL,
+    )
     done_ids = load_done_ids(REFERENCES_PATH, key="arxiv_id")
     logger.info("Already done: %d papers", len(done_ids))
 
