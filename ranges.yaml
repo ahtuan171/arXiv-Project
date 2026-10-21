@@ -8,37 +8,37 @@ month_sizes: {}
 
 members:
   member1:
-    name: ""
+    name: "Anh Pham"
     student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    start_month: "2025-01"
+    start_id: 07642
+    end_month: "2025-01"
+    end_id: 12641
   member2:
-    name: ""
+    name: "Phạm Xuân Duy"
     student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    start_month: "2024-12"
+    start_id: 13848
+    end_month: "2024-12"
+    end_id: 18847
   member3:
-    name: ""
+    name: "Ah Tuân"
     student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    start_month: "2025-01"
+    start_id: 17642
+    end_month: "2025-02"
+    end_id: 03234
   member4:
-    name: ""
+    name: "Toàn Lý"
     student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    start_month: "2025-02"
+    start_id: 13235
+    end_month: "2025-02"
+    end_id: 18234
   member5:
-    name: ""
-    student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    name: "Duy Hao"
+    student_id: "24120306"
+    start_month: "2024-12"
+    start_id: 03848
+    end_month: "2024-12"
+    end_id: 08847
