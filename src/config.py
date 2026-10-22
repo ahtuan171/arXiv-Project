@@ -7,6 +7,7 @@ passing the key to :func:`load_member_range`.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass
@@ -22,17 +23,85 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 LOG_DIR = ROOT_DIR / "logs"
 RANGES_FILE = ROOT_DIR / "ranges.yaml"
+ENV_FILE = ROOT_DIR / ".env"
+SCHEMA_VERSION = 2
+
+
+def load_env_file(path: Path = ENV_FILE) -> None:
+    """Load simple ``KEY=VALUE`` pairs from ``.env`` without overriding the shell.
+
+    The project only needs a tiny subset of dotenv syntax, so this avoids an
+    extra dependency. Existing environment variables always win.
+    """
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_env_file()
 
 # --- Network politeness ----------------------------------------------------
 # arXiv requires at least 3 seconds between requests.
 ARXIV_MIN_INTERVAL = 3.0
-# Semantic Scholar has its own (stricter) limit; conservative default.
-S2_MIN_INTERVAL = 1.0
-S2_API_KEY = os.environ.get("S2_API_KEY", "")
+# The website JSON endpoints tolerate a few requests/second, but be polite
+# enough to avoid WAF challenges. All tabs share one limiter.
+try:
+    S2_WEB_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_WEB_MIN_INTERVAL", "3.0")))
+except ValueError:
+    S2_WEB_MIN_INTERVAL = 3.0
+S2_RATE_LIMIT_COOLDOWN = 2.0  # shared pause after any 429 response
+S2_WAF_COOLDOWN = 30.0  # longer pause after an AWS WAF challenge
+S2_PAGE_SIZE = 1000
+S2_BATCH_SIZE = 100
+S2_MAX_OFFSET = 10_000
+try:
+    S2_TABS = max(1, int(os.environ.get("S2_TABS", "3")))
+except ValueError:
+    S2_TABS = 3
+S2_HEADLESS = os.environ.get("S2_HEADLESS", "1").strip().lower() not in ("0", "false", "no")
+
+# --- Semantic Scholar official Graph API -----------------------------------
+S2_API_KEY = os.environ.get("S2_API_KEY", "").strip()
+S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
+# The keyed allowance is 100 requests / 5 minutes. Stay at 1 req/s by default.
+try:
+    S2_API_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_API_MIN_INTERVAL", "1.0")))
+except ValueError:
+    S2_API_MIN_INTERVAL = 1.0
+S2_API_MAX_RETRIES = 5
+S2_API_TIMEOUT = 30
+try:
+    S2_API_PAGE_SIZE = max(1, min(int(os.environ.get("S2_API_PAGE_SIZE", "500")), 1000))
+except ValueError:
+    S2_API_PAGE_SIZE = 500
+S2_API_BATCH_SIZE = 100
+S2_API_PAPER_FIELDS = "paperId,externalIds,title,authors,year,publicationDate"
 
 MAX_RETRIES = 5
 BACKOFF_BASE = 2.0  # seconds; wait = BACKOFF_BASE ** attempt
+MAX_BACKOFF = 60.0
+RETRY_JITTER = 0.5
+MAX_RETRY_AFTER = 120.0
 REQUEST_TIMEOUT = 60  # seconds
+
+# --- Crawl behaviour -------------------------------------------------------
+MAX_PAPER_ATTEMPTS = 3
+PROGRESS_INTERVAL_SECONDS = 30.0
+STATS_FLUSH_EVERY = 50
 
 # --- Identifiers -----------------------------------------------------------
 # Characters replaced by ID_SEPARATOR in file names / fields (see clean_arxiv_id).
@@ -99,10 +168,25 @@ class ArxivRange:
         return sum(1 for _ in self.iter_ids(month_sizes))
 
 
+class _DecimalLoader(yaml.SafeLoader):
+    """SafeLoader that keeps numbers as strings.
+
+    YAML 1.1 treats unquoted IDs such as ``07642`` as *octal* (4002). arXiv IDs
+    are decimal, so all scalars are loaded as strings and converted explicitly.
+    """
+
+
+_DecimalLoader.yaml_implicit_resolvers = copy.deepcopy(yaml.SafeLoader.yaml_implicit_resolvers)
+for _first_char, _resolvers in list(_DecimalLoader.yaml_implicit_resolvers.items()):
+    _DecimalLoader.yaml_implicit_resolvers[_first_char] = [
+        (tag, regexp) for tag, regexp in _resolvers if tag != "tag:yaml.org,2002:int"
+    ]
+
+
 def load_ranges_file(path: Path = RANGES_FILE) -> dict:
     """Load the raw content of ``ranges.yaml``."""
     with open(path, encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        return yaml.load(handle, Loader=_DecimalLoader) or {}
 
 
 def load_member_range(member: Optional[str] = None, path: Path = RANGES_FILE) -> ArxivRange:
