@@ -3,105 +3,151 @@
 
 Usage:
     export ARXIV_MEMBER=memberX
-    export S2_API_KEY=your_key
     python scripts/crawl_references.py
+
+By default the crawler uses the official Semantic Scholar Graph API and reads
+``S2_API_KEY`` from ``.env``. Pass ``--client browser`` to scrape the website
+through Chromium (install it once with ``playwright install chromium``) or
+``--client both`` to cross-check the two clients. Progress is stored in
+``data/raw/<member>/ledger.jsonl``; it is safe to stop with Ctrl-C and rerun.
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
+import os
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import config
-from src.utils import setup_logging, load_done_ids, append_jsonl
-from src.config import load_member_range, load_month_sizes
-from src.s2_client import S2Client
-from src.stats import CrawlStats, save_stats
-
-LOG_DIR = config.LOG_DIR
-RAW_DIR = config.RAW_DIR
-REFERENCES_PATH = RAW_DIR / "references.jsonl"
-LOG_PATH = LOG_DIR / "crawl_references.log"
-
-logger = setup_logging("crawl_references", LOG_PATH)
+from src.crawler import crawl_references, paths_for
+from src.utils import LockError, file_lock, setup_logging
 
 
-def main() -> int:
-    member = config.os.environ.get("ARXIV_MEMBER")
+def _parse_month_sizes(values: list[str]) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(f"Invalid --month-size {item!r}; expected YYMM=MAX_ID")
+        month, raw_size = item.split("=", 1)
+        try:
+            sizes[month.strip()] = int(raw_size)
+        except ValueError as error:
+            raise ValueError(f"Invalid --month-size {item!r}; MAX_ID must be an integer") from error
+    return sizes
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Crawl arXiv references from Semantic Scholar")
+    parser.add_argument("--member", help="Member key in ranges.yaml (default: ARXIV_MEMBER)")
+    parser.add_argument(
+        "--client",
+        choices=["api", "browser", "both"],
+        default="api",
+        help="Which Semantic Scholar client to use (default: api)",
+    )
+    parser.add_argument(
+        "--api-min-interval",
+        type=float,
+        default=None,
+        help="Minimum seconds between API requests (default: S2_API_MIN_INTERVAL)",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Process at most N pending papers")
+    parser.add_argument("--dry-run", action="store_true", help="Show progress plan without API calls")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that exhausted attempts")
+    parser.add_argument("--retry-not-found", action="store_true", help="Retry papers previously not indexed by S2")
+    parser.add_argument("--tabs", type=int, default=None, help="Concurrent browser tabs (default: S2_TABS or 3)")
+    parser.add_argument("--headed", action="store_true", help="Show the browser window (needs a display)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Log every S2 request as well as every paper")
+    parser.add_argument("--tolerate-errors", type=int, default=0, help="Exit 0 with at most N errors")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Override ARXIV_DATA_DIR")
+    parser.add_argument(
+        "--month-size",
+        action="append",
+        default=[],
+        metavar="YYMM=MAX_ID",
+        help="Fill a missing month size, e.g. --month-size 2501=24000 (repeatable)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    member = args.member or os.environ.get("ARXIV_MEMBER")
     if not member:
-        logger.error("Set ARXIV_MEMBER env var (e.g., member3)")
-        return 1
+        parser.error("Pass --member or set ARXIV_MEMBER (e.g., member3)")
 
     try:
-        month_sizes = load_month_sizes()
-        arxiv_range = load_member_range(member)
-    except Exception as e:
-        logger.error("Failed to load range for %s: %s", member, e)
-        return 1
+        paths = paths_for(member, args.data_dir)
+    except ValueError as error:
+        parser.error(str(error))
 
-    total_ids = arxiv_range.count(month_sizes)
-    logger.info("Member %s: %d paper IDs to process", member, total_ids)
-
-    s2 = S2Client()
-    logger.info(
-        "S2 auth: %s; pacing: %.1fs/request",
-        "API key" if s2.api_key else "NO API KEY",
-        config.S2_MIN_INTERVAL,
+    log = setup_logging(
+        f"crawl_references.{member}",
+        paths.log,
+        level=logging.DEBUG if args.verbose else logging.INFO,
     )
-    done_ids = load_done_ids(REFERENCES_PATH, key="arxiv_id")
-    logger.info("Already done: %d papers", len(done_ids))
+    log.info("Starting crawl for %s", member)
 
-    stats = CrawlStats()
-    started = time.monotonic()
+    try:
+        month_sizes = _parse_month_sizes(args.month_size)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.tabs is not None and args.tabs < 1:
+        parser.error("--tabs must be >= 1")
+    if args.api_min_interval is not None and args.api_min_interval < 0:
+        parser.error("--api-min-interval must be >= 0")
 
-    def persist() -> None:
-        save_stats(
-            stats,
-            member=member,
-            total_ids=total_ids,
-            already_done=len(done_ids),
-            elapsed_seconds=time.monotonic() - started,
+    def run():
+        return crawl_references(
+            member,
+            paths=paths,
+            client_type=args.client,
+            api_min_interval=args.api_min_interval,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            retry_errors=args.retry_errors,
+            retry_not_found=args.retry_not_found,
+            month_sizes=month_sizes or None,
+            log=log,
+            tabs=args.tabs or config.S2_TABS,
+            headless=not args.headed,
         )
 
     try:
-        for arxiv_id in arxiv_range.iter_ids(month_sizes):
-            if arxiv_id in done_ids:
-                continue
+        if args.dry_run:
+            result = run()
+        else:
+            with file_lock(paths.ledger.with_name(".crawler.lock")):
+                result = run()
+    except LockError as error:
+        log.error("%s", error)
+        return 1
+    except KeyboardInterrupt:
+        log.warning("Interrupted; progress has been saved, rerun to resume")
+        return 130
+    except Exception:
+        log.exception("Fatal error while crawling %s", member)
+        return 1
 
-            try:
-                refs = s2.get_references(arxiv_id)
-                for ref in refs:
-                    if ref.arxiv_id:
-                        record = {
-                            "arxiv_id": arxiv_id,
-                            "ref_arxiv_id": ref.arxiv_id,
-                            "ref_title": ref.title,
-                            "ref_authors": ref.authors,
-                            "ref_submission_date": ref.publication_date or "",
-                            "ref_s2_id": ref.paper_id,
-                        }
-                        append_jsonl(REFERENCES_PATH, record)
-                stats.add_paper(refs)
-            except Exception as e:
-                stats.add_error()
-                logger.error("Failed to process %s: %s", arxiv_id, e)
+    if result.fatal:
+        log.error("Crawl aborted for %s; see the error above", member)
+        return 1
+    if result.dry_run:
+        return 0
+    if result.stats.errors > args.tolerate_errors:
+        log.error(
+            "Finished with %d errors (tolerance %d); rerun to retry",
+            result.stats.errors, args.tolerate_errors,
+        )
+        return 2
 
-            if stats.processed % 50 == 0:
-                persist()
-                logger.info(
-                    "Progress: processed=%d, refs_found=%d, refs_with_arxiv=%d, errors=%d",
-                    stats.processed, stats.refs_found, stats.refs_with_arxiv, stats.errors
-                )
-    finally:
-        persist()
-
-    logger.info(
-        "DONE: processed=%d, refs_found=%d, refs_with_arxiv=%d, errors=%d",
-        stats.processed, stats.refs_found, stats.refs_with_arxiv, stats.errors
-    )
+    log.info("Finished %s successfully", member)
     return 0
 
 
