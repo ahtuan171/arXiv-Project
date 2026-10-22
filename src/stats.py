@@ -28,7 +28,22 @@ def stats_paths(member: str) -> tuple[Path, Path]:
 
 @dataclass
 class CrawlStats:
-    """Counters collected while crawling references of arXiv papers."""
+    """Counters collected while crawling references of arXiv papers.
+
+    Metric semantics (Problem C1):
+    - ``raw_refs_received``: reference entries returned by the API before any
+      filtering, across all pagination pages.  Does not double-count retries.
+    - ``refs_with_paper_id``: entries with a usable Semantic Scholar paper ID.
+    - ``refs_found``: deduplicated references passed to the crawler (legacy name
+      retained for backward compatibility; equals len(refs) in add_paper).
+    - ``refs_with_arxiv`` / ``refs_with_arxiv_id``: references mapped to a valid
+      arXiv ID.  The property ``refs_with_arxiv_id`` is a read-only alias.
+    - ``refs_unresolved``: entries that cannot be resolved to any target identifier.
+    - ``refs_written`` / ``edges_written``: valid reference edges actually persisted.
+      The property ``edges_written`` is a read-only alias.
+    - ``fallback_requests``: number of batch-metadata fallback requests made.
+    - ``partial``: number of papers whose crawl succeeded but had unresolved references.
+    """
 
     processed: int = 0
     refs_found: int = 0
@@ -41,8 +56,34 @@ class CrawlStats:
     api_calls: int = 0
     browser_calls: int = 0
     rate_limited: int = 0
+    # --- New granular metrics (Problem C1) ---
+    raw_refs_received: int = 0
+    refs_with_paper_id: int = 0
+    refs_unresolved: int = 0
+    fallback_requests: int = 0
+    partial: int = 0
 
-    def add_paper(self, refs: Iterable[Any], written: Optional[int] = None) -> None:
+    @property
+    def edges_written(self) -> int:
+        """Alias for ``refs_written`` — valid edges actually persisted."""
+        return self.refs_written
+
+    @property
+    def refs_with_arxiv_id(self) -> int:
+        """Alias for ``refs_with_arxiv`` — references mapped to a valid arXiv ID."""
+        return self.refs_with_arxiv
+
+    def add_paper(
+        self,
+        refs: Iterable[Any],
+        written: Optional[int] = None,
+        *,
+        raw_refs_received: int = 0,
+        refs_with_paper_id: int = 0,
+        refs_unresolved: int = 0,
+        fallback_requests: int = 0,
+        is_partial: bool = False,
+    ) -> None:
         """Record one successfully processed paper and its references."""
         refs = list(refs)
         with_arxiv = sum(1 for ref in refs if getattr(ref, "arxiv_id", None))
@@ -50,6 +91,12 @@ class CrawlStats:
         self.refs_found += len(refs)
         self.refs_with_arxiv += with_arxiv
         self.refs_written += with_arxiv if written is None else written
+        self.raw_refs_received += raw_refs_received
+        self.refs_with_paper_id += refs_with_paper_id
+        self.refs_unresolved += refs_unresolved
+        self.fallback_requests += fallback_requests
+        if is_partial:
+            self.partial += 1
 
     def add_error(self) -> None:
         """Record one paper whose crawl failed after retries."""
@@ -122,10 +169,18 @@ def build_report(
         f"| Số cạnh mới đã ghi | {stats.refs_written:,} |",
         f"| Số lỗi | {stats.errors:,} |",
     ]
+    if stats.raw_refs_received or stats.refs_unresolved or stats.partial:
+        lines += [
+            f"| Tổng raw API refs | {stats.raw_refs_received:,} |",
+            f"| Refs có paperId | {stats.refs_with_paper_id:,} |",
+            f"| Refs không xác định | {stats.refs_unresolved:,} |",
+            f"| Paper partial | {stats.partial:,} |",
+        ]
     if stats.client_type:
         lines += [
             f"| API calls | {stats.api_calls:,} |",
             f"| Browser calls | {stats.browser_calls:,} |",
+            f"| Fallback requests | {stats.fallback_requests:,} |",
             f"| Số lần bị rate limit | {stats.rate_limited:,} |",
         ]
     lines.append("")
