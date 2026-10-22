@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src import config
-from src.s2_api_client import S2ApiAuthError, S2ApiClient, S2ApiRateLimited
+from src.s2_api_client import S2ApiAuthError, S2ApiClient, S2ApiRateLimited, ReferenceResult
 from src.s2_client import S2AuthError, S2BrowserClient, S2Error, S2NotFound, S2Paper
 from src.stats import CrawlStats, format_duration, save_stats, stats_paths
 from src.utils import (
     append_jsonl,
     append_jsonl_many,
     canonical_arxiv_id,
+    is_valid_arxiv_id,
     load_latest_records,
     normalize_arxiv_id,
     read_jsonl,
@@ -204,7 +205,7 @@ def build_reference_record(
 ) -> Optional[dict]:
     """Build one output record, or ``None`` when the reference has no arXiv ID."""
     ref_id = normalize_arxiv_id(ref.arxiv_id)
-    if not ref_id:
+    if not ref_id or not is_valid_arxiv_id(ref_id):
         return None
     return {
         "schema_version": config.SCHEMA_VERSION,
@@ -302,12 +303,21 @@ def _attempts(record: Optional[dict]) -> int:
         return 0
 
 
-def _is_done(record: Optional[dict], *, retry_errors: bool, retry_not_found: bool) -> bool:
+def _is_done(
+    record: Optional[dict],
+    *,
+    retry_errors: bool,
+    retry_not_found: bool,
+    retry_partial: bool = False,
+) -> bool:
     if not record:
         return False
     status = record.get("status")
     if status == "ok":
         return True
+    if status == "partial":
+        # Problem D1: partial papers are done unless --retry-partial is given.
+        return not retry_partial
     if status == "not_found":
         return not retry_not_found
     if status == "error":
@@ -326,8 +336,21 @@ def _ledger_entry(
     refs_total: int = 0,
     refs_with_arxiv: int = 0,
     refs_written: int = 0,
+    raw_refs_received: int = 0,
+    refs_with_paper_id: int = 0,
+    refs_unresolved: int = 0,
+    fallback_requests: int = 0,
+    completeness: str = "",
     error: str = "",
 ) -> dict:
+    """Build one ledger record.
+
+    Problem D1 statuses:
+    - ``ok``: crawl succeeded, all reference metadata resolved.
+    - ``partial``: crawl succeeded, some references unresolved.
+    - ``not_found``: S2 does not index the paper.
+    - ``error``: transport/API failure.
+    """
     return {
         "schema_version": config.SCHEMA_VERSION,
         "arxiv_id": canonical_arxiv_id(arxiv_id),
@@ -337,6 +360,11 @@ def _ledger_entry(
         "refs_total": refs_total,
         "refs_with_arxiv": refs_with_arxiv,
         "refs_written": refs_written,
+        "raw_refs_received": raw_refs_received,
+        "refs_with_paper_id": refs_with_paper_id,
+        "refs_unresolved": refs_unresolved,
+        "fallback_requests": fallback_requests,
+        "completeness": completeness,
         "error": error[:500],
         "crawled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -355,6 +383,7 @@ def crawl_references(
     dry_run: bool = False,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    retry_partial: bool = False,
     month_sizes: Optional[dict[str, int]] = None,
     log: Optional[logging.Logger] = None,
     tabs: int = config.S2_TABS,
@@ -383,6 +412,7 @@ def crawl_references(
             dry_run=dry_run,
             retry_errors=retry_errors,
             retry_not_found=retry_not_found,
+            retry_partial=retry_partial,
             month_sizes=month_sizes,
             log=log,
             tabs=tabs,
@@ -404,6 +434,7 @@ async def crawl_references_async(
     dry_run: bool = False,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    retry_partial: bool = False,
     month_sizes: Optional[dict[str, int]] = None,
     log: Optional[logging.Logger] = None,
     tabs: int = config.S2_TABS,
@@ -444,7 +475,12 @@ async def crawl_references_async(
     pending: list[str] = []
     for arxiv_id in arxiv_range.iter_ids(sizes):
         record = ledger.get(canonical_arxiv_id(arxiv_id))
-        if _is_done(record, retry_errors=retry_errors, retry_not_found=retry_not_found):
+        if _is_done(
+            record,
+            retry_errors=retry_errors,
+            retry_not_found=retry_not_found,
+            retry_partial=retry_partial,
+        ):
             stats.add_skipped()
         else:
             pending.append(arxiv_id)
@@ -656,21 +692,50 @@ async def crawl_references_async(
             append_jsonl_many(paths.references, new_records, fsync=True)
             pairs.update(seen)
 
+            # Problem C1/D1: extract per-paper metrics from ReferenceResult
+            per_paper_raw = 0
+            per_paper_with_pid = 0
+            per_paper_unresolved = 0
+            per_paper_fallback = 0
+            if isinstance(refs, ReferenceResult):
+                per_paper_raw = refs.raw_refs_received
+                per_paper_with_pid = refs.refs_with_paper_id
+                per_paper_unresolved = refs.refs_unresolved
+                per_paper_fallback = refs.fallback_requests
+
+            is_partial = per_paper_unresolved > 0
+            paper_status = "partial" if is_partial else "ok"
+            completeness = "partial" if is_partial else "complete"
+
             entry = _ledger_entry(
                 arxiv_id, member,
-                status="ok",
+                status=paper_status,
                 attempts=attempts,
                 refs_total=len(refs),
                 refs_with_arxiv=refs_with_arxiv,
                 refs_written=len(new_records),
+                raw_refs_received=per_paper_raw,
+                refs_with_paper_id=per_paper_with_pid,
+                refs_unresolved=per_paper_unresolved,
+                fallback_requests=per_paper_fallback,
+                completeness=completeness,
             )
             append_jsonl(paths.ledger, entry, fsync=True)
             ledger[key] = entry
-            stats.add_paper(refs, written=len(new_records))
+            stats.add_paper(
+                refs,
+                written=len(new_records),
+                raw_refs_received=per_paper_raw,
+                refs_with_paper_id=per_paper_with_pid,
+                refs_unresolved=per_paper_unresolved,
+                fallback_requests=per_paper_fallback,
+                is_partial=is_partial,
+            )
             if refs:
                 log.info(
-                    "[tab %d] %s: refs=%d, with_arxiv=%d, new_edges=%d",
+                    "[tab %d] %s: refs=%d, with_arxiv=%d, new_edges=%d%s",
                     tab_id, arxiv_id, len(refs), refs_with_arxiv, len(new_records),
+                    f", unresolved={per_paper_unresolved}" if per_paper_unresolved else "",
                 )
             else:
                 log.info("[tab %d] %s: refs=0 (S2 has no references)", tab_id, arxiv_id)
