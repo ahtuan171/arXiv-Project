@@ -89,10 +89,16 @@ class TestReferences:
                 offset = int(request.url.params["offset"])
                 if offset == 0:
                     return httpx.Response(200, json={
-                        "data": [{"paperId": "p1"}, {"paperId": "p2"}],
+                        "data": [
+                            {"citedPaper": {"paperId": "p1"}},
+                            {"citedPaper": {"paperId": "p2"}},
+                        ],
                         "next": 2,
                     })
-                return httpx.Response(200, json={"data": [{"paperId": "p3"}], "next": None})
+                return httpx.Response(200, json={
+                    "data": [{"citedPaper": {"paperId": "p3"}}],
+                    "next": None,
+                })
             return httpx.Response(200, json=[
                 paper_payload("p1", "2401.00001"),
                 paper_payload("p2", None, title="No arXiv"),
@@ -121,16 +127,188 @@ class TestReferences:
             if request.method == "GET"
         ]
         assert offset_calls == ["0", "2"]
+        assert requests[0].url.params["fields"] == config.S2_API_REF_FIELDS
         batch = [request for request in requests if request.method == "POST"]
         assert len(batch) == 1
         assert batch[0].url.path.endswith("/paper/batch")
         assert "externalIds" in batch[0].url.params["fields"]
 
+    def test_direct_metadata_extraction_avoids_batch_lookup(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "data": [
+                        {
+                            "citedPaper": {
+                                "paperId": "p1",
+                                "externalIds": {"ArXiv": "2401.00001"},
+                                "title": "Paper 1",
+                                "authors": [{"name": "Author A"}],
+                                "year": 2024,
+                                "publicationDate": "2024-01-01",
+                            }
+                        },
+                        {
+                            "citedPaper": {
+                                "paperId": "p2",
+                                "externalIds": {"DOI": "10.1234/example"},
+                                "title": "Paper 2",
+                                "authors": [{"name": "Author B"}],
+                                "year": 2023,
+                                "publicationDate": "2023-05-01",
+                            }
+                        },
+                    ],
+                    "next": None,
+                })
+            return httpx.Response(500, text="Should not be called")
+
+        client, http = make_client(handler)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert len(refs) == 2
+        assert refs[0].paper_id == "p1"
+        assert refs[0].arxiv_id == "2401.00001"
+        assert refs[0].title == "Paper 1"
+        assert refs[1].paper_id == "p2"
+        assert refs[1].arxiv_id is None
+        assert refs[1].title == "Paper 2"
+
+        # Verify ZERO POST requests were made!
+        post_requests = [r for r in requests if r.method == "POST"]
+        assert len(post_requests) == 0
+
+    def test_empty_response(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": [], "next": None})
+
+        client, http = make_client(handler)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert refs == []
+
+    def test_missing_or_malformed_nested_fields(self):
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "data": [
+                        "not-a-dict",
+                        {"noCitedPaper": 123},
+                        {"citedPaper": None},
+                        {"citedPaper": "not-a-dict"},
+                        {"citedPaper": {}},
+                        {"citedPaper": {"paperId": ""}},
+                        {"citedPaper": {"paperId": "   "}},
+                        {"citedPaper": {"paperId": "valid_p1"}},
+                    ],
+                    "next": None,
+                })
+            return httpx.Response(200, json=[paper_payload("valid_p1", "2401.00001")])
+
+        client, http = make_client(handler)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert len(refs) == 1
+        assert refs[0].paper_id == "valid_p1"
+        assert refs[0].arxiv_id == "2401.00001"
+
+    def test_duplicate_references_are_deduplicated(self):
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "data": [
+                        {"citedPaper": {"paperId": "dup1"}},
+                        {"citedPaper": {"paperId": "dup1"}},
+                        {"citedPaper": {"paperId": "dup2"}},
+                        {"citedPaper": {"paperId": "dup1"}},
+                    ],
+                    "next": None,
+                })
+            return httpx.Response(200, json=[
+                paper_payload("dup1", "2401.00001"),
+                paper_payload("dup2", "2401.00002"),
+            ])
+
+        client, http = make_client(handler)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert [r.paper_id for r in refs] == ["dup1", "dup2"]
+
+    def test_pagination_advances_and_terminates(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                offset = int(request.url.params["offset"])
+                if offset == 0:
+                    return httpx.Response(200, json={
+                        "data": [{"citedPaper": {"paperId": "p1"}}],
+                        "next": 1,
+                    })
+                if offset == 1:
+                    return httpx.Response(200, json={
+                        "data": [{"citedPaper": {"paperId": "p2"}}],
+                        "next": 2,
+                    })
+                return httpx.Response(200, json={
+                    "data": [],
+                    "next": None,
+                })
+            return httpx.Response(200, json=[
+                paper_payload("p1", "2401.00001"),
+                paper_payload("p2", "2401.00002"),
+            ])
+
+        client, http = make_client(handler, page_size=1)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert [r.paper_id for r in refs] == ["p1", "p2"]
+        offsets = [r.url.params["offset"] for r in requests if r.method == "GET"]
+        assert offsets == ["0", "1", "2"]
+
     def test_missing_batch_metadata_is_a_placeholder(self):
         def handler(request):
             if request.method == "GET":
                 return httpx.Response(200, json={
-                    "data": [{"paperId": "p1"}, {"paperId": "p2"}], "next": None,
+                    "data": [
+                        {"citedPaper": {"paperId": "p1"}},
+                        {"citedPaper": {"paperId": "p2"}},
+                    ],
+                    "next": None,
                 })
             return httpx.Response(200, json=[paper_payload("p1", "2401.00001"), None])
 
@@ -165,6 +343,30 @@ class TestReferences:
 
         run(scenario())
         assert len(calls) == 1
+
+    def test_regression_old_flat_paper_id_vs_nested_cited_paper(self):
+        """Old parser looked for item['paperId'], failing when response has item['citedPaper']['paperId']."""
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "data": [
+                        {"citedPaper": {"paperId": "correct_id"}},
+                    ],
+                    "next": None,
+                })
+            return httpx.Response(200, json=[paper_payload("correct_id", "2401.00001")])
+
+        client, http = make_client(handler)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert len(refs) == 1
+        assert refs[0].paper_id == "correct_id"
 
 
 class TestErrors:
@@ -246,3 +448,51 @@ class TestErrors:
 
         run(scenario())
         assert times[1] - times[0] >= 0.04
+
+    def test_5xx_transient_error_retries_and_succeeds(self, monkeypatch):
+        monkeypatch.setattr(config, "RETRY_JITTER", 0.0)
+        monkeypatch.setattr(config, "BACKOFF_BASE", 0.0)
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(500, text="Internal Server Error")
+            if request.method == "GET":
+                return httpx.Response(200, json={
+                    "data": [{"citedPaper": {"paperId": "p1"}}],
+                    "next": None,
+                })
+            return httpx.Response(200, json=[paper_payload("p1", "2401.00001")])
+
+        client, http = make_client(handler, max_retries=3)
+
+        async def scenario():
+            await client.start(1)
+            refs = await client.get_references(None, "2501.07642")
+            await http.aclose()
+            return refs
+
+        refs = run(scenario())
+        assert len(refs) == 1
+        assert refs[0].paper_id == "p1"
+        assert len(calls) == 3  # 1st GET fails (500), 2nd GET succeeds (200), 3rd POST batch (200)
+
+    def test_permanent_failure_raises_exception_not_empty_success(self, monkeypatch):
+        from src.s2_api_client import S2ApiTransientError
+
+        monkeypatch.setattr(config, "RETRY_JITTER", 0.0)
+        monkeypatch.setattr(config, "BACKOFF_BASE", 0.0)
+
+        def handler(request):
+            return httpx.Response(500, text="Service Unavailable")
+
+        client, http = make_client(handler, max_retries=2)
+
+        async def scenario():
+            await client.start(1)
+            with pytest.raises(S2ApiTransientError):
+                await client.get_references(None, "2501.07642")
+            await http.aclose()
+
+        run(scenario())

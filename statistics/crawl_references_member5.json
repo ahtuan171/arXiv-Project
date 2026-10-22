@@ -1,17 +1,17 @@
 {
-  "processed": 10,
-  "refs_found": 0,
-  "refs_with_arxiv": 0,
-  "refs_written": 0,
-  "not_found": 0,
+  "processed": 20,
+  "refs_found": 492,
+  "refs_with_arxiv": 304,
+  "refs_written": 304,
+  "not_found": 1,
   "errors": 0,
-  "skipped": 158,
+  "skipped": 228,
   "client_type": "api",
-  "api_calls": 19,
+  "api_calls": 24,
   "browser_calls": 0,
-  "rate_limited": 9,
+  "rate_limited": 4,
   "member": "member5",
   "total_ids": 5000,
-  "already_done": 158,
-  "elapsed_seconds": 36.07894596800179
+  "already_done": 228,
+  "elapsed_seconds": 71.70573571099885
 }

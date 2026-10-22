@@ -90,6 +90,10 @@ except ValueError:
     S2_API_PAGE_SIZE = 500
 S2_API_BATCH_SIZE = 100
 S2_API_PAPER_FIELDS = "paperId,externalIds,title,authors,year,publicationDate"
+S2_API_REF_FIELDS = os.environ.get(
+    "S2_API_REF_FIELDS",
+    ",".join(f"citedPaper.{f}" for f in S2_API_PAPER_FIELDS.split(",")),
+)
 
 MAX_RETRIES = 5
 BACKOFF_BASE = 2.0  # seconds; wait = BACKOFF_BASE ** attempt

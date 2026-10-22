@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -236,14 +237,19 @@ class S2ApiClient:
                 assert last_error is not None
                 raise last_error
 
+            is_rate_limited = isinstance(last_error, S2ApiRateLimited)
             if retry_after is not None:
                 delay = float(retry_after)
+            elif is_rate_limited:
+                delay = max(config.S2_RATE_LIMIT_COOLDOWN, config.BACKOFF_BASE ** attempt)
             else:
                 delay = config.BACKOFF_BASE ** attempt
-            if retry_after is not None:
+
+            if is_rate_limited or retry_after is not None:
                 self.rate_limiter.block(delay)
+
             delay = min(max(delay, 0.0), config.MAX_BACKOFF)
-            delay += config.RETRY_JITTER
+            delay += random.uniform(0.0, config.RETRY_JITTER)
             logger.warning(
                 "%s failed (%s); retry %d/%d in %.1fs",
                 path, last_error, attempt, self.max_retries, delay,
@@ -329,7 +335,7 @@ class S2ApiClient:
                 "GET",
                 f"/paper/arXiv:{quote(clean_id, safe='/')}/references",
                 params={
-                    "fields": "paperId",
+                    "fields": config.S2_API_REF_FIELDS,
                     "offset": offset,
                     "limit": self.page_size,
                 },
@@ -341,11 +347,29 @@ class S2ApiClient:
                 raise S2ApiTransientError("unexpected references payload from Semantic Scholar API")
             for item in items:
                 if not isinstance(item, dict):
+                    logger.warning("Ignoring non-dict reference entry for arXiv:%s: %r", clean_id, type(item))
                     continue
-                item_id = str(item.get("paperId") or "")
-                if item_id and item_id not in seen:
+                cited = item.get("citedPaper")
+                if not isinstance(cited, dict):
+                    logger.warning(
+                        "Ignoring reference entry without valid citedPaper dict for arXiv:%s: %r",
+                        clean_id,
+                        item,
+                    )
+                    continue
+                raw_id = cited.get("paperId")
+                item_id = str(raw_id).strip() if raw_id is not None else ""
+                if not item_id:
+                    logger.warning("Ignoring citedPaper with missing or empty paperId for arXiv:%s: %r", clean_id, item)
+                    continue
+                if item_id not in seen:
                     seen.add(item_id)
                     paper_ids.append(item_id)
+                    # If citedPaper already contains metadata, parse and cache directly
+                    if "externalIds" in cited or "title" in cited:
+                        paper = _paper_from_api(cited)
+                        if paper is not None:
+                            self._ref_cache[item_id] = paper
 
             next_offset = data.get("next")
             if not items:
@@ -357,7 +381,10 @@ class S2ApiClient:
             if len(items) < self.page_size:
                 break
 
-        await self.fetch_papers_batch(paper_ids)
+        # Batch lookup only references that lack cached metadata
+        missing_ids = [pid for pid in paper_ids if pid not in self._ref_cache]
+        if missing_ids:
+            await self.fetch_papers_batch(missing_ids)
 
         refs: list[S2Paper] = []
         for paper_id in paper_ids:
