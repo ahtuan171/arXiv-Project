@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Any, Optional
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Iterable, Optional
 from urllib.parse import quote
 
 import httpx
@@ -31,7 +33,7 @@ from src.s2_client import (
     S2RateLimited,
     S2TransientError,
 )
-from src.utils import AsyncRateLimiter, normalize_arxiv_id
+from src.utils import AsyncRateLimiter, is_valid_arxiv_id, normalize_arxiv_id
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +63,20 @@ class S2ApiPermanentError(S2ApiError, S2PermanentError):
 
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse Retry-After header supporting both delay-seconds and HTTP-date."""
     if value is None:
         return None
+    val = value.strip()
     try:
-        seconds = float(value)
+        seconds = float(val)
     except (TypeError, ValueError):
-        return None
+        try:
+            dt = parsedate_to_datetime(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+        except Exception:
+            return None
     return min(max(seconds, 0.0), config.MAX_RETRY_AFTER)
 
 
@@ -86,14 +96,17 @@ def _authors(value: Any) -> list[str]:
 
 def _paper_from_api(data: dict) -> Optional[S2Paper]:
     """Convert one Graph API paper object into :class:`S2Paper`."""
-    paper_id = str(data.get("paperId") or "")
-    if not paper_id:
-        return None
+    paper_id = str(data.get("paperId") or "").strip()
     external = data.get("externalIds")
     arxiv_id = None
     if isinstance(external, dict):
         raw_arxiv = external.get("ArXiv") or external.get("arxiv")
-        arxiv_id = normalize_arxiv_id(raw_arxiv) or None
+        candidate = normalize_arxiv_id(raw_arxiv) or None
+        if candidate and is_valid_arxiv_id(candidate):
+            arxiv_id = candidate
+    # Problem B1: If paper_id is missing but arxiv_id is valid, retain it
+    if not paper_id and not arxiv_id:
+        return None
     publication_date = str(data.get("publicationDate") or "")
     year = data.get("year")
     if not isinstance(year, int):
@@ -108,6 +121,66 @@ def _paper_from_api(data: dict) -> Optional[S2Paper]:
         year=year,
         publication_date=publication_date or None,
     )
+
+
+def is_sufficiently_complete(paper: S2Paper, raw_data: Optional[dict] = None) -> bool:
+    """Check if an S2Paper record has sufficient metadata for the project schema.
+
+    A record is considered sufficiently complete when:
+    1. It has a non-empty title.
+    2. If raw_data is provided, externalIds was returned in the response.
+    3. If it has an arXiv ID, it has authors and publication date (or year).
+    """
+    if not paper.title:
+        return False
+    if raw_data is not None:
+        if "externalIds" not in raw_data:
+            return False
+    if paper.arxiv_id:
+        if not paper.publication_date and paper.year is None:
+            return False
+        if not paper.authors:
+            return False
+    return True
+
+
+def merge_paper(base: Optional[S2Paper], update: Optional[S2Paper]) -> Optional[S2Paper]:
+    """Merge fallback paper metadata into base without overwriting valid data with empty/None."""
+    if base is None:
+        return update
+    if update is None:
+        return base
+    return S2Paper(
+        paper_id=base.paper_id or update.paper_id or "",
+        arxiv_id=base.arxiv_id or update.arxiv_id,
+        title=base.title if base.title else update.title,
+        authors=list(base.authors) if base.authors else list(update.authors),
+        year=base.year if base.year is not None else update.year,
+        publication_date=base.publication_date if base.publication_date else update.publication_date,
+    )
+
+
+class ReferenceResult(list):
+    """List of S2Paper references with per-paper API diagnostics and metrics."""
+
+    def __init__(
+        self,
+        papers: Iterable[S2Paper] = (),
+        *,
+        raw_refs_received: int = 0,
+        refs_with_paper_id: int = 0,
+        refs_with_arxiv_id: int = 0,
+        refs_unresolved: int = 0,
+        unresolved_details: Optional[list[dict]] = None,
+        fallback_requests: int = 0,
+    ) -> None:
+        super().__init__(papers)
+        self.raw_refs_received = raw_refs_received
+        self.refs_with_paper_id = refs_with_paper_id
+        self.refs_with_arxiv_id = refs_with_arxiv_id
+        self.refs_unresolved = refs_unresolved
+        self.unresolved_details = list(unresolved_details or [])
+        self.fallback_requests = fallback_requests
 
 
 class S2ApiClient:
@@ -137,6 +210,7 @@ class S2ApiClient:
         self.api_calls = 0
         self.auth_errors = 0
         self.rate_limit_hits = 0
+        self.fallback_requests = 0
         self._http = http_client
         self._owns_http = http_client is None
         self._paper_id_cache: dict[str, str] = {}
@@ -297,7 +371,8 @@ class S2ApiClient:
                     continue
                 paper = _paper_from_api(item)
                 if paper is not None:
-                    self._ref_cache[paper.paper_id] = paper
+                    cached = self._ref_cache.get(paper.paper_id)
+                    self._ref_cache[paper.paper_id] = merge_paper(cached, paper)
             logger.debug(
                 "Batch resolved %d/%d paper(s)",
                 sum(1 for pid in batch if pid in self._ref_cache), len(batch),
@@ -318,7 +393,7 @@ class S2ApiClient:
         papers = await self.fetch_papers_batch([paper_id])
         return papers[0] if papers else None
 
-    async def get_references(self, page: Any, arxiv_id: str) -> list[S2Paper]:
+    async def get_references(self, page: Any, arxiv_id: str) -> ReferenceResult:
         """Fetch every reference for one paper.
 
         ``page`` is accepted and ignored so the API client can be dropped into
@@ -326,8 +401,18 @@ class S2ApiClient:
         """
         del page
         clean_id = self._clean_id(arxiv_id)
-        paper_ids: list[str] = []
-        seen: set[str] = set()
+
+        raw_refs_received = 0
+        refs_with_paper_id = 0
+        refs_unresolved = 0
+        unresolved_details: list[dict] = []
+
+        paper_keys: list[str] = []
+        seen_keys: set[str] = set()
+        direct_papers: dict[str, S2Paper] = {}
+        needs_fallback: list[str] = []
+
+        initial_fallback_count = self.fallback_requests
         offset = 0
 
         while True:
@@ -345,31 +430,78 @@ class S2ApiClient:
             items = data.get("data")
             if not isinstance(items, list):
                 raise S2ApiTransientError("unexpected references payload from Semantic Scholar API")
+
+            raw_refs_received += len(items)
+
             for item in items:
                 if not isinstance(item, dict):
+                    refs_unresolved += 1
+                    unresolved_details.append({
+                        "source_arxiv_id": clean_id,
+                        "title": "",
+                        "year": None,
+                        "external_ids": None,
+                        "reason": f"non_dict_entry:{type(item).__name__}",
+                    })
                     logger.warning("Ignoring non-dict reference entry for arXiv:%s: %r", clean_id, type(item))
                     continue
+
                 cited = item.get("citedPaper")
                 if not isinstance(cited, dict):
+                    refs_unresolved += 1
+                    unresolved_details.append({
+                        "source_arxiv_id": clean_id,
+                        "title": "",
+                        "year": None,
+                        "external_ids": None,
+                        "reason": "missing_or_null_cited_paper",
+                    })
                     logger.warning(
                         "Ignoring reference entry without valid citedPaper dict for arXiv:%s: %r",
                         clean_id,
                         item,
                     )
                     continue
-                raw_id = cited.get("paperId")
-                item_id = str(raw_id).strip() if raw_id is not None else ""
-                if not item_id:
-                    logger.warning("Ignoring citedPaper with missing or empty paperId for arXiv:%s: %r", clean_id, item)
+
+                raw_id = str(cited.get("paperId") or "").strip()
+                external = cited.get("externalIds")
+                raw_arxiv = None
+                if isinstance(external, dict):
+                    raw_arxiv = external.get("ArXiv") or external.get("arxiv")
+                arxiv_id = normalize_arxiv_id(raw_arxiv) or None
+
+                if raw_id:
+                    refs_with_paper_id += 1
+                    item_key = raw_id
+                elif arxiv_id and is_valid_arxiv_id(arxiv_id):
+                    # Problem B1: missing paperId but externalIds has valid arXiv ID
+                    item_key = f"arxiv:{arxiv_id}"
+                else:
+                    # Problem B1: unresolvable reference entry
+                    refs_unresolved += 1
+                    unresolved_details.append({
+                        "source_arxiv_id": clean_id,
+                        "title": str(cited.get("title") or ""),
+                        "year": cited.get("year"),
+                        "external_ids": external if isinstance(external, dict) else None,
+                        "reason": "invalid_arxiv_id" if arxiv_id else "missing_paper_id_and_arxiv_id",
+                    })
+                    logger.warning("Ignoring unresolvable reference for arXiv:%s: %r", clean_id, item)
                     continue
-                if item_id not in seen:
-                    seen.add(item_id)
-                    paper_ids.append(item_id)
-                    # If citedPaper already contains metadata, parse and cache directly
-                    if "externalIds" in cited or "title" in cited:
-                        paper = _paper_from_api(cited)
-                        if paper is not None:
-                            self._ref_cache[item_id] = paper
+
+                if item_key not in seen_keys:
+                    seen_keys.add(item_key)
+                    paper_keys.append(item_key)
+
+                    paper = _paper_from_api(cited)
+                    if paper is not None:
+                        direct_papers[item_key] = paper
+                        if is_sufficiently_complete(paper, cited):
+                            self._ref_cache[item_key] = paper
+                        elif raw_id:
+                            needs_fallback.append(raw_id)
+                    elif raw_id:
+                        needs_fallback.append(raw_id)
 
             next_offset = data.get("next")
             if not items:
@@ -381,26 +513,51 @@ class S2ApiClient:
             if len(items) < self.page_size:
                 break
 
-        # Batch lookup only references that lack cached metadata
-        missing_ids = [pid for pid in paper_ids if pid not in self._ref_cache]
-        if missing_ids:
-            await self.fetch_papers_batch(missing_ids)
+        # Problem B2: Fallback batch lookup only for incomplete records with paperId
+        pending_fallback = [pid for pid in needs_fallback if pid not in self._ref_cache]
+        if pending_fallback:
+            self.fallback_requests += 1
+            batch_results = await self.fetch_papers_batch(pending_fallback)
+            batch_map = {p.paper_id: p for p in batch_results if p.paper_id}
+            for pid in pending_fallback:
+                base = direct_papers.get(pid)
+                fallback_paper = batch_map.get(pid)
+                merged = merge_paper(base, fallback_paper)
+                if merged is not None:
+                    self._ref_cache[pid] = merged
 
         refs: list[S2Paper] = []
-        for paper_id in paper_ids:
-            cached = self._ref_cache.get(paper_id)
+        refs_with_arxiv_id = 0
+        for key in paper_keys:
+            cached = self._ref_cache.get(key) or direct_papers.get(key)
             if cached is not None:
                 refs.append(cached)
+                if cached.arxiv_id:
+                    refs_with_arxiv_id += 1
             else:
-                refs.append(S2Paper(
-                    paper_id=paper_id,
-                    arxiv_id=None,
+                p = S2Paper(
+                    paper_id=key if not key.startswith("arxiv:") else "",
+                    arxiv_id=key[len("arxiv:"):] if key.startswith("arxiv:") else None,
                     title="",
                     authors=[],
                     year=None,
                     publication_date=None,
-                ))
-        return refs
+                )
+                refs.append(p)
+                if p.arxiv_id:
+                    refs_with_arxiv_id += 1
+
+        per_paper_fallback = self.fallback_requests - initial_fallback_count
+
+        return ReferenceResult(
+            refs,
+            raw_refs_received=raw_refs_received,
+            refs_with_paper_id=refs_with_paper_id,
+            refs_with_arxiv_id=refs_with_arxiv_id,
+            refs_unresolved=refs_unresolved,
+            unresolved_details=unresolved_details,
+            fallback_requests=per_paper_fallback,
+        )
 
     @staticmethod
     def _clean_id(arxiv_id: str) -> str:
