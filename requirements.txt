@@ -1,5 +1,7 @@
 # Pipeline dependencies (also used on Google Colab for benchmarking)
 requests>=2.31
+playwright>=1.40
+httpx>=0.27
 PyYAML>=6.0
 pandas>=2.0
 numpy>=1.26
