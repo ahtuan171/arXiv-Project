@@ -17,6 +17,23 @@ import yaml
 
 # --- Paths -----------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from .env file if present
+_env_file = ROOT_DIR / ".env"
+if _env_file.is_file():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        with open(_env_file, encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    _k, _v = _k.strip(), _v.strip().strip("'\"")
+                    if _k and _k not in os.environ:
+                        os.environ[_k] = _v
+
 DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
@@ -25,9 +42,9 @@ RANGES_FILE = ROOT_DIR / "ranges.yaml"
 
 # --- Network politeness ----------------------------------------------------
 # arXiv requires at least 3 seconds between requests.
-ARXIV_MIN_INTERVAL = 3.0
+ARXIV_MIN_INTERVAL = 3.5
 # Semantic Scholar has its own (stricter) limit; conservative default.
-S2_MIN_INTERVAL = 1.0
+S2_MIN_INTERVAL = 1.2
 S2_API_KEY = os.environ.get("S2_API_KEY", "")
 
 MAX_RETRIES = 5
