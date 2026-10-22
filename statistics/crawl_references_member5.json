@@ -1,0 +1,17 @@
+{
+  "processed": 10,
+  "refs_found": 0,
+  "refs_with_arxiv": 0,
+  "refs_written": 0,
+  "not_found": 0,
+  "errors": 0,
+  "skipped": 158,
+  "client_type": "api",
+  "api_calls": 19,
+  "browser_calls": 0,
+  "rate_limited": 9,
+  "member": "member5",
+  "total_ids": 5000,
+  "already_done": 158,
+  "elapsed_seconds": 36.07894596800179
+}

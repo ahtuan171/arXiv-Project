@@ -1,0 +1,13 @@
+{
+  "processed": 2,
+  "refs_found": 0,
+  "refs_with_arxiv": 0,
+  "refs_written": 0,
+  "not_found": 0,
+  "errors": 2,
+  "skipped": 0,
+  "member": "member1",
+  "total_ids": 5000,
+  "already_done": 0,
+  "elapsed_seconds": 33.27443871200012
+}
