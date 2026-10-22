@@ -11,12 +11,16 @@ from src.utils import read_jsonl
 
 
 REQUIRED_COLUMNS = [
+    "schema_version",
     "arxiv_id",
     "ref_arxiv_id",
     "ref_title",
     "ref_authors",
     "ref_submission_date",
+    "ref_year",
     "ref_s2_id",
+    "member",
+    "crawled_at",
 ]
 
 
@@ -32,17 +36,24 @@ def load_references(path: Path | str) -> pd.DataFrame:
 
     df = pd.DataFrame(records)
 
+    # Read data produced with the previous crawl-metadata field name.
+    if "ref_submission_date" not in df.columns and "ref_publication_date" in df.columns:
+        df = df.rename(columns={"ref_publication_date": "ref_submission_date"})
+
     # Ensure all columns exist
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
-            df[col] = "" if col != "ref_authors" else [[] for _ in range(len(df))]
+            if col == "ref_authors":
+                df[col] = [[] for _ in range(len(df))]
+            elif col == "ref_year":
+                df[col] = pd.NA
+            else:
+                df[col] = ""
 
     # Type coercion
-    df["arxiv_id"] = df["arxiv_id"].astype(str)
-    df["ref_arxiv_id"] = df["ref_arxiv_id"].astype(str)
-    df["ref_title"] = df["ref_title"].astype(str)
-    df["ref_submission_date"] = df["ref_submission_date"].astype(str)
-    df["ref_s2_id"] = df["ref_s2_id"].astype(str)
+    for col in ("arxiv_id", "ref_arxiv_id", "ref_title", "ref_submission_date", "ref_s2_id", "member", "crawled_at"):
+        df[col] = df[col].astype(str)
+    df["ref_year"] = pd.to_numeric(df["ref_year"], errors="coerce").astype("Int64")
 
     # ref_authors: ensure list of strings
     def _ensure_list(v):
@@ -62,7 +73,7 @@ def load_references(path: Path | str) -> pd.DataFrame:
     df["ref_authors"] = df["ref_authors"].apply(_ensure_list)
 
     # Replace NaN/None with empty string for string columns
-    str_cols = ["ref_title", "ref_submission_date", "ref_s2_id"]
+    str_cols = ["ref_title", "ref_submission_date", "ref_s2_id", "member", "crawled_at"]
     for col in str_cols:
         df[col] = df[col].fillna("")
 
