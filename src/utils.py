@@ -34,6 +34,9 @@ except ImportError:  # pragma: no cover
 
 # --- Identifiers -----------------------------------------------------------
 _ARXIV_VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
+_ARXIV_ID_PATTERN = re.compile(
+    r"^(?:\d{4}[._]\d{4,5}|[a-zA-Z\-]+(?:\.[a-zA-Z\-]+)?[/_]\d{7})$"
+)
 
 
 def normalize_arxiv_id(arxiv_id: Optional[str]) -> str:
@@ -48,6 +51,14 @@ def normalize_arxiv_id(arxiv_id: Optional[str]) -> str:
     if text.lower().startswith("arxiv:"):
         text = text[len("arxiv:"):].strip()
     return _ARXIV_VERSION_RE.sub("", text)
+
+
+def is_valid_arxiv_id(arxiv_id: Optional[str]) -> bool:
+    """Return True if arxiv_id matches modern (YYMM.NNNN[N]) or legacy format."""
+    if not arxiv_id:
+        return False
+    norm = normalize_arxiv_id(arxiv_id)
+    return bool(_ARXIV_ID_PATTERN.match(norm))
 
 
 def clean_arxiv_id(arxiv_id: str) -> str:
