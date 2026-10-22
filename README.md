@@ -9,16 +9,29 @@ trích dẫn (reference matching) cho các bài báo arXiv.
 ## Cấu trúc repo
 
 ```
-src/            Mã nguồn pipeline (config.py, utils.py, các module crawl/parse/match)
-notebooks/      Notebook khám phá, thử nghiệm
-book/           Jupyter Book (báo cáo M1 + M2); hình và bảng sinh ra lúc build
-tests/          Unit test (pytest)
-ranges.yaml     Dải arXiv ID của từng thành viên
-data/           Dữ liệu cục bộ — KHÔNG commit (đã .gitignore)
-.github/        GitHub Actions: build và deploy book lên GitHub Pages
+src/                Mã nguồn pipeline
+  config.py         Cấu hình đường dẫn, rate limit, dải arXiv ID
+  crawler.py        Crawler có resume, chọn client API/browser
+  s2_api_client.py  Client Graph API chính thức của Semantic Scholar
+  s2_client.py      Client Playwright (fallback / đối chiếu)
+  stats.py          Thống kê và báo cáo Markdown
+  read_ref.py       Đọc references.jsonl -> pandas DataFrame
+  utils.py          JSONL, rate limiter, retry, logging, đo hiệu năng
+scripts/            CLI (crawl_references.py)
+notebooks/          Notebook khám phá, thử nghiệm
+book/               Jupyter Book (báo cáo M1 + M2)
+docs/               Tài liệu chi tiết (crawler, dữ liệu)
+tests/              Unit test (pytest)
+statistics/         Thống kê lần chạy gần nhất của từng member (.json, .md)
+ranges.yaml         Dải arXiv ID của từng thành viên
+data/               Dữ liệu cục bộ — KHÔNG commit (đã .gitignore)
+local/              Ghi chú riêng — KHÔNG commit
+.github/            GitHub Actions: build và deploy book lên GitHub Pages
 ```
 
 ## Bắt đầu
+
+Yêu cầu Python 3.10+.
 
 ```bash
 git clone https://github.com/ahtuan171/arXiv-Project.git
@@ -31,16 +44,27 @@ python -m pytest -q
 Mỗi thành viên crawl **dải ID riêng** của mình:
 
 1. Điền dải của bạn vào `ranges.yaml` (tìm theo MSSV trên sheet đăng ký, cột H–K).
-2. Chọn dải bằng biến môi trường: `export ARXIV_MEMBER=member3`.
-3. Dữ liệu ghi vào `data/raw/` (đổi thư mục bằng `ARXIV_DATA_DIR`).
+   Nếu dải vắt qua tháng, điền thêm `month_sizes` (ID lớn nhất của tháng trước).
+2. Chọn dải bằng biến môi trường: `export ARXIV_MEMBER=member3`
+   (hoặc truyền `--member member3`).
+3. Chạy crawler:
 
-Quy tắc dữ liệu chung:
+```bash
+python scripts/crawl_references.py                # Graph API (mặc định), tự resume
+python scripts/crawl_references.py --dry-run      # xem còn bao nhiêu paper
+python scripts/crawl_references.py --limit 20     # thử nhanh 20 paper
+```
 
-- File trung gian và đầu ra dùng JSON Lines (`.jsonl`), UTF-8, một object mỗi dòng.
-- Giá trị thiếu: chuỗi → `""`, danh sách → `[]`, số → `null`.
-- Mọi arXiv ID trong dữ liệu và tên file đi qua `src.utils.clean_arxiv_id()`.
-- Nghỉ tối thiểu 3 giây giữa hai lần gọi arXiv (`utils.RateLimiter`); scraper phải chạy lại được từ chỗ dừng (`utils.load_done_ids`).
-- Đo hiệu năng bằng `utils.measure` / `@utils.timed` (thời gian, RAM, disk); số liệu chính thức đo trên Google Colab chỉ CPU.
+Dữ liệu ghi riêng vào `data/raw/<member>/` (`references.jsonl`, `ledger.jsonl`);
+log và thống kê nằm trong `logs/` và `statistics/`.
+
+## Cào metadata references
+
+Hướng dẫn chi tiết về crawler: chọn client (`api` / `browser` / `both`), fallback
+và retry, resume, exit code, schema `references.jsonl` / `ledger.jsonl`, đọc dữ
+liệu bằng pandas và xử lý sự cố.
+
+Xem [docs/crawl-references.md](docs/crawl-references.md).
 
 ## Build báo cáo
 
