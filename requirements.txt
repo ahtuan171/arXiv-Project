@@ -1,0 +1,11 @@
+# Pipeline dependencies (also used on Google Colab for benchmarking)
+requests>=2.31
+PyYAML>=6.0
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+tqdm>=4.66
+arxiv>=2.1
+
+# Tests
+pytest>=8.0

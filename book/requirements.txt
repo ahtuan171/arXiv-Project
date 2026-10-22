@@ -1,0 +1,4 @@
+# Dependencies to build the Jupyter Book (installed by the GitHub Actions workflow)
+-r ../requirements.txt
+jupyter-book>=1.0,<2.0
+ipykernel>=6.29

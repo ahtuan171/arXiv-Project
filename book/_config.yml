@@ -1,0 +1,23 @@
+title: arXiv Project
+author: "Phạm Đắc Anh, Phạm Anh Tuấn, Nguyễn Duy Hào, Lý Phương Toàn, Phạm Xuân Duy"
+copyright: "2026"
+logo: ""
+
+# Figures and tables are generated while the book is built (required by the course).
+execute:
+  execute_notebooks: force
+  timeout: 600
+  stderr_output: remove-warn
+
+html:
+  use_repository_button: true
+  use_issues_button: true
+
+repository:
+  url: https://github.com/ahtuan171/arXiv-Project
+  path_to_book: book
+  branch: main
+
+sphinx:
+  config:
+    html_show_copyright: false

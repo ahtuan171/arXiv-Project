@@ -1,0 +1,44 @@
+# arXiv ID range assigned to each member (columns H-K of the registration sheet).
+# Ranges are inclusive: start_id .. end_id (about 5000 papers each).
+# Months accept "2025-04" or "2504". A range that crosses a month boundary needs
+# the number of papers of every month it crosses, filled in `month_sizes`
+# (largest ID of that month, e.g. "2504": 24000).
+
+month_sizes: {}
+
+members:
+  member1:
+    name: ""
+    student_id: ""
+    start_month: null
+    start_id: null
+    end_month: null
+    end_id: null
+  member2:
+    name: ""
+    student_id: ""
+    start_month: null
+    start_id: null
+    end_month: null
+    end_id: null
+  member3:
+    name: ""
+    student_id: ""
+    start_month: null
+    start_id: null
+    end_month: null
+    end_id: null
+  member4:
+    name: ""
+    student_id: ""
+    start_month: null
+    start_id: null
+    end_month: null
+    end_id: null
+  member5:
+    name: ""
+    student_id: ""
+    start_month: null
+    start_id: null
+    end_month: null
+    end_id: null

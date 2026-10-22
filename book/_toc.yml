@@ -1,0 +1,5 @@
+format: jb-book
+root: intro
+chapters:
+  - file: 01_m1_crawling
+  - file: 02_m2_parsing
