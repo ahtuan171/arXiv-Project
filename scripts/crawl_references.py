@@ -5,11 +5,29 @@ Usage:
     export ARXIV_MEMBER=memberX
     python scripts/crawl_references.py
 
-By default the crawler uses the official Semantic Scholar Graph API and reads
-``S2_API_KEY`` from ``.env``. Pass ``--client browser`` to scrape the website
-through Chromium (install it once with ``playwright install chromium``) or
-``--client both`` to cross-check the two clients. Progress is stored in
-``data/raw/<member>/ledger.jsonl``; it is safe to stop with Ctrl-C and rerun.
+Pipeline and Metrics:
+    - raw_refs_received: Raw reference entries returned by S2 API.
+    - refs_with_paper_id: Reference entries possessing a Semantic Scholar paperId.
+    - refs_with_arxiv_id: Reference entries resolved to a valid arXiv ID.
+    - refs_unresolved: Entries that cannot be resolved to a valid identifier.
+    - edges_written: Valid arXiv -> arXiv reference edges written to JSONL.
+
+Ledger Statuses:
+    - ok: Successfully crawled with all references resolved.
+    - partial: Successfully crawled, but some references were unresolvable.
+               Skipped on resume unless --retry-partial is specified.
+    - not_found: Paper was not found on Semantic Scholar (HTTP 404).
+    - error: Transient/transport errors exhausted retries. Retried with --retry-errors.
+
+Fallback & Completeness:
+    Direct metadata extraction minimizes API calls by reading nested citedPaper
+    objects directly. Records missing required metadata (such as authors or
+    publication date for arXiv papers) trigger a batch fallback lookup to
+    enrich missing fields without overwriting valid direct data.
+
+Retry & Rate Limits:
+    HTTP 429 and 5xx responses are handled with exponential backoff, jitter, and
+    Retry-After header parsing (both integer seconds and RFC 7231 HTTP-date).
 """
 
 from __future__ import annotations
@@ -41,7 +59,10 @@ def _parse_month_sizes(values: list[str]) -> dict[str, int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Crawl arXiv references from Semantic Scholar")
+    parser = argparse.ArgumentParser(
+        description="Crawl arXiv references from Semantic Scholar with robust error handling and fallback",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--member", help="Member key in ranges.yaml (default: ARXIV_MEMBER)")
     parser.add_argument(
         "--client",
@@ -57,8 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=None, help="Process at most N pending papers")
     parser.add_argument("--dry-run", action="store_true", help="Show progress plan without API calls")
-    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that exhausted attempts")
-    parser.add_argument("--retry-not-found", action="store_true", help="Retry papers previously not indexed by S2")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously ended in error status")
+    parser.add_argument("--retry-not-found", action="store_true", help="Retry papers previously marked not_found")
+    parser.add_argument(
+        "--retry-partial",
+        action="store_true",
+        help="Retry papers previously completed with partial status (unresolved references)",
+    )
     parser.add_argument("--tabs", type=int, default=None, help="Concurrent browser tabs (default: S2_TABS or 3)")
     parser.add_argument("--headed", action="store_true", help="Show the browser window (needs a display)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Log every S2 request as well as every paper")
@@ -113,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             retry_errors=args.retry_errors,
             retry_not_found=args.retry_not_found,
+            retry_partial=args.retry_partial,
             month_sizes=month_sizes or None,
             log=log,
             tabs=args.tabs or config.S2_TABS,
