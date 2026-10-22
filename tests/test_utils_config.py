@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -34,6 +35,17 @@ def test_range_crossing_year():
 def test_invalid_range():
     with pytest.raises(ValueError):
         config.ArxivRange("2505", 1, "2504", 1)
+
+
+def test_ranges_yaml_ids_are_decimal_not_octal(tmp_path):
+    path = tmp_path / "ranges.yaml"
+    path.write_text(
+        "members:\n"
+        "  m1: {start_month: '2025-01', start_id: 07642, end_month: '2025-01', end_id: 07644}\n"
+    )
+    rng = config.load_member_range("m1", path)
+    assert (rng.start_id, rng.end_id) == (7642, 7644)
+    assert list(rng.iter_ids()) == ["2501.07642", "2501.07643", "2501.07644"]
 
 
 def test_load_member_range_requires_values(tmp_path):
@@ -74,12 +86,49 @@ def test_jsonl_roundtrip_and_resume(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8").splitlines()[0])["title"].startswith("Tiếng")
 
 
+def test_append_jsonl_many_writes_one_batch(tmp_path):
+    path = tmp_path / "records.jsonl"
+    written = utils.append_jsonl_many(path, [{"id": index} for index in range(3)], fsync=True)
+    assert written == 3
+    assert [record["id"] for record in utils.read_jsonl(path)] == [0, 1, 2]
+
+
+def test_load_latest_records_keeps_last_per_id(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    utils.append_jsonl_many(path, [
+        {"arxiv_id": "a", "status": "error", "attempts": 1},
+        {"arxiv_id": "a", "status": "ok", "attempts": 1},
+        {"arxiv_id": "b", "status": "not_found"},
+    ])
+    latest = utils.load_latest_records(path)
+    assert latest["a"]["status"] == "ok"
+    assert latest["b"]["status"] == "not_found"
+
+
+def test_normalize_and_canonical_arxiv_id():
+    assert utils.normalize_arxiv_id("arXiv:2504.12345v3") == "2504.12345"
+    assert utils.normalize_arxiv_id("hep-th/9901001v2") == "hep-th/9901001"
+    assert utils.normalize_arxiv_id(None) == ""
+    assert utils.canonical_arxiv_id("arXiv:2504.12345v3") == "2504_12345"
+
+
 def test_rate_limiter_enforces_interval():
     limiter = utils.RateLimiter(0.2)
     limiter.wait()
     start = time.monotonic()
     limiter.wait()
     assert time.monotonic() - start >= 0.19
+
+
+def test_async_rate_limiter_block_pauses_all_tabs():
+    async def scenario():
+        limiter = utils.AsyncRateLimiter(0)
+        limiter.block(0.2)
+        start = time.monotonic()
+        await limiter.wait()
+        return time.monotonic() - start
+
+    assert asyncio.run(scenario()) >= 0.19
 
 
 def test_retry_gives_up_and_succeeds():
