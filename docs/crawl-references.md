@@ -1,6 +1,6 @@
 # Cào metadata references từ Semantic Scholar
 
-Tài liệu chi tiết cho `scripts/crawl_references.py`: cấu hình, chọn client, resume,
+Tài liệu chi tiết cho `src/scripts/crawl_references.py`: cấu hình, chọn client, resume,
 schema dữ liệu và xử lý sự cố. Tổng quan dự án xem tại [README](../README.md).
 
 ## Mục lục
@@ -60,21 +60,21 @@ Các biến môi trường liên quan:
 ## Chạy crawler
 
 ```bash
-python scripts/crawl_references.py                    # Graph API (mặc định), tự resume
-python scripts/crawl_references.py --limit 20         # thử nhanh 20 paper
-python scripts/crawl_references.py --dry-run          # xem còn bao nhiêu paper
-python scripts/crawl_references.py --client browser   # scrape website bằng Chromium
-python scripts/crawl_references.py --client both      # API + browser, log chỗ lệch
-python scripts/crawl_references.py --api-min-interval 1.0  # giãn nhịp gọi API
-python scripts/crawl_references.py --tabs 3           # số worker API / số tab Chromium
-python scripts/crawl_references.py --retry-errors     # thử lại paper từng lỗi
-python scripts/crawl_references.py --retry-not-found  # thử lại paper S2 chưa index
-python scripts/crawl_references.py --retry-partial    # thử lại paper hoàn thành nhưng còn unresolved
-python scripts/crawl_references.py --verbose          # log từng paper + từng request S2
-python scripts/crawl_references.py --headed           # mở cửa sổ browser để debug
-python scripts/crawl_references.py --data-dir /data/arxiv  # đổi gốc dữ liệu
-python scripts/crawl_references.py --month-size 2501=24000
-python scripts/crawl_references.py --tolerate-errors 5     # exit 0 nếu <= 5 lỗi
+python src/scripts/crawl_references.py                    # Graph API (mặc định), tự resume
+python src/scripts/crawl_references.py --limit 20         # thử nhanh 20 paper
+python src/scripts/crawl_references.py --dry-run          # xem còn bao nhiêu paper
+python src/scripts/crawl_references.py --client browser   # scrape website bằng Chromium
+python src/scripts/crawl_references.py --client both      # API + browser, log chỗ lệch
+python src/scripts/crawl_references.py --api-min-interval 1.0  # giãn nhịp gọi API
+python src/scripts/crawl_references.py --tabs 3           # số worker API / số tab Chromium
+python src/scripts/crawl_references.py --retry-errors     # thử lại paper từng lỗi
+python src/scripts/crawl_references.py --retry-not-found  # thử lại paper S2 chưa index
+python src/scripts/crawl_references.py --retry-partial    # thử lại paper hoàn thành nhưng còn unresolved
+python src/scripts/crawl_references.py --verbose          # log từng paper + từng request S2
+python src/scripts/crawl_references.py --headed           # mở cửa sổ browser để debug
+python src/scripts/crawl_references.py --data-dir /data/arxiv  # đổi gốc dữ liệu
+python src/scripts/crawl_references.py --month-size 2501=24000
+python src/scripts/crawl_references.py --tolerate-errors 5     # exit 0 nếu <= 5 lỗi
 ```
 
 ## Chọn client
