@@ -50,6 +50,7 @@ Các biến môi trường liên quan:
 |---|---:|---|
 | `S2_API_KEY` | rỗng | Key Graph API; không có key thì dùng quota ẩn danh |
 | `S2_API_MIN_INTERVAL` | `1.0` | Giây tối thiểu giữa hai request API, dùng chung mọi worker |
+| `S2_API_REF_FIELDS` | `citedPaper.paperId,citedPaper.externalIds,citedPaper.title,citedPaper.authors,citedPaper.year,citedPaper.publicationDate` | Các trường lấy cho mỗi reference; mặc định suy ra từ `S2_API_PAPER_FIELDS` |
 | `S2_WEB_MIN_INTERVAL` | `3.0` | Giây tối thiểu giữa hai request browser, dùng chung mọi tab |
 | `S2_TABS` | `3` | Số worker API / số tab Chromium mặc định |
 | `S2_HEADLESS` | `1` | `0`/`false` để hiện cửa sổ browser |
@@ -68,6 +69,7 @@ python scripts/crawl_references.py --api-min-interval 1.0  # giãn nhịp gọi 
 python scripts/crawl_references.py --tabs 3           # số worker API / số tab Chromium
 python scripts/crawl_references.py --retry-errors     # thử lại paper từng lỗi
 python scripts/crawl_references.py --retry-not-found  # thử lại paper S2 chưa index
+python scripts/crawl_references.py --retry-partial    # thử lại paper hoàn thành nhưng còn unresolved
 python scripts/crawl_references.py --verbose          # log từng paper + từng request S2
 python scripts/crawl_references.py --headed           # mở cửa sổ browser để debug
 python scripts/crawl_references.py --data-dir /data/arxiv  # đổi gốc dữ liệu
@@ -93,7 +95,8 @@ sang browser, giữ nguyên tiến độ và ghi `client_type = "api->browser"` 
 thống kê.
 
 - 404: paper chưa được S2 index — ghi `not_found`, không retry.
-- 429: retry theo header `Retry-After` và tạm chặn mọi worker qua rate limiter.
+- 429: retry theo header `Retry-After` (hỗ trợ cả giây và HTTP-date) và tạm chặn
+  mọi worker qua rate limiter.
 - 5xx / lỗi mạng: retry với exponential backoff + jitter.
 - 401/403: không retry; kích hoạt fallback ở chế độ `--client api`.
 
@@ -101,8 +104,9 @@ thống kê.
 
 - Mỗi paper xong được ghi ngay vào ledger (fsync), nên Ctrl-C an toàn: paper
   đang làm dở không bị đánh dấu `ok` và sẽ được làm lại ở lần chạy sau.
-- Paper 0 reference, paper `not_found` và paper lỗi đều có trạng thái riêng,
-  tránh lặp vô hạn. Dùng `--retry-errors` / `--retry-not-found` để thử lại.
+- Paper 0 reference, paper `not_found`, paper `partial` (có reference unresolved)
+  và paper `error` đều có trạng thái riêng, tránh lặp vô hạn. Dùng
+  `--retry-errors` / `--retry-not-found` / `--retry-partial` để thử lại.
 - Một file lock (`.crawler.lock`) ngăn hai tiến trình cùng ghi vào một member.
 
 ## Exit code
@@ -122,8 +126,9 @@ hoặc `--data-dir`):
 - `references.jsonl` — cạnh trích dẫn, mỗi dòng gồm `schema_version`,
   `arxiv_id`, `ref_arxiv_id`, `ref_title`, `ref_authors`,
   `ref_submission_date`, `ref_year`, `ref_s2_id`, `member`, `crawled_at`.
-- `ledger.jsonl` — trạng thái từng paper (`ok` / `not_found` / `error`, số lần
-  thử, số reference tìm thấy/ghi được); đây là cơ sở để resume.
+- `ledger.jsonl` — trạng thái từng paper (`ok` / `partial` / `not_found` / `error`,
+  số lần thử, số reference tìm thấy/ghi được, và các metrics chi tiết); đây là
+  cơ sở để resume.
 - File cũ dùng chung `data/raw/references.jsonl` được tự động nhập một lần vào
   đúng thư mục member (theo dải ID) khi chạy lần đầu.
 - Log: `logs/crawl_references_<member>.log`.
@@ -148,6 +153,47 @@ Ví dụ một dòng `references.jsonl`:
 }
 ```
 
+### Ledger schema (mỗi dòng một paper)
+
+```json
+{
+  "schema_version": 2,
+  "arxiv_id": "2504_12523",
+  "member": "member3",
+  "status": "ok",
+  "attempts": 0,
+  "refs_total": 45,
+  "refs_with_arxiv": 38,
+  "refs_written": 38,
+  "raw_refs_received": 45,
+  "refs_with_paper_id": 42,
+  "refs_unresolved": 3,
+  "fallback_requests": 1,
+  "completeness": "complete",
+  "error": "",
+  "crawled_at": "2026-01-01T00:00:00+00:00"
+}
+```
+
+**Các trạng thái `status`:**
+
+| Trạng thái | Ý nghĩa | Resume mặc định |
+|---|---|---|
+| `ok` | Crawl thành công, tất cả reference đều resolved | Bỏ qua |
+| `partial` | Crawl thành công nhưng một vài reference **unresolved** | Bỏ qua (trừ `--retry-partial`) |
+| `not_found` | Paper chưa có trên S2 (HTTP 404) | Bỏ qua (trừ `--retry-not-found`) |
+| `error` | Lỗi transport/API sau khi hết retry | Thử lại nếu `--retry-errors`, hoặc đã hết `MAX_PAPER_ATTEMPTS` |
+
+**Metrics chi tiết trong ledger:**
+- `refs_total`: tổng references API trả về cho paper này
+- `refs_with_arxiv`: số reference có arXiv ID hợp lệ
+- `refs_written`: số cạnh thực tế ghi vào `references.jsonl` (sau dedup)
+- `raw_refs_received`: entries raw từ API trước khi lọc (đếm tất cả page)
+- `refs_with_paper_id`: entries có Semantic Scholar paperId
+- `refs_unresolved`: entries không xác định được identifier nào
+- `fallback_requests`: số lần gọi batch lookup để bổ sung metadata thiếu
+- `completeness`: `"complete"` hoặc `"partial"`
+
 ## Quy tắc dữ liệu chung
 
 - File trung gian và đầu ra dùng JSON Lines (`.jsonl`), UTF-8, một object mỗi dòng.
@@ -155,6 +201,10 @@ Ví dụ một dòng `references.jsonl`:
 - Mọi arXiv ID trong dữ liệu và tên file đi qua `src.utils.clean_arxiv_id()`;
   trước khi so khớp, ID được bỏ version bằng `normalize_arxiv_id()` để
   `2301.12345v3` và `2301.12345` là cùng một đỉnh.
+- ID legacy 7 chữ số vẫn hợp lệ (regex `_ARXIV_ID_PATTERN` trong `src/utils.py`).
+  `clean_arxiv_id()` đổi `/` thành `_`, nên `astro-ph/1234567` được lưu là
+  `astro-ph_1234567` và `math/1234567` là `math_1234567`; đây là dạng chuẩn
+  hoá bình thường, không phải dữ liệu lỗi.
 - Khi gọi dịch vụ khác của arXiv (ví dụ tải full-text), nghỉ tối thiểu 3 giây
   giữa hai request (`utils.RateLimiter`, `ARXIV_MIN_INTERVAL`). Crawler hiện tại
   chỉ gọi Semantic Scholar.
@@ -209,3 +259,5 @@ cat statistics/crawl_references_member3.md
 | `KeyError: memberX` | Sai `ARXIV_MEMBER` | Kiểm tra `ranges.yaml` |
 | `month_sizes is missing` | Thiếu config tháng | Điền `month_sizes` hoặc dùng `--month-size` |
 | Exit code `2` | Có lỗi tạm thời sau retry | Chạy lại, hoặc `--tolerate-errors N` |
+
+(End of file - total 216 lines)
