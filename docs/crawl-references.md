@@ -123,9 +123,8 @@ thống kê.
 Mỗi member ghi riêng vào `data/raw/<member>/` (đổi gốc bằng `ARXIV_DATA_DIR`
 hoặc `--data-dir`):
 
-- `references.jsonl` — cạnh trích dẫn, mỗi dòng gồm `schema_version`,
-  `arxiv_id`, `ref_arxiv_id`, `ref_title`, `ref_authors`,
-  `ref_submission_date`, `ref_year`, `ref_s2_id`, `member`, `crawled_at`.
+- `references.jsonl` — cạnh trích dẫn, mỗi dòng gồm `arxiv_id`,
+  `ref_arxiv_id`, `ref_title`, `ref_authors`, `ref_submission_date`, `ref_s2_id`.
 - `ledger.jsonl` — trạng thái từng paper (`ok` / `partial` / `not_found` / `error`,
   số lần thử, số reference tìm thấy/ghi được, và các metrics chi tiết); đây là
   cơ sở để resume.
@@ -140,16 +139,12 @@ Ví dụ một dòng `references.jsonl`:
 
 ```json
 {
-  "schema_version": 2,
   "arxiv_id": "2504_12523",
   "ref_arxiv_id": "2401_05432",
   "ref_title": "Attention Is All You Need",
   "ref_authors": ["Ashish Vaswani", "Noam Shazeer"],
   "ref_submission_date": "2024-01-10",
-  "ref_year": 2024,
-  "ref_s2_id": "abc123...",
-  "member": "member3",
-  "crawled_at": "2026-01-01T00:00:00+00:00"
+  "ref_s2_id": "abc123..."
 }
 ```
 
@@ -229,8 +224,8 @@ print(df.dtypes)
 ```
 
 `load_references` trả về đủ cột trong `REQUIRED_COLUMNS`, đổi tên
-`ref_publication_date` (dữ liệu cũ) thành `ref_submission_date`, ép
-`ref_year` sang `Int64` và `ref_authors` sang `list[str]`.
+`ref_publication_date` (dữ liệu cũ) thành `ref_submission_date`, và ép
+`ref_authors` sang `list[str]`.
 
 ## Theo dõi tiến độ
 
