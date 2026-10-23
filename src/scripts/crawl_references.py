@@ -3,7 +3,7 @@
 
 Usage:
     export ARXIV_MEMBER=memberX
-    python scripts/crawl_references.py
+    python src/scripts/crawl_references.py
 
 Pipeline and Metrics:
     - raw_refs_received: Raw reference entries returned by S2 API.
@@ -38,7 +38,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src import config
 from src.crawler import crawl_references, paths_for
