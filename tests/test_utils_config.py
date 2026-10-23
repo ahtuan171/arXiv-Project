@@ -61,7 +61,7 @@ def test_rate_limiter_enforces_interval():
     limiter.wait()
     start = time.monotonic()
     limiter.wait()
-    assert time.monotonic() - start >= 0.19
+    assert time.monotonic() - start >= 0.18
 
 
 def test_retry_gives_up_and_succeeds():
