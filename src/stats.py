@@ -6,8 +6,10 @@ Markdown report so a run can be inspected without parsing the log file.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -212,3 +214,126 @@ def save_stats(
     payload.update({key: value for key, value in report_kwargs.items() if value is not None})
     _atomic_write(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     _atomic_write(report_path, build_report(stats, **report_kwargs))
+
+
+# --- Semantic Scholar API Query Stats CSV -----------------------------------
+
+QUERY_STATS_CSV_COLUMNS: list[str] = [
+    "arxiv_id",
+    "ref_status",
+    "num_crawled_refs",
+    "num_arxiv_refs",
+    "ref_time_sec",
+]
+
+
+def make_query_stat_record(
+    arxiv_id: str,
+    ref_status: str,
+    num_crawled_refs: int,
+    num_arxiv_refs: int,
+    ref_time_sec: float,
+) -> dict[str, Any]:
+    """Create a structured dictionary for one Semantic Scholar API query result."""
+    from src.utils import canonical_arxiv_id
+
+    if ref_status not in {"success", "not_found", "failed"}:
+        raise ValueError(
+            f"Invalid ref_status {ref_status!r}; expected 'success', 'not_found', or 'failed'"
+        )
+
+    return {
+        "arxiv_id": canonical_arxiv_id(arxiv_id),
+        "ref_status": ref_status,
+        "num_crawled_refs": int(num_crawled_refs),
+        "num_arxiv_refs": int(num_arxiv_refs),
+        "ref_time_sec": round(float(ref_time_sec), 4),
+    }
+
+
+def create_query_stats_csv(
+    records: Iterable[dict[str, Any]],
+    output_path: Path | str,
+) -> Path:
+    """Create and write query statistics records to a CSV file.
+
+    Columns:
+    - arxiv_id (Primary Key): Mã bài báo.
+    - ref_status: Trạng thái gọi API (success, not_found, failed).
+    - num_crawled_refs: Tổng số tài liệu tham khảo cào được từ Semantic Scholar.
+    - num_arxiv_refs: Số tài liệu tham khảo có chứa mã ArXiv hợp lệ.
+    - ref_time_sec: Thời gian gọi và phản hồi từ API.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(temp_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=QUERY_STATS_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(rec)
+    os.replace(temp_path, path)
+    return path
+
+
+def append_query_stat_csv(
+    record: dict[str, Any],
+    output_path: Path | str,
+) -> None:
+    """Append a single query statistic record to a CSV file, writing headers if new."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists() and path.stat().st_size > 0
+    with open(path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=QUERY_STATS_CSV_COLUMNS, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(record)
+
+
+async def query_and_record_paper_stats(
+    client: Any,
+    arxiv_id: str,
+) -> dict[str, Any]:
+    """Query Semantic Scholar API for a single paper, timing response and parsing counts."""
+    from src.s2_client import S2NotFound
+    from src.utils import canonical_arxiv_id, is_valid_arxiv_id, normalize_arxiv_id
+
+    canon_id = canonical_arxiv_id(arxiv_id)
+    t0 = time.perf_counter()
+    try:
+        page = getattr(client, "pages", [None])[0] if hasattr(client, "pages") else None
+        refs = await client.get_references(page, arxiv_id)
+        duration = time.perf_counter() - t0
+
+        num_crawled = getattr(refs, "raw_refs_received", len(refs))
+        num_arxiv = sum(
+            1 for ref in refs
+            if is_valid_arxiv_id(normalize_arxiv_id(getattr(ref, "arxiv_id", None)) or "")
+        )
+        return make_query_stat_record(
+            arxiv_id=canon_id,
+            ref_status="success",
+            num_crawled_refs=num_crawled,
+            num_arxiv_refs=num_arxiv,
+            ref_time_sec=duration,
+        )
+    except S2NotFound:
+        duration = time.perf_counter() - t0
+        return make_query_stat_record(
+            arxiv_id=canon_id,
+            ref_status="not_found",
+            num_crawled_refs=0,
+            num_arxiv_refs=0,
+            ref_time_sec=duration,
+        )
+    except Exception:
+        duration = time.perf_counter() - t0
+        return make_query_stat_record(
+            arxiv_id=canon_id,
+            ref_status="failed",
+            num_crawled_refs=0,
+            num_arxiv_refs=0,
+            ref_time_sec=duration,
+        )
+

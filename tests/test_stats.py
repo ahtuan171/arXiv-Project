@@ -100,3 +100,104 @@ def test_stats_paths_are_per_member():
     assert first_json != second_json
     assert first_report != second_report
     assert first_json.parent.name == "statistics"
+
+
+import csv
+import pytest
+from src.s2_client import S2NotFound, S2Error, S2Paper
+from src.stats import (
+    QUERY_STATS_CSV_COLUMNS,
+    append_query_stat_csv,
+    create_query_stats_csv,
+    make_query_stat_record,
+    query_and_record_paper_stats,
+)
+
+
+def test_make_query_stat_record_valid():
+    rec = make_query_stat_record("2501.07642", "success", 10, 5, 1.23456)
+    assert rec == {
+        "arxiv_id": "2501_07642",
+        "ref_status": "success",
+        "num_crawled_refs": 10,
+        "num_arxiv_refs": 5,
+        "ref_time_sec": 1.2346,
+    }
+
+
+def test_make_query_stat_record_invalid_status():
+    with pytest.raises(ValueError, match="Invalid ref_status"):
+        make_query_stat_record("2501.07642", "unknown", 0, 0, 0.5)
+
+
+def test_create_and_append_query_stats_csv(tmp_path):
+    csv_file = tmp_path / "stats.csv"
+    records = [
+        make_query_stat_record("2501.07642", "success", 15, 8, 0.75),
+        make_query_stat_record("2501.07643", "not_found", 0, 0, 0.25),
+    ]
+    created = create_query_stats_csv(records, csv_file)
+    assert created == csv_file
+    assert csv_file.exists()
+
+    with open(csv_file, mode="r", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    assert len(reader) == 2
+    assert list(reader[0].keys()) == QUERY_STATS_CSV_COLUMNS
+    assert reader[0]["arxiv_id"] == "2501_07642"
+    assert reader[0]["ref_status"] == "success"
+    assert reader[0]["num_crawled_refs"] == "15"
+    assert reader[0]["num_arxiv_refs"] == "8"
+    assert reader[0]["ref_time_sec"] == "0.75"
+
+    # Test append
+    extra = make_query_stat_record("2501.07644", "failed", 0, 0, 0.12)
+    append_query_stat_csv(extra, csv_file)
+    with open(csv_file, mode="r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 3
+    assert rows[2]["ref_status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_query_and_record_paper_stats_success():
+    class MockSuccessClient:
+        async def get_references(self, page, arxiv_id):
+            return [
+                S2Paper("p1", "2401.00001", "T1", ["A1"], 2024, "2024-01-01"),
+                S2Paper("p2", None, "T2", ["A2"], 2024, "2024-01-02"),
+            ]
+
+    rec = await query_and_record_paper_stats(MockSuccessClient(), "2501.07642")
+    assert rec["arxiv_id"] == "2501_07642"
+    assert rec["ref_status"] == "success"
+    assert rec["num_crawled_refs"] == 2
+    assert rec["num_arxiv_refs"] == 1
+    assert rec["ref_time_sec"] >= 0.0
+
+
+@pytest.mark.anyio
+async def test_query_and_record_paper_stats_not_found():
+    class MockNotFoundClient:
+        async def get_references(self, page, arxiv_id):
+            raise S2NotFound("Not found")
+
+    rec = await query_and_record_paper_stats(MockNotFoundClient(), "2501.07642")
+    assert rec["arxiv_id"] == "2501_07642"
+    assert rec["ref_status"] == "not_found"
+    assert rec["num_crawled_refs"] == 0
+    assert rec["num_arxiv_refs"] == 0
+
+
+@pytest.mark.anyio
+async def test_query_and_record_paper_stats_failed():
+    class MockErrorClient:
+        async def get_references(self, page, arxiv_id):
+            raise S2Error("Server 500 error")
+
+    rec = await query_and_record_paper_stats(MockErrorClient(), "2501.07642")
+    assert rec["arxiv_id"] == "2501_07642"
+    assert rec["ref_status"] == "failed"
+    assert rec["num_crawled_refs"] == 0
+    assert rec["num_arxiv_refs"] == 0
+
