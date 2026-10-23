@@ -651,12 +651,11 @@ class TestSchemaRegression:
     def test_edge_record_has_all_required_columns(self):
         ref = S2Paper("p1", "2401.00001", "T", ["A"], 2024, "2024-01-01")
         record = build_reference_record(FIRST_ID, ref, MEMBER, "2026-01-01T00:00:00+00:00")
-        required = {
-            "schema_version", "arxiv_id", "ref_arxiv_id", "ref_title",
-            "ref_authors", "ref_submission_date", "ref_year", "ref_s2_id",
-            "member", "crawled_at",
+        expected = {
+            "arxiv_id", "ref_arxiv_id", "ref_title",
+            "ref_authors", "ref_submission_date", "ref_s2_id",
         }
-        assert required.issubset(record.keys())
+        assert set(record.keys()) == expected
 
     def test_no_edge_for_invalid_arxiv_id(self):
         ref = S2Paper("p1", "not-an-arxiv-id!!!", "T", [], None, None)

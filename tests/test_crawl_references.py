@@ -385,10 +385,18 @@ class TestReferenceRecord:
         )
         assert record["arxiv_id"] == "2501_07642"
         assert record["ref_arxiv_id"] == "2401_00001"
+        assert record["ref_title"] == "Paper"
+        assert record["ref_authors"] == ["A"]
         assert record["ref_submission_date"] == "2024-01-01"
-        assert record["ref_year"] == 2024
-        assert record["member"] == MEMBER
-        assert record["schema_version"] == config.SCHEMA_VERSION
+        assert record["ref_s2_id"] == "p1"
+        assert set(record.keys()) == {
+            "arxiv_id",
+            "ref_arxiv_id",
+            "ref_title",
+            "ref_authors",
+            "ref_submission_date",
+            "ref_s2_id",
+        }
 
     def test_drops_references_without_arxiv_id(self):
         assert build_reference_record(FIRST_ID, make_paper(arxiv_id=None), MEMBER, "now") is None
@@ -569,7 +577,10 @@ class TestCrawl:
         migrated = read_records(paths.references)
         assert len(migrated) == 1
         assert migrated[0]["ref_submission_date"] == "2024-01-01"
-        assert migrated[0]["member"] == MEMBER
+        assert migrated[0]["ref_title"] == "Old"
+        assert "member" not in migrated[0]
+        assert "schema_version" not in migrated[0]
+        assert "crawled_at" not in migrated[0]
         assert load_latest_records(paths.ledger)[canonical_arxiv_id(FIRST_ID)]["status"] == "ok"
 
     def test_dry_run_makes_no_calls_and_writes_no_data(self, tmp_path, quiet_log):

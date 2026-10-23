@@ -200,24 +200,20 @@ def load_reference_pairs(path: Path) -> set[tuple[str, str]]:
 def build_reference_record(
     citing_id: str,
     ref: S2Paper,
-    member: str,
-    crawled_at: str,
+    member: Optional[str] = None,
+    crawled_at: Optional[str] = None,
 ) -> Optional[dict]:
     """Build one output record, or ``None`` when the reference has no arXiv ID."""
     ref_id = normalize_arxiv_id(ref.arxiv_id)
     if not ref_id or not is_valid_arxiv_id(ref_id):
         return None
     return {
-        "schema_version": config.SCHEMA_VERSION,
         "arxiv_id": canonical_arxiv_id(citing_id),
         "ref_arxiv_id": canonical_arxiv_id(ref_id),
         "ref_title": ref.title or "",
         "ref_authors": list(ref.authors or []),
         "ref_submission_date": ref.publication_date or "",
-        "ref_year": ref.year,
-        "ref_s2_id": ref.paper_id,
-        "member": member,
-        "crawled_at": crawled_at,
+        "ref_s2_id": ref.paper_id or "",
     }
 
 
@@ -257,16 +253,12 @@ def migrate_legacy_references(
         seen.add(pair)
         counts[citing] = counts.get(citing, 0) + 1
         records.append({
-            "schema_version": config.SCHEMA_VERSION,
             "arxiv_id": citing,
             "ref_arxiv_id": cited,
             "ref_title": record.get("ref_title") or "",
             "ref_authors": list(record.get("ref_authors") or []),
             "ref_submission_date": record.get("ref_submission_date") or record.get("ref_publication_date") or "",
-            "ref_year": record.get("ref_year"),
             "ref_s2_id": record.get("ref_s2_id") or "",
-            "member": member,
-            "crawled_at": crawled_at,
         })
 
     if not records:
