@@ -203,10 +203,10 @@ Ví dụ một dòng `references.jsonl`:
 - Khi gọi dịch vụ khác của arXiv (ví dụ tải full-text), nghỉ tối thiểu 3 giây
   giữa hai request (`utils.RateLimiter`, `ARXIV_MIN_INTERVAL`). Crawler hiện tại
   chỉ gọi Semantic Scholar.
-- Client Graph API (`src/s2_api_client.py`) dùng `httpx`, header `x-api-key`,
+- Client Graph API (`src/crawl_references_module/s2_api_client.py`) dùng `httpx`, header `x-api-key`,
   endpoint `/paper/arXiv:<id>`, `/paper/<id>/references` và `/paper/batch`;
   retry 429 (theo `Retry-After`) và 5xx, không retry 401/403/404.
-- Client browser (`src/s2_client.py`) vẫn giữ làm fallback/dự phòng: một
+- Client browser (`src/crawl_references_module/s2_client.py`) vẫn giữ làm fallback/dự phòng: một
   Chromium, 3 tab tái sử dụng, chung một `AsyncRateLimiter`, nghỉ 30 giây sau
   WAF challenge. Tab chỉ đóng sau khi toàn bộ hàng đợi xong (hoặc khi Ctrl-C / lỗi).
 - Thống kê mỗi lần chạy có thêm `client_type`, `api_calls`, `browser_calls`,
@@ -217,7 +217,7 @@ Ví dụ một dòng `references.jsonl`:
 ## Đọc dữ liệu
 
 ```python
-from src.read_ref import load_references
+from src.crawl_references_module.read_ref import load_references
 
 df = load_references("data/raw/member3/references.jsonl")
 print(df.dtypes)

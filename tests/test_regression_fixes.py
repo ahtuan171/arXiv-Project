@@ -16,14 +16,14 @@ import httpx
 import pytest
 
 from src import config
-from src.crawler import (
+from src.crawl_references_module.crawler import (
     CrawlPaths,
     _is_done,
     _ledger_entry,
     build_reference_record,
     crawl_references,
 )
-from src.s2_api_client import (
+from src.crawl_references_module.s2_api_client import (
     ReferenceResult,
     S2ApiClient,
     S2ApiRateLimited,
@@ -32,8 +32,8 @@ from src.s2_api_client import (
     is_sufficiently_complete,
     merge_paper,
 )
-from src.s2_client import S2Paper
-from src.stats import CrawlStats
+from src.crawl_references_module.s2_client import S2Paper
+from src.crawl_references_module.stats import CrawlStats
 from src.utils import canonical_arxiv_id, load_latest_records, read_jsonl
 
 MEMBER = "member1"

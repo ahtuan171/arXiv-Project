@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from src.stats import CrawlStats, build_report, save_stats, stats_paths
+from src.crawl_references_module.stats import CrawlStats, build_report, save_stats, stats_paths
 
 
 class FakeRef:
@@ -104,8 +104,8 @@ def test_stats_paths_are_per_member():
 
 import csv
 import pytest
-from src.s2_client import S2NotFound, S2Error, S2Paper
-from src.stats import (
+from src.crawl_references_module.s2_client import S2NotFound, S2Error, S2Paper
+from src.crawl_references_module.stats import (
     QUERY_STATS_CSV_COLUMNS,
     append_query_stat_csv,
     create_query_stats_csv,

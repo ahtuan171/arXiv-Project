@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src import config
-from src.crawler import crawl_references, paths_for
+from src.crawl_references_module.crawler import crawl_references, paths_for
 from src.utils import LockError, file_lock, setup_logging
 
 

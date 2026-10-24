@@ -1,6 +1,6 @@
 """Semantic Scholar official Graph API client.
 
-Unlike :mod:`src.s2_client`, this client talks to the documented JSON API over
+Unlike :mod:`src.crawl_references_module.s2_client`, this client talks to the documented JSON API over
 plain HTTPS. It needs ``S2_API_KEY`` for the keyed rate limit, but works without
 a key at the much lower anonymous limit.
 
@@ -24,7 +24,7 @@ from urllib.parse import quote
 import httpx
 
 from src import config
-from src.s2_client import (
+from src.crawl_references_module.s2_client import (
     S2AuthError,
     S2Error,
     S2NotFound,

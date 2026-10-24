@@ -12,9 +12,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src import config
-from src.s2_api_client import S2ApiAuthError, S2ApiClient, S2ApiRateLimited, ReferenceResult
-from src.s2_client import S2AuthError, S2BrowserClient, S2Error, S2NotFound, S2Paper
-from src.stats import CrawlStats, format_duration, save_stats, stats_paths
+from src.crawl_references_module.s2_api_client import (
+    ReferenceResult,
+    S2ApiAuthError,
+    S2ApiClient,
+    S2ApiRateLimited,
+)
+from src.crawl_references_module.s2_client import (
+    S2AuthError,
+    S2BrowserClient,
+    S2Error,
+    S2NotFound,
+    S2Paper,
+)
+from src.crawl_references_module.stats import CrawlStats, format_duration, save_stats, stats_paths
 from src.utils import (
     append_jsonl,
     append_jsonl_many,

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from src import config
-from src.s2_api_client import (
+from src.crawl_references_module.s2_api_client import (
     S2ApiAuthError,
     S2ApiClient,
     S2ApiNotFound,
@@ -479,7 +479,7 @@ class TestErrors:
         assert len(calls) == 3  # 1st GET fails (500), 2nd GET succeeds (200), 3rd POST batch (200)
 
     def test_permanent_failure_raises_exception_not_empty_success(self, monkeypatch):
-        from src.s2_api_client import S2ApiTransientError
+        from src.crawl_references_module.s2_api_client import S2ApiTransientError
 
         monkeypatch.setattr(config, "RETRY_JITTER", 0.0)
         monkeypatch.setattr(config, "BACKOFF_BASE", 0.0)

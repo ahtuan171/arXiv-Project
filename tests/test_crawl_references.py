@@ -10,15 +10,15 @@ from types import SimpleNamespace
 import pytest
 
 from src import config
-from src.crawler import (
+from src.crawl_references_module.crawler import (
     CrawlPaths,
     build_reference_record,
     crawl_references,
     load_reference_pairs,
     paths_for,
 )
-from src.s2_api_client import S2ApiAuthError, S2ApiRateLimited
-from src.s2_client import (
+from src.crawl_references_module.s2_api_client import S2ApiAuthError, S2ApiRateLimited
+from src.crawl_references_module.s2_client import (
     S2AuthError,
     S2BrowserClient,
     S2NotFound,
@@ -685,7 +685,7 @@ class TestApiMigration:
             FIRST_ID: [make_paper("r1", "2401.00001"), make_paper("r2", "2401.00002")],
         })
 
-        with caplog.at_level(logging.WARNING, logger="src.crawler"):
+        with caplog.at_level(logging.WARNING, logger="src.crawl_references_module.crawler"):
             result = crawl_references(
                 MEMBER, paths=paths, api_client=api, browser_client=browser,
                 client_type="both", limit=1, tabs=1, log=quiet_log,

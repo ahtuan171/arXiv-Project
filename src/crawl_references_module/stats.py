@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-STATS_DIR = Path(__file__).resolve().parent.parent / "statistics"
+STATS_DIR = Path(__file__).resolve().parent.parent.parent / "statistics"
 STATS_JSON_PATH = STATS_DIR / "crawl_references.json"
 STATS_REPORT_PATH = STATS_DIR / "index.md"
 
@@ -296,7 +296,7 @@ async def query_and_record_paper_stats(
     arxiv_id: str,
 ) -> dict[str, Any]:
     """Query Semantic Scholar API for a single paper, timing response and parsing counts."""
-    from src.s2_client import S2NotFound
+    from src.crawl_references_module.s2_client import S2NotFound
     from src.utils import canonical_arxiv_id, is_valid_arxiv_id, normalize_arxiv_id
 
     canon_id = canonical_arxiv_id(arxiv_id)
