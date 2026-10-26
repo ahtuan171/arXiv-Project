@@ -14,6 +14,7 @@ def test_download_stats_schema():
         has_tex=True,
         raw_size_bytes=10240,
         cleaned_size_bytes=4096,
+        num_tex_files=1,
         download_time_sec=1.234,
     )
     d = stats.to_dict()
@@ -23,6 +24,7 @@ def test_download_stats_schema():
         "has_tex": True,
         "raw_size_bytes": 10240,
         "cleaned_size_bytes": 4096,
+        "num_tex_files": 1,
         "download_time_sec": 1.234,
     }
     # Verify exact column names matching Table 2 in table_description.md
@@ -32,6 +34,7 @@ def test_download_stats_schema():
         "has_tex",
         "raw_size_bytes",
         "cleaned_size_bytes",
+        "num_tex_files",
         "download_time_sec",
     ]
     assert list(d.keys()) == expected_cols
@@ -93,7 +96,7 @@ def test_extract_source_archive_tar_gz(tmp_path: Path):
     assert extracted is True
     assert has_tex is True
     assert (target_dir / "paper.tex").exists()
-    assert (target_dir / "figs" / "fig1.png").exists()
+    assert not (target_dir / "figs" / "fig1.png").exists()
 
 
 def test_extract_source_archive_single_gz(tmp_path: Path):
@@ -250,6 +253,7 @@ def test_download_papers_range(tmp_path: Path, monkeypatch):
         "has_tex",
         "raw_size_bytes",
         "cleaned_size_bytes",
+        "num_tex_files",
         "download_time_sec",
     ]
     assert df.loc[df["arxiv_id"] == "2504.00001", "download_status"].values[0] == "success"
@@ -267,4 +271,213 @@ def test_download_papers_range(tmp_path: Path, monkeypatch):
     assert len(df_resumed) == 2
 
 
+def test_extract_source_archive_strictly_tex_and_bib_only(tmp_path: Path):
+    import io, tarfile
+    from src.download_module.downloader import extract_source_archive
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in [
+            ("paper.tex", b"\\documentclass{article}"),
+            ("refs.bib", b"@article{test, ...}"),
+            ("figure1.png", b"\x89PNG fake image"),
+            ("style.sty", b"\\ProvidesPackage{custom}"),
+            ("document.pdf", b"%PDF-1.4 binary"),
+            ("subdir/extra.tex", b"\\section{Appendix}"),
+        ]:
+            data = content
+            ti = tarfile.TarInfo(name=name)
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+
+    target_dir = tmp_path / "paper_source"
+    extracted_ok, has_tex = extract_source_archive(buf.getvalue(), target_dir)
+
+    assert extracted_ok is True
+    assert has_tex is True
+    remaining = [p.name for p in target_dir.rglob("*") if p.is_file()]
+    assert set(remaining) == {"paper.tex", "refs.bib", "extra.tex"}
+
+
+def test_download_single_paper_retry_429(tmp_path: Path, monkeypatch):
+    import io
+    import tarfile
+    from src.download_module.downloader import download_single_paper
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tex_data = b"\\documentclass{article}\n\\begin{document}Retried 429\\end{document}"
+        ti = tarfile.TarInfo(name="main.tex")
+        ti.size = len(tex_data)
+        tar.addfile(ti, io.BytesIO(tex_data))
+    tar_bytes = buf.getvalue()
+
+    call_count = 0
+
+    def mock_get(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return MockResponse(b"Too Many Requests", 429, {"Retry-After": "0.01"})
+        return MockResponse(tar_bytes, 200, {"Content-Type": "application/x-eprint-tar"})
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    stats = download_single_paper(
+        "2504.11111",
+        raw_dir=tmp_path,
+        rate_limiter=None,
+        max_retries=3,
+        backoff_base=0.01,
+    )
+
+    assert call_count == 2
+    assert stats.download_status == "success"
+    assert stats.has_tex is True
+    assert stats.num_tex_files == 1
+
+
+def test_download_single_paper_retry_server_errors_5xx(tmp_path: Path, monkeypatch):
+    import io
+    import tarfile
+    from src.download_module.downloader import download_single_paper
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tex_data = b"\\documentclass{article}\n\\begin{document}Retried 503\\end{document}"
+        ti = tarfile.TarInfo(name="main.tex")
+        ti.size = len(tex_data)
+        tar.addfile(ti, io.BytesIO(tex_data))
+    tar_bytes = buf.getvalue()
+
+    call_count = 0
+
+    def mock_get(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return MockResponse(b"Bad Gateway", 502)
+        if call_count == 2:
+            return MockResponse(b"Service Unavailable", 503)
+        return MockResponse(tar_bytes, 200, {"Content-Type": "application/x-eprint-tar"})
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    stats = download_single_paper(
+        "2504.22222",
+        raw_dir=tmp_path,
+        rate_limiter=None,
+        max_retries=4,
+        backoff_base=0.01,
+    )
+
+    assert call_count == 3
+    assert stats.download_status == "success"
+    assert stats.has_tex is True
+    assert stats.num_tex_files == 1
+
+
+def test_download_single_paper_retry_connection_loss_and_timeout(tmp_path: Path, monkeypatch):
+    import io
+    import tarfile
+    import requests.exceptions
+    from src.download_module.downloader import download_single_paper
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tex_data = b"\\documentclass{article}\n\\begin{document}Retried drop\\end{document}"
+        ti = tarfile.TarInfo(name="main.tex")
+        ti.size = len(tex_data)
+        tar.addfile(ti, io.BytesIO(tex_data))
+    tar_bytes = buf.getvalue()
+
+    call_count = 0
+
+    def mock_get(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise requests.exceptions.Timeout("Connection timed out on Colab")
+        if call_count == 2:
+            raise requests.exceptions.ConnectionError("Connection dropped by peer")
+        return MockResponse(tar_bytes, 200, {"Content-Type": "application/x-eprint-tar"})
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    stats = download_single_paper(
+        "2504.33333",
+        raw_dir=tmp_path,
+        rate_limiter=None,
+        max_retries=4,
+        backoff_base=0.01,
+    )
+
+    assert call_count == 3
+    assert stats.download_status == "success"
+    assert stats.has_tex is True
+    assert stats.num_tex_files == 1
+
+
+def test_download_single_paper_no_retry_on_404(tmp_path: Path, monkeypatch):
+    from src.download_module.downloader import download_single_paper
+
+    call_count = 0
+
+    def mock_get(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return MockResponse(b"Not Found", 404)
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    stats = download_single_paper(
+        "2504.44444",
+        raw_dir=tmp_path,
+        rate_limiter=None,
+        max_retries=3,
+        backoff_base=0.01,
+    )
+
+    assert call_count == 1
+    assert stats.download_status == "failed"
+    assert stats.num_tex_files == 0
+
+
+def test_download_single_paper_retry_incomplete_read(tmp_path: Path, monkeypatch):
+    import http.client
+    import io
+    import tarfile
+    from src.download_module.downloader import download_single_paper
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tex_data = b"\\documentclass{article}\n\\begin{document}Incomplete read retried\\end{document}"
+        ti = tarfile.TarInfo(name="main.tex")
+        ti.size = len(tex_data)
+        tar.addfile(ti, io.BytesIO(tex_data))
+    tar_bytes = buf.getvalue()
+
+    call_count = 0
+
+    def mock_get(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise http.client.IncompleteRead(b"partial bytes read", 1000)
+        return MockResponse(tar_bytes, 200, {"Content-Type": "application/x-eprint-tar"})
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    stats = download_single_paper(
+        "2504.55555",
+        raw_dir=tmp_path,
+        rate_limiter=None,
+        max_retries=3,
+        backoff_base=0.01,
+    )
+
+    assert call_count == 2
+    assert stats.download_status == "success"
+    assert stats.has_tex is True
+    assert stats.num_tex_files == 1
 
