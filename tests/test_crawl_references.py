@@ -706,3 +706,38 @@ class TestApiMigration:
             crawl_references(
                 MEMBER, paths=paths, client_type="scraper", log=quiet_log,
             )
+
+
+def test_crawl_references_range_generates_m1_reference_stats(tmp_path):
+    from src.crawl_references_module.crawler import crawl_references_range
+    import pandas as pd
+
+    csv_file = tmp_path / "csv" / "m1_reference_stats.csv"
+    out_file = tmp_path / "references.jsonl"
+
+    fake_client = FakeClient({
+        "2502.13235": [
+            make_paper("ref1", "1706.03762", "Attention"),
+            make_paper("ref2", "", "Non-arxiv paper"),
+        ]
+    })
+
+    df = crawl_references_range(
+        id_list=["2502.13235"],
+        out_path=out_file,
+        csv_path=csv_file,
+        client=fake_client,
+    )
+
+    assert csv_file.exists()
+    assert out_file.exists()
+    df_read = pd.read_csv(csv_file, dtype={"arxiv_id": str})
+    expected_cols = ["arxiv_id", "ref_status", "num_crawled_refs", "num_arxiv_refs", "ref_time_sec"]
+    assert list(df_read.columns) == expected_cols
+    assert len(df_read) == 1
+    assert df_read.loc[0, "arxiv_id"] == "2502.13235"
+    assert df_read.loc[0, "ref_status"] == "success"
+    assert df_read.loc[0, "num_crawled_refs"] == 2
+    assert df_read.loc[0, "num_arxiv_refs"] == 1
+    assert df_read.loc[0, "ref_time_sec"] >= 0
+
