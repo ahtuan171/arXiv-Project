@@ -816,3 +816,168 @@ async def crawl_references_async(
         pending=len(pending),
         fatal=fatal,
     )
+
+
+def crawl_references_range(
+    id_list: list[str],
+    out_path: Optional[Union[Path, str]] = None,
+    csv_path: Optional[Union[Path, str]] = None,
+    client: Optional[Any] = None,
+    limit: int = 0,
+    resume: bool = True,
+    dry_run: bool = False,
+    log: Optional[logging.Logger] = None,
+) -> Any:
+    """Crawl Semantic Scholar references for a list of arXiv IDs, generating Table 3 CSV.
+
+    Exports:
+    - out_path (JSONL): Reference citation edges matching Milestone 1 requirements.
+    - csv_path (CSV): Table 3 (m1_reference_stats) with columns:
+      `arxiv_id`, `ref_status`, `num_crawled_refs`, `num_arxiv_refs`, `ref_time_sec`.
+    """
+    import pandas as pd
+
+    logger_inst = log or logger
+    if out_path is None:
+        out_path = config.DATA_DIR / "references.jsonl"
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    if csv_path is None:
+        csv_path = config.DATA_DIR / "csv" / "m1_reference_stats.csv"
+    csv_p = Path(csv_path)
+    csv_p.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_stats_p = csv_p.with_suffix(".jsonl")
+
+    expected_cols = ["arxiv_id", "ref_status", "num_crawled_refs", "num_arxiv_refs", "ref_time_sec"]
+
+    if dry_run:
+        logger_inst.info("dry_run=True, skipping Semantic Scholar queries.")
+        return pd.DataFrame(columns=expected_cols)
+
+    done_ids: set[str] = set()
+    records: list[dict[str, Any]] = []
+
+    if resume:
+        if jsonl_stats_p.exists():
+            for row in read_jsonl(jsonl_stats_p):
+                records.append(row)
+                if row.get("arxiv_id"):
+                    done_ids.add(str(row["arxiv_id"]))
+        elif csv_p.exists():
+            try:
+                df_existing = pd.read_csv(csv_p, dtype={"arxiv_id": str})
+                records = df_existing.to_dict(orient="records")
+                done_ids = set(df_existing["arxiv_id"].astype(str))
+            except Exception:
+                pass
+
+    todo_ids = [str(x).strip() for x in id_list if str(x).strip() and (not resume or str(x).strip() not in done_ids)]
+    if limit > 0:
+        todo_ids = todo_ids[:limit]
+
+    # Resolve client
+    owns_client = False
+    active_client = client
+    if active_client is None:
+        active_client = S2ApiClient()
+        owns_client = True
+
+    async def _fetch_one(cid: str) -> tuple[str, list[S2Paper]]:
+        page = active_client.pages[0] if getattr(active_client, "pages", None) else None
+        if asyncio.iscoroutinefunction(active_client.get_references):
+            refs = await active_client.get_references(page, cid)
+        else:
+            refs = active_client.get_references(page, cid)
+        return cid, refs
+
+    async def _run_crawl():
+        if hasattr(active_client, "start"):
+            if not getattr(active_client, "started", False):
+                if asyncio.iscoroutinefunction(active_client.start):
+                    await active_client.start(1)
+                else:
+                    active_client.start(1)
+        try:
+            for cid in todo_ids:
+                t0 = time.perf_counter()
+                ref_status = "failed"
+                num_crawled_refs = 0
+                num_arxiv_refs = 0
+                raw_refs: list[S2Paper] = []
+
+                try:
+                    _, raw_refs = await _fetch_one(cid)
+                    ref_status = "success"
+                    num_crawled_refs = len(raw_refs)
+                except S2NotFound:
+                    ref_status = "not_found"
+                except Exception as err:
+                    logger_inst.warning("S2 query failed for %s: %s", cid, err)
+                    ref_status = "failed"
+
+                dt = time.perf_counter() - t0
+
+                # Process reference records
+                edge_records: list[dict] = []
+                for ref_item in raw_refs:
+                    rec = build_reference_record(cid, ref_item)
+                    if rec is not None:
+                        num_arxiv_refs += 1
+                        edge_records.append(rec)
+
+                if edge_records:
+                    append_jsonl_many(out_p, edge_records, fsync=True)
+
+                stat_item = {
+                    "arxiv_id": cid,
+                    "ref_status": ref_status,
+                    "num_crawled_refs": int(num_crawled_refs),
+                    "num_arxiv_refs": int(num_arxiv_refs),
+                    "ref_time_sec": round(float(dt), 4),
+                }
+                records.append(stat_item)
+                append_jsonl(jsonl_stats_p, stat_item)
+                done_ids.add(cid)
+        finally:
+            if owns_client and hasattr(active_client, "close"):
+                if asyncio.iscoroutinefunction(active_client.close):
+                    await active_client.close()
+                else:
+                    active_client.close()
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Running inside existing loop
+        task = loop.create_task(_run_crawl())
+        # If in async loop without nest_asyncio, wait with asyncio.wait
+        import concurrent.futures
+        # Alternatively run in new thread or nest_asyncio
+        try:
+            import nest_asyncio
+            nest_asyncio.apply()
+            loop.run_until_complete(_run_crawl())
+        except Exception:
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(lambda: asyncio.run(_run_crawl())).result()
+    else:
+        asyncio.run(_run_crawl())
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["arxiv_id"], keep="last")
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = None
+        df = df[expected_cols]
+    else:
+        df = pd.DataFrame(columns=expected_cols)
+
+    df.to_csv(csv_p, index=False)
+    logger_inst.info("Saved Table 3 stats to %s (%d rows)", csv_p, len(df))
+    return df
+

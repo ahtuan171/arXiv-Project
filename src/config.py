@@ -18,6 +18,23 @@ import yaml
 
 # --- Paths -----------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from .env file if present
+_env_file = ROOT_DIR / ".env"
+if _env_file.is_file():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        with open(_env_file, encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    _k, _v = _k.strip(), _v.strip().strip("'\"")
+                    if _k and _k not in os.environ:
+                        os.environ[_k] = _v
+
 DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
@@ -56,14 +73,14 @@ load_env_file()
 
 # --- Network politeness ----------------------------------------------------
 # arXiv requires at least 3 seconds between requests.
-ARXIV_MIN_INTERVAL = 3.0
+ARXIV_MIN_INTERVAL = 3.2
 # The website JSON endpoints tolerate a few requests/second, but be polite
 # enough to avoid WAF challenges. All tabs share one limiter.
 try:
-    S2_WEB_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_WEB_MIN_INTERVAL", "3.0")))
+    S2_WEB_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_WEB_MIN_INTERVAL", "3.2")))
 except ValueError:
-    S2_WEB_MIN_INTERVAL = 3.0
-S2_RATE_LIMIT_COOLDOWN = 2.0  # shared pause after any 429 response
+    S2_WEB_MIN_INTERVAL = 3.2
+S2_RATE_LIMIT_COOLDOWN = 2.2  # shared pause after any 429 response
 S2_WAF_COOLDOWN = 30.0  # longer pause after an AWS WAF challenge
 S2_PAGE_SIZE = 1000
 S2_BATCH_SIZE = 100
@@ -79,9 +96,9 @@ S2_API_KEY = os.environ.get("S2_API_KEY", "").strip()
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 # The keyed allowance is 100 requests / 5 minutes. Stay at 1 req/s by default.
 try:
-    S2_API_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_API_MIN_INTERVAL", "1.0")))
+    S2_API_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_API_MIN_INTERVAL", "1.2")))
 except ValueError:
-    S2_API_MIN_INTERVAL = 1.0
+    S2_API_MIN_INTERVAL = 1.2
 S2_API_MAX_RETRIES = 5
 S2_API_TIMEOUT = 30
 try:
@@ -99,6 +116,7 @@ MAX_RETRIES = 5
 BACKOFF_BASE = 2.0  # seconds; wait = BACKOFF_BASE ** attempt
 MAX_BACKOFF = 60.0
 RETRY_JITTER = 0.5
+JITTER = RETRY_JITTER
 MAX_RETRY_AFTER = 120.0
 REQUEST_TIMEOUT = 60  # seconds
 
