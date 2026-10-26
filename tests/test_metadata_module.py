@@ -162,3 +162,78 @@ def test_discovery_and_summarize(tmp_path: Path):
     assert summary["n_refs_total"] == 1
     assert summary["n_refs_with_arxiv"] == 1
     assert summary["avg_refs_per_paper"] == 1.0
+
+
+def test_crawl_papers_generates_m1_discovery_stats_csv(tmp_path: Path, monkeypatch):
+    from src.metadata_module.crawl_papers import crawl_papers
+    import pandas as pd
+
+    csv_file = tmp_path / "csv" / "m1_discovery_stats.csv"
+    jsonl_file = tmp_path / "papers.jsonl"
+
+    mock_result = MagicMock()
+    mock_result.entry_id = "http://arxiv.org/abs/2502.13235v2"
+    mock_result.title = "Test Paper"
+    author = MagicMock()
+    author.name = "Author"
+    mock_result.authors = [author]
+    mock_result.summary = "Abstract"
+    mock_result.categories = ["cs.AI"]
+    mock_result.primary_category = "cs.AI"
+    mock_result.published = datetime(2025, 2, 18, tzinfo=timezone.utc)
+    mock_result.updated = datetime(2025, 2, 20, tzinfo=timezone.utc)
+    mock_result.doi = None
+    mock_result.journal_ref = None
+    mock_result.comment = None
+
+    monkeypatch.setattr("src.metadata_module.crawl_papers.try_fetch_arxiv", lambda cid, *a, **kw: mock_result)
+
+    result = crawl_papers(
+        id_list=["2502.13235"],
+        out_path=jsonl_file,
+        csv_path=csv_file,
+    )
+
+    assert csv_file.exists()
+    df = pd.read_csv(csv_file, dtype={"arxiv_id": str})
+    expected_cols = ["arxiv_id", "discovery_status", "num_versions", "discovery_time_sec"]
+    assert list(df.columns) == expected_cols
+    assert len(df) == 1
+    assert df.loc[0, "arxiv_id"] == "2502.13235"
+    assert df.loc[0, "discovery_status"] == "success"
+    assert df.loc[0, "num_versions"] == 2
+    assert df.loc[0, "discovery_time_sec"] >= 0
+
+
+def test_try_fetch_arxiv_retry_transient_error(monkeypatch):
+    from src.metadata_module.crawl_papers import try_fetch_arxiv
+    import arxiv
+
+    call_count = 0
+    mock_paper = MagicMock()
+    mock_paper.entry_id = "http://arxiv.org/abs/2502.13235v1"
+
+    class MockResults:
+        def __iter__(self):
+            return self
+        def __next__(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise arxiv.HTTPError(status=503, message="Service Unavailable")
+            return mock_paper
+
+    monkeypatch.setattr("src.metadata_module.crawl_papers._client.results", lambda search: MockResults())
+
+    res = try_fetch_arxiv(
+        "2502.13235",
+        rate_limiter=None,
+        max_retries=3,
+        backoff_base=0.01,
+        jitter=0.0,
+    )
+
+    assert call_count == 2
+    assert res == mock_paper
+
+
