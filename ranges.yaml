@@ -22,12 +22,12 @@ members:
     end_month: null
     end_id: null
   member3:
-    name: ""
-    student_id: ""
-    start_month: null
-    start_id: null
-    end_month: null
-    end_id: null
+    name: "Hao"
+    student_id: "24120306"
+    start_month: "2024-12"
+    start_id: "03848"
+    end_month: "2024-12"
+    end_id: "08847"
   member4:
     name: ""
     student_id: ""

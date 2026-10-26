@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
+import os
+import random
+import re
 import sys
 import threading
 import time
@@ -22,8 +26,41 @@ try:  # ``resource`` is not available on Windows.
 except ImportError:  # pragma: no cover
     resource = None  # type: ignore[assignment]
 
+try:  # ``fcntl`` is not available on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 
 # --- Identifiers -----------------------------------------------------------
+_ARXIV_VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
+_ARXIV_ID_PATTERN = re.compile(
+    r"^(?:\d{4}[._]\d{4,5}|[a-zA-Z\-]+(?:\.[a-zA-Z\-]+)?[/_]\d{7})$"
+)
+
+
+def normalize_arxiv_id(arxiv_id: Optional[str]) -> str:
+    """Return an arXiv ID without ``arXiv:`` prefix or version suffix.
+
+    ``arXiv:2301.12345v3`` and ``2301.12345`` both become ``2301.12345``, so
+    citation edges match regardless of the version used by Semantic Scholar.
+    """
+    if arxiv_id is None:
+        return ""
+    text = str(arxiv_id).strip()
+    if text.lower().startswith("arxiv:"):
+        text = text[len("arxiv:"):].strip()
+    return _ARXIV_VERSION_RE.sub("", text)
+
+
+def is_valid_arxiv_id(arxiv_id: Optional[str]) -> bool:
+    """Return True if arxiv_id matches modern (YYMM.NNNN[N]) or legacy format."""
+    if not arxiv_id:
+        return False
+    norm = normalize_arxiv_id(arxiv_id)
+    return bool(_ARXIV_ID_PATTERN.match(norm))
+
+
 def clean_arxiv_id(arxiv_id: str) -> str:
     """Make an arXiv ID safe for file names and data fields.
 
@@ -37,21 +74,44 @@ def clean_arxiv_id(arxiv_id: str) -> str:
     return text
 
 
+def canonical_arxiv_id(arxiv_id: Optional[str]) -> str:
+    """Normalize a version and then make it safe for storage."""
+    return clean_arxiv_id(normalize_arxiv_id(arxiv_id))
+
+
 # --- Logging ---------------------------------------------------------------
 def setup_logging(name: str = "arxiv", log_file: Optional[Path] = None, level: int = logging.INFO) -> logging.Logger:
-    """Return a logger writing to stderr and, optionally, to ``log_file``."""
-    logger = logging.getLogger(name)
-    if logger.handlers:  # already configured
-        return logger
-    logger.setLevel(level)
+    """Configure the root logger so every ``src.*`` module is captured.
+
+    ``s2_client`` and ``utils.retry`` log through their own module loggers.
+    Configuring only the caller's logger (the previous behaviour) silently sent
+    the most important warnings to ``lastResort`` instead of the log file.
+    """
+    root = logging.getLogger()
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+
+    if not getattr(root, "_arxiv_configured", False):
+        root.setLevel(level)
+        if not root.handlers:
+            stream = logging.StreamHandler(sys.stderr)
+            stream.setFormatter(formatter)
+            root.addHandler(stream)
+        root._arxiv_configured = True  # type: ignore[attr-defined]
+
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    for handler in handlers:
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        configured_files = getattr(root, "_arxiv_log_files", set())
+        resolved = str(log_file.resolve())
+        if resolved not in configured_files:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+            configured_files.add(resolved)
+            root._arxiv_log_files = configured_files  # type: ignore[attr-defined]
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = True
     return logger
 
 
@@ -86,12 +146,42 @@ class RateLimiter:
         return wrapper  # type: ignore[return-value]
 
 
+class AsyncRateLimiter:
+    """Async variant of :class:`RateLimiter`, shared by all browser tabs."""
+
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = min_interval
+        self._last_call = 0.0
+        self._not_before = 0.0
+        self._lock = asyncio.Lock()
+
+    def block(self, seconds: float) -> None:
+        """Pause every tab after a shared quota error."""
+        self._not_before = max(self._not_before, time.monotonic() + max(0.0, seconds))
+
+    async def wait(self) -> None:
+        async with self._lock:
+            target = max(self._last_call + self.min_interval, self._not_before)
+            remaining = target - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            self._last_call = time.monotonic()
+
+
 def retry(
     max_attempts: int = config.MAX_RETRIES,
     backoff: float = config.BACKOFF_BASE,
     exceptions: tuple[type[BaseException], ...] = (Exception,),
+    max_delay: float = config.MAX_BACKOFF,
+    jitter: float = config.RETRY_JITTER,
 ) -> Callable[[F], F]:
-    """Retry a function with exponential backoff; re-raise after the last attempt."""
+    """Retry a function with capped exponential backoff and optional jitter.
+
+    If the raised exception exposes ``retry_after`` (seconds), that value is
+    honoured instead of the exponential delay. The decorator only retries the
+    exception types passed in ``exceptions``; callers should use this to let
+    permanent failures (404, invalid IDs) fail fast.
+    """
 
     def decorator(func: F) -> F:
         @functools.wraps(func)
@@ -103,8 +193,18 @@ def retry(
                 except exceptions as error:
                     if attempt == max_attempts:
                         raise
-                    delay = backoff**attempt
-                    logger.warning("%s failed (%s); retry %d/%d in %.0fs", func.__name__, error, attempt, max_attempts, delay)
+                    retry_after = getattr(error, "retry_after", None)
+                    if retry_after is None:
+                        delay = backoff**attempt
+                    else:
+                        delay = float(retry_after)
+                    delay = min(max(delay, 0.0), max_delay)
+                    if jitter:
+                        delay += random.uniform(0.0, jitter)
+                    logger.warning(
+                        "%s failed (%s); retry %d/%d in %.1fs",
+                        func.__name__, error, attempt, max_attempts, delay,
+                    )
                     time.sleep(delay)
 
         return wrapper  # type: ignore[return-value]
@@ -113,11 +213,29 @@ def retry(
 
 
 # --- JSON Lines I/O (UTF-8, one object per line) ---------------------------
-def append_jsonl(path: Path, record: dict) -> None:
-    """Append one record to a ``.jsonl`` file, creating parent folders."""
+def append_jsonl_many(path: Path, records: Iterable[dict], *, fsync: bool = False) -> int:
+    """Append a batch of records with one open/write/close cycle.
+
+    Writing the whole batch at once means a crash can only leave a truncated
+    *last* line (which :func:`read_jsonl` skips), never interleaved records.
+    Returns the number of records written.
+    """
+    records = list(records)
+    if not records:
+        return 0
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.write(payload)
+        handle.flush()
+        if fsync:
+            os.fsync(handle.fileno())
+    return len(records)
+
+
+def append_jsonl(path: Path, record: dict, *, fsync: bool = False) -> None:
+    """Append one record to a ``.jsonl`` file, creating parent folders."""
+    append_jsonl_many(path, [record], fsync=fsync)
 
 
 def write_jsonl(path: Path, records: Iterable[dict]) -> None:
@@ -146,6 +264,48 @@ def load_done_ids(path: Path, key: str = "arxiv_id") -> set[str]:
     if not path.exists():
         return set()
     return {record[key] for record in read_jsonl(path) if key in record}
+
+
+def load_latest_records(path: Path, key: str = "arxiv_id") -> dict[str, dict]:
+    """Return the last record per key, e.g. a progress ledger keyed by arXiv ID."""
+    if not path.exists():
+        return {}
+    latest: dict[str, dict] = {}
+    for record in read_jsonl(path):
+        value = record.get(key)
+        if value:
+            latest[str(value)] = record
+    return latest
+
+
+# --- Process locking -------------------------------------------------------
+class LockError(RuntimeError):
+    """Another process already owns the crawler lock."""
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Take an exclusive non-blocking lock for one member's output directory.
+
+    Prevents two crawler processes for the same member from appending duplicate
+    edges. On platforms without ``fcntl`` this is a no-op.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise LockError(f"Another crawler is already running ({path})") from error
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 # --- Performance measurement ----------------------------------------------
