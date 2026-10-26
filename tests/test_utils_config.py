@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 import time
 
 import pytest
@@ -155,3 +156,31 @@ def test_measure_reports_time():
     with utils.measure("sleep") as result:
         time.sleep(0.05)
     assert result.seconds >= 0.05
+
+
+def test_system_benchmark_tracker(tmp_path: Path):
+    from src.benchmark import SystemBenchmarkTracker
+    import pandas as pd
+
+    csv_file = tmp_path / "m1_system_benchmark.csv"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "test.txt").write_bytes(b"x" * 1024 * 1024)  # 1 MB
+
+    tracker = SystemBenchmarkTracker(storage_dirs=[data_dir], sample_interval_sec=0.02)
+    tracker.start()
+    time.sleep(0.08)
+    df = tracker.stop(total_papers=5, csv_path=csv_file)
+
+    assert csv_file.exists()
+    expected_cols = [
+        "total_papers", "total_wall_time_sec", "peak_ram_mb",
+        "average_ram_mb", "peak_disk_mb", "final_storage_mb"
+    ]
+    assert list(df.columns) == expected_cols
+    assert df.loc[0, "total_papers"] == 5
+    assert df.loc[0, "total_wall_time_sec"] > 0
+    assert df.loc[0, "peak_ram_mb"] > 0
+    assert df.loc[0, "average_ram_mb"] > 0
+    assert df.loc[0, "final_storage_mb"] >= 1.0
+

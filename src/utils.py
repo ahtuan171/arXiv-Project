@@ -388,3 +388,10 @@ def parse_arxiv_range(
     else:
         raise ValueError("Provide arXiv IDs in 'YYMM.NNNNN' format or specify the month parameter.")
 
+
+def get_benchmark_tracker(*args: Any, **kwargs: Any) -> Any:
+    """Helper to instantiate SystemBenchmarkTracker."""
+    from src.benchmark import SystemBenchmarkTracker
+    return SystemBenchmarkTracker(*args, **kwargs)
+
+
