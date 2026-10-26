@@ -184,7 +184,13 @@ def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool
     return False, False
 
 
+import http.client
+import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import requests.exceptions
+
 from src import config, utils
 from src.utils import RateLimiter
 
@@ -195,6 +201,23 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) arXiv-Project/1.
 _default_arxiv_limiter = RateLimiter(config.ARXIV_MIN_INTERVAL)
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse Retry-After header supporting both delay-seconds and HTTP-date."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(text)
+            now = datetime.now(timezone.utc)
+            seconds = (target - now).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0), getattr(config, "MAX_RETRY_AFTER", 120.0))
+
+
 def download_single_paper(
     arxiv_id: str,
     raw_dir: Optional[Path] = None,
@@ -202,8 +225,18 @@ def download_single_paper(
     session: Optional[requests.Session] = None,
     timeout: int = config.REQUEST_TIMEOUT,
     user_agent: str = DEFAULT_USER_AGENT,
+    max_retries: int = config.MAX_RETRIES,
+    backoff_base: float = config.BACKOFF_BASE,
+    max_backoff: float = config.MAX_BACKOFF,
+    jitter: float = config.RETRY_JITTER,
 ) -> DownloadStats:
     """Download, extract, and clean the source files of a single arXiv paper.
+
+    Includes automatic retries with exponential backoff for:
+    - HTTP 429 (Too Many Requests / Rate limiting): honours Retry-After header.
+    - HTTP 500, 502, 503, 504 (Server overload / Gateway errors).
+    - Network connection drops and timeouts (e.g. transient Colab disconnects).
+    HTTP 404 fails fast without retrying.
 
     Measures performance and attributes matching Table 2 (m1_download_stats):
     - arxiv_id (Primary Key)
@@ -220,6 +253,10 @@ def download_single_paper(
         session: Optional requests.Session for connection reuse.
         timeout: HTTP request timeout in seconds.
         user_agent: Custom User-Agent header for arXiv politeness.
+        max_retries: Maximum number of attempts for transient errors.
+        backoff_base: Exponential backoff base factor (seconds).
+        max_backoff: Maximum backoff delay cap (seconds).
+        jitter: Random jitter added to backoff delays (seconds).
 
     Returns:
         DownloadStats object recording all attributes required by Table 2.
@@ -228,29 +265,104 @@ def download_single_paper(
         raw_dir = config.RAW_DIR
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    if rate_limiter is not None:
-        rate_limiter.wait()
-
     t0 = time.perf_counter()
     url = ARXIV_SRC_URL.format(arxiv_id=arxiv_id)
     headers = {"User-Agent": user_agent}
+    get_func = session.get if session is not None else requests.get
 
-    try:
-        get_func = session.get if session is not None else requests.get
-        response = get_func(url, headers=headers, timeout=timeout)
-    except Exception as err:
-        logger.error("Network error downloading %s: %s", arxiv_id, err)
-        return DownloadStats(
-            arxiv_id=arxiv_id,
-            download_status="failed",
-            has_tex=False,
-            raw_size_bytes=0,
-            cleaned_size_bytes=0,
-            download_time_sec=time.perf_counter() - t0,
+    response = None
+
+    for attempt in range(1, max_retries + 1):
+        if rate_limiter is not None:
+            rate_limiter.wait()
+
+        retry_after: Optional[float] = None
+        error_msg = ""
+
+        try:
+            res = get_func(url, headers=headers, timeout=timeout)
+            status = res.status_code
+
+            if status == 200:
+                response = res
+                break
+            elif status == 404:
+                # Permanent failure: paper source does not exist, fail fast
+                logger.warning("HTTP 404 for arXiv ID %s (not found, skipping retries)", arxiv_id)
+                return DownloadStats(
+                    arxiv_id=arxiv_id,
+                    download_status="failed",
+                    has_tex=False,
+                    raw_size_bytes=0,
+                    cleaned_size_bytes=0,
+                    download_time_sec=time.perf_counter() - t0,
+                )
+            elif status == 429:
+                # Rate limit exceeded: honours Retry-After header
+                retry_after = _parse_retry_after(res.headers.get("retry-after"))
+                error_msg = f"HTTP 429 Too Many Requests (Retry-After={retry_after})"
+            elif status in (500, 502, 503, 504):
+                # Temporary server overload or gateway error
+                error_msg = f"HTTP {status} Server Error"
+            else:
+                # Other non-retryable 4xx client errors (e.g. 400, 403)
+                logger.warning("HTTP %d for arXiv ID %s (non-retryable client error)", status, arxiv_id)
+                return DownloadStats(
+                    arxiv_id=arxiv_id,
+                    download_status="failed",
+                    has_tex=False,
+                    raw_size_bytes=0,
+                    cleaned_size_bytes=0,
+                    download_time_sec=time.perf_counter() - t0,
+                )
+        except (requests.exceptions.RequestException, OSError, http.client.HTTPException) as err:
+            # Connection timeout, connection drop, socket reset, IncompleteRead, broken chunked transfer
+            error_msg = f"Network connection drop/timeout: {err}"
+        except Exception as err:
+            logger.error("Unexpected error downloading %s: %s", arxiv_id, err)
+            return DownloadStats(
+                arxiv_id=arxiv_id,
+                download_status="failed",
+                has_tex=False,
+                raw_size_bytes=0,
+                cleaned_size_bytes=0,
+                download_time_sec=time.perf_counter() - t0,
+            )
+
+        if attempt == max_retries:
+            logger.error(
+                "arXiv download %s exhausted all %d retries. Last error: %s",
+                arxiv_id, max_retries, error_msg,
+            )
+            return DownloadStats(
+                arxiv_id=arxiv_id,
+                download_status="failed",
+                has_tex=False,
+                raw_size_bytes=0,
+                cleaned_size_bytes=0,
+                download_time_sec=time.perf_counter() - t0,
+            )
+
+        # Calculate backoff delay
+        if retry_after is not None:
+            delay = float(retry_after)
+        elif "HTTP 429" in error_msg:
+            # Under rate limit with no header, enforce at least arXiv minimum delay
+            delay = max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt)
+        else:
+            delay = backoff_base ** attempt
+
+        delay = min(max(delay, 0.0), max_backoff)
+        if jitter > 0:
+            delay += random.uniform(0.0, jitter)
+
+        logger.warning(
+            "arXiv download %s failed (%s); retry %d/%d in %.2fs",
+            arxiv_id, error_msg, attempt, max_retries, delay,
         )
+        time.sleep(delay)
 
-    if response.status_code != 200:
-        logger.warning("HTTP %d for arXiv ID %s", response.status_code, arxiv_id)
+    if response is None:
         return DownloadStats(
             arxiv_id=arxiv_id,
             download_status="failed",
@@ -348,6 +460,8 @@ def download_papers_range(
     delay: float = config.ARXIV_MIN_INTERVAL,
     resume: bool = True,
     show_progress: bool = True,
+    max_retries: int = config.MAX_RETRIES,
+    backoff_base: float = config.BACKOFF_BASE,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -364,6 +478,8 @@ def download_papers_range(
         delay: Delay in seconds between requests (minimum 3.0s per crawling.md).
         resume: If True, skips IDs already recorded in previous runs.
         show_progress: Whether to display a tqdm progress bar.
+        max_retries: Maximum attempts per paper download for transient errors.
+        backoff_base: Base multiplier for exponential backoff (seconds).
 
     Returns:
         pd.DataFrame containing the Table 2 statistics (m1_download_stats).
@@ -414,6 +530,8 @@ def download_papers_range(
             raw_dir=raw_dir,
             rate_limiter=limiter,
             session=session,
+            max_retries=max_retries,
+            backoff_base=backoff_base,
         )
         rec = stats.to_dict()
         records.append(rec)

@@ -29,3 +29,5 @@ book/_build/
 
 Project_description/
 *.md
+
+docs/
