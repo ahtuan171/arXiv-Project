@@ -1,4 +1,4 @@
-"""Metadata module for crawling and processing arXiv papers metadata and references."""
+"""Metadata module for crawling and processing arXiv papers metadata."""
 
 from __future__ import annotations
 
@@ -11,10 +11,6 @@ __all__ = [
     "error_record",
     "extract_version_count",
     "try_fetch_arxiv",
-    "crawl_references",
-    "normalize_ref_arxiv_id",
-    "parse_refs",
-    "try_fetch_s2",
     "get_paper",
     "get_refs",
     "iter_arxiv_ref_ids",
@@ -23,11 +19,7 @@ __all__ = [
     "papers_index",
     "refs_index",
     "summarize",
-    "MONTH_MAX",
-    "PARTS",
-    "generate_id_list",
-    "ids_in_range",
-    "yymm",
+    "parse_arxiv_range",
 ]
 
 _MAPPING = {
@@ -36,10 +28,6 @@ _MAPPING = {
     "error_record": "crawl_papers",
     "extract_version_count": "crawl_papers",
     "try_fetch_arxiv": "crawl_papers",
-    "crawl_references": "crawl_references",
-    "normalize_ref_arxiv_id": "crawl_references",
-    "parse_refs": "crawl_references",
-    "try_fetch_s2": "crawl_references",
     "get_paper": "discovery",
     "get_refs": "discovery",
     "iter_arxiv_ref_ids": "discovery",
@@ -48,17 +36,17 @@ _MAPPING = {
     "papers_index": "discovery",
     "refs_index": "discovery",
     "summarize": "discovery",
-    "MONTH_MAX": "make_id_list",
-    "PARTS": "make_id_list",
-    "generate_id_list": "make_id_list",
-    "ids_in_range": "make_id_list",
-    "yymm": "make_id_list",
+    "parse_arxiv_range": "src.utils",
 }
 
 
 def __getattr__(name: str) -> Any:
     if name in _MAPPING:
-        mod = importlib.import_module(f"src.metadata_module.{_MAPPING[name]}")
+        target = _MAPPING[name]
+        if target.startswith("src."):
+            mod = importlib.import_module(target)
+        else:
+            mod = importlib.import_module(f"src.metadata_module.{target}")
         val = getattr(mod, name)
         globals()[name] = val
         return val

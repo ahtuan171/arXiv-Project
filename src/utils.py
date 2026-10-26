@@ -363,3 +363,28 @@ def timed(func: F) -> F:
             return func(*args, **kwargs)
 
     return wrapper  # type: ignore[return-value]
+
+
+def parse_arxiv_range(
+    start_id: str | int,
+    end_id: str | int,
+    month: Optional[str] = None,
+    month_sizes: Optional[dict[str, int]] = None,
+) -> list[str]:
+    """Generate a list of arXiv IDs from start_id to end_id inclusive.
+
+    Supports:
+    - String IDs formatted as 'YYMM.NNNNN' (e.g. '2504.12523' to '2504.12530')
+    - Integer IDs with explicit `month` parameter (e.g. 12523 to 12530 with month='2502')
+    """
+    if isinstance(start_id, str) and "." in start_id and isinstance(end_id, str) and "." in end_id:
+        s_m, s_n = start_id.strip().split(".", 1)
+        e_m, e_n = end_id.strip().split(".", 1)
+        rng = config.ArxivRange(s_m, int(s_n), e_m, int(e_n))
+        return list(rng.iter_ids(month_sizes=month_sizes))
+    elif month is not None:
+        rng = config.ArxivRange(str(month), int(start_id), str(month), int(end_id))
+        return list(rng.iter_ids(month_sizes=month_sizes))
+    else:
+        raise ValueError("Provide arXiv IDs in 'YYMM.NNNNN' format or specify the month parameter.")
+
