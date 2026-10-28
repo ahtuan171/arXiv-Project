@@ -269,28 +269,65 @@ def download_single_paper(
                                  time.perf_counter() - t0, error_type, message)
 
         url = ARXIV_SRC_URL.format(arxiv_id=arxiv_id)
-        headers = {"User-Agent": user_agent}
+        base_headers = {"User-Agent": user_agent}
+        downloaded_chunks: list[bytes] = []
+        downloaded_len = 0
+        total_expected_len: Optional[int] = None
+        content_type = ""
+
         for attempt in range(1, max_retries + 1):
             retry_after = None
             is_429 = False
             res = None
+            req_headers = dict(base_headers)
+            if downloaded_len > 0:
+                req_headers["Range"] = f"bytes={downloaded_len}-"
+
             try:
                 res = (session.get if session is not None else requests.get)(
-                    url, headers=headers, timeout=timeout, stream=True)
-                if res.status_code == 200:
-                    if hasattr(res, "iter_content"):
-                        content_chunks = []
-                        for chunk in res.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                content_chunks.append(chunk)
-                        content = b"".join(content_chunks) if content_chunks else getattr(res, "content", b"")
-                    else:
-                        content = getattr(res, "content", b"")
-                    expected_len = res.headers.get("Content-Length")
-                    if expected_len and expected_len.isdigit() and len(content) < int(expected_len):
-                        raise http.client.IncompleteRead(len(content), int(expected_len) - len(content))
+                    url, headers=req_headers, timeout=timeout, stream=True)
+
+                if res.status_code == 416:
+                    downloaded_chunks.clear()
+                    downloaded_len = 0
+                    req_headers.pop("Range", None)
+                    res = (session.get if session is not None else requests.get)(
+                        url, headers=req_headers, timeout=timeout, stream=True)
+
+                if res.status_code in (200, 206):
                     content_type = res.headers.get("Content-Type", "").lower()
+                    if res.status_code == 200:
+                        downloaded_chunks.clear()
+                        downloaded_len = 0
+                        exp_hdr = res.headers.get("Content-Length")
+                        if exp_hdr and exp_hdr.isdigit():
+                            total_expected_len = int(exp_hdr)
+                    elif res.status_code == 206:
+                        cr = res.headers.get("Content-Range", "")
+                        if "/" in cr:
+                            tot_str = cr.split("/")[-1].strip()
+                            if tot_str.isdigit():
+                                total_expected_len = int(tot_str)
+
+                    if hasattr(res, "iter_content"):
+                        for chunk in res.iter_content(chunk_size=512 * 1024):
+                            if chunk:
+                                downloaded_chunks.append(chunk)
+                                downloaded_len += len(chunk)
+                    else:
+                        c = getattr(res, "content", b"")
+                        if c:
+                            downloaded_chunks.append(c)
+                            downloaded_len += len(c)
+
+                    if total_expected_len is not None and downloaded_len < total_expected_len:
+                        raise requests.exceptions.RequestException(
+                            f"IncompleteRead: {downloaded_len} bytes read, {total_expected_len - downloaded_len} more expected"
+                        )
+
+                    content = b"".join(downloaded_chunks)
                     break
+
                 message = f"HTTP {res.status_code}"
                 if res.status_code == 404:
                     return failed("not_found", message)
@@ -301,9 +338,11 @@ def download_single_paper(
                 retry_after = recovery.parse_retry_after(res.headers.get("Retry-After"))
             except (requests.exceptions.RequestException, http.client.IncompleteRead) as exc:
                 message = f"Network error: {exc}"
+
             if attempt == max_retries:
                 logger.error("arXiv download %s failed after %d attempts: %s", arxiv_id, attempt, message)
-                return failed("transient", message)
+                return failed("transient", message, size=downloaded_len)
+
             if retry_after is not None:
                 delay = min(max(config.ARXIV_MIN_INTERVAL, float(retry_after)), config.MAX_RETRY_AFTER)
             elif is_429:
@@ -312,8 +351,10 @@ def download_single_paper(
                 delay = min(max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt), max_backoff)
             if jitter > 0:
                 delay += random.uniform(0.0, jitter)
-            logger.warning("arXiv download %s failed (%s); retry %d/%d in %.2fs",
-                           arxiv_id, message, attempt, max_retries, delay)
+
+            resume_note = f" (resuming from {downloaded_len / (1024 * 1024):.1f} MB)" if downloaded_len > 0 else ""
+            logger.warning("arXiv download %s failed (%s)%s; retry %d/%d in %.2fs",
+                           arxiv_id, message, resume_note, attempt, max_retries, delay)
             time.sleep(max(0.0, delay))
 
         size = len(content)

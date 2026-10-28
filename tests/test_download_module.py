@@ -68,3 +68,35 @@ def test_download_429_backoff_delay(tmp_path, monkeypatch):
     assert len(sleeps) == 1
     # First 429 retry must wait at least 6.0 seconds
     assert sleeps[0] >= 6.0
+
+
+def test_download_resumes_via_http_range(tmp_path, monkeypatch):
+    from src.download_module.downloader import download_single_paper
+    import http.client
+    
+    # Attempt 1: Server provides first 50 bytes with Content-Length 100, then disconnects
+    resp_part1 = MagicMock()
+    resp_part1.status_code = 200
+    resp_part1.headers = {"Content-Type": "application/pdf", "Content-Length": "100"}
+    resp_part1.iter_content = lambda chunk_size=1024: [b"%PDF-1.4 " + b"A" * 41] # 50 bytes
+    
+    # Attempt 2: Client sends Range: bytes=50-, Server returns 206 with remaining 50 bytes
+    range_headers_received = []
+    
+    def mock_get(url, headers, **kwargs):
+        if "Range" in headers:
+            range_headers_received.append(headers["Range"])
+            resp_part2 = MagicMock()
+            resp_part2.status_code = 206
+            resp_part2.headers = {"Content-Type": "application/pdf", "Content-Range": "bytes 50-99/100"}
+            resp_part2.iter_content = lambda chunk_size=1024: [b"B" * 50] # remaining 50 bytes
+            return resp_part2
+        return resp_part1
+
+    monkeypatch.setattr("requests.get", mock_get)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    stats = download_single_paper("2502.00001", raw_dir=tmp_path, max_retries=3, jitter=0.0)
+    assert stats.download_status == "pdf_only"
+    assert stats.raw_size_bytes == 100
+    assert range_headers_received == ["bytes=50-"]
