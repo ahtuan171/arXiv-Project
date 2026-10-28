@@ -54,6 +54,7 @@ class CrawlStats:
     not_found: int = 0
     errors: int = 0
     skipped: int = 0
+    deferred: int = 0  # skipped errors waiting for cooldown or a configuration fix
     client_type: str = ""
     api_calls: int = 0
     browser_calls: int = 0
@@ -111,7 +112,7 @@ class CrawlStats:
         self.not_found += 1
 
     def add_skipped(self, count: int = 1) -> None:
-        """Record papers skipped because they were already completed."""
+        """Record papers omitted this run (completed or explicitly deferred)."""
         self.skipped += count
 
     def to_dict(self) -> dict[str, int]:
@@ -150,7 +151,7 @@ def build_report(
     if stats.client_type:
         lines.append(f"- **Client:** `{stats.client_type}`")
     if total_ids is not None:
-        remaining = max(0, total_ids - already_done - stats.processed)
+        remaining = max(0, total_ids - already_done - (stats.processed - stats.errors))
         lines.append(f"- **Tổng số arXiv ID:** {total_ids:,}")
         lines.append(f"- **Còn lại sau lần chạy này:** {remaining:,}")
     lines.append(f"- **Đã xong từ trước (bỏ qua):** {already_done:,}")
@@ -170,6 +171,7 @@ def build_report(
         f"| Số references có arXiv ID | {stats.refs_with_arxiv:,} |",
         f"| Số cạnh mới đã ghi | {stats.refs_written:,} |",
         f"| Số lỗi | {stats.errors:,} |",
+        f"| Số paper lỗi đang chờ thử lại/sửa cấu hình | {stats.deferred:,} |",
     ]
     if stats.raw_refs_received or stats.refs_unresolved or stats.partial:
         lines += [

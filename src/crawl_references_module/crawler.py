@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import inspect
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from src import config
+from src import config, recovery
 from src.crawl_references_module.s2_api_client import (
     ReferenceResult,
     S2ApiAuthError,
@@ -23,6 +24,7 @@ from src.crawl_references_module.s2_client import (
     S2BrowserClient,
     S2Error,
     S2NotFound,
+    S2PermanentError,
     S2Paper,
 )
 from src.crawl_references_module.stats import CrawlStats, format_duration, save_stats, stats_paths
@@ -31,7 +33,6 @@ from src.utils import (
     append_jsonl_many,
     canonical_arxiv_id,
     is_valid_arxiv_id,
-    load_latest_records,
     normalize_arxiv_id,
     read_jsonl,
 )
@@ -195,17 +196,26 @@ def paths_for(member: str, data_dir: Optional[Path] = None) -> CrawlPaths:
     )
 
 
-def load_reference_pairs(path: Path) -> set[tuple[str, str]]:
-    """Load existing ``(citing, cited)`` pairs using canonical IDs."""
+def load_reference_pairs(path: Path, *, compact: bool = False) -> set[tuple[str, str]]:
+    """Load canonical pairs; optionally repair duplicate edges from older runs."""
     if not path.exists():
         return set()
-    pairs: set[tuple[str, str]] = set()
+    unique = {}
+    unkeyed = []
+    duplicates = 0
     for record in read_jsonl(path):
         citing = canonical_arxiv_id(record.get("arxiv_id"))
         cited = canonical_arxiv_id(record.get("ref_arxiv_id"))
-        if citing and cited:
-            pairs.add((citing, cited))
-    return pairs
+        if not citing or not cited:
+            unkeyed.append(record)
+            continue
+        pair = (citing, cited)
+        duplicates += pair in unique
+        unique[pair] = record
+    if compact and duplicates:
+        # Atomic replacement keeps the original intact if compaction fails.
+        recovery.atomic_write_jsonl(path, [*unkeyed, *unique.values()])
+    return set(unique)
 
 
 def build_reference_record(
@@ -313,21 +323,8 @@ def _is_done(
     retry_not_found: bool,
     retry_partial: bool = False,
 ) -> bool:
-    if not record:
-        return False
-    status = record.get("status")
-    if status == "ok":
-        return True
-    if status == "partial":
-        # Problem D1: partial papers are done unless --retry-partial is given.
-        return not retry_partial
-    if status == "not_found":
-        return not retry_not_found
-    if status == "error":
-        if retry_errors:
-            return False
-        return _attempts(record) >= config.MAX_PAPER_ATTEMPTS
-    return False
+    return recovery.should_skip(record, retry_errors=retry_errors,
+                                retry_not_found=retry_not_found, retry_partial=retry_partial)
 
 
 def _ledger_entry(
@@ -344,6 +341,8 @@ def _ledger_entry(
     refs_unresolved: int = 0,
     fallback_requests: int = 0,
     completeness: str = "",
+    refs_unique_total: Optional[int] = None,
+    error_type: str = "",
     error: str = "",
 ) -> dict:
     """Build one ledger record.
@@ -359,7 +358,9 @@ def _ledger_entry(
         "arxiv_id": canonical_arxiv_id(arxiv_id),
         "member": member,
         "status": status,
-        "attempts": attempts,
+        **recovery.progress_entry(canonical_arxiv_id(arxiv_id), status,
+            {"attempts": max(0, attempts - 1)}, error=error, error_type=error_type),
+        "refs_unique_total": refs_unique_total,
         "refs_total": refs_total,
         "refs_with_arxiv": refs_with_arxiv,
         "refs_written": refs_written,
@@ -474,10 +475,20 @@ async def crawl_references_async(
     if not dry_run:
         migrate_legacy_references(paths, member, arxiv_range, sizes, log)
 
-    ledger = load_latest_records(paths.ledger)
+    ledger = recovery.latest_rows(paths.ledger, canonical_arxiv_id)
+    existing_pairs = load_reference_pairs(paths.references, compact=not dry_run)
+    edge_counts = {}
+    for citing, cited in existing_pairs:
+        edge_counts[citing] = edge_counts.get(citing, 0) + 1
     pending: list[str] = []
     for arxiv_id in arxiv_range.iter_ids(sizes):
         record = ledger.get(canonical_arxiv_id(arxiv_id))
+        if record and record.get("status") in {"ok", "partial"}:
+            expected = record.get("refs_unique_total")
+            if expected is None:
+                expected = record.get("refs_with_arxiv", 0)
+            if edge_counts.get(canonical_arxiv_id(arxiv_id), 0) < int(expected or 0):
+                record = None
         if _is_done(
             record,
             retry_errors=retry_errors,
@@ -485,6 +496,8 @@ async def crawl_references_async(
             retry_partial=retry_partial,
         ):
             stats.add_skipped()
+            if record.get("status") in {"error", "blocked"}:
+                stats.deferred += 1
         else:
             pending.append(arxiv_id)
 
@@ -492,8 +505,8 @@ async def crawl_references_async(
         pending = pending[: max(0, limit)]
 
     log.info(
-        "Member %s: total=%d, already_done=%d, pending=%d%s",
-        member, total_ids, stats.skipped, len(pending),
+        "Member %s: total=%d, already_done=%d, deferred=%d, pending=%d%s",
+        member, total_ids, stats.skipped - stats.deferred, stats.deferred, len(pending),
         f", limit={limit}" if limit is not None else "",
     )
 
@@ -510,7 +523,7 @@ async def crawl_references_async(
                 paths.stats_markdown,
                 member=member,
                 total_ids=total_ids,
-                already_done=stats.skipped,
+                already_done=stats.skipped - stats.deferred,
                 elapsed_seconds=0.0,
             )
         except Exception:
@@ -558,7 +571,7 @@ async def crawl_references_async(
     used_clients: list[Any] = [active_client]
     fallback_lock = asyncio.Lock()
 
-    pairs = load_reference_pairs(paths.references)
+    pairs = existing_pairs
     started = time.monotonic()
     last_flush = started
     last_processed = 0
@@ -587,7 +600,7 @@ async def crawl_references_async(
                 paths.stats_markdown,
                 member=member,
                 total_ids=total_ids,
-                already_done=stats.skipped,
+                already_done=stats.skipped - stats.deferred,
                 elapsed_seconds=time.monotonic() - started,
             )
         except Exception:
@@ -603,7 +616,7 @@ async def crawl_references_async(
             persist()
             elapsed = now - started
             rate = stats.processed / elapsed if elapsed > 0 else 0.0
-            remaining = max(0, total_ids - stats.skipped - stats.processed)
+            remaining = max(0, total_ids - (stats.skipped - stats.deferred) - (stats.processed - stats.errors))
             eta = format_duration(remaining / rate) if rate > 0 else "?"
             log.info(
                 "Progress: processed=%d, skipped=%d, not_found=%d, errors=%d, "
@@ -661,18 +674,24 @@ async def crawl_references_async(
             refs = await fetch_references(page, tab_id, arxiv_id)
         except S2NotFound:
             entry = _ledger_entry(arxiv_id, member, status="not_found", attempts=attempts)
-            append_jsonl(paths.ledger, entry, fsync=True)
+            recovery.durable_append(paths.ledger, entry)
             ledger[key] = entry
             stats.add_not_found()
             log.info("[tab %d] %s: not indexed by S2", tab_id, arxiv_id)
-        except S2AuthError:
+        except S2AuthError as error:
+            entry = _ledger_entry(arxiv_id, member, status="blocked", attempts=attempts + 1,
+                                  error=str(error), error_type="blocked")
+            recovery.durable_append(paths.ledger, entry)
+            ledger[key] = entry
             raise
         except S2Error as error:
             attempts += 1
             entry = _ledger_entry(
-                arxiv_id, member, status="error", attempts=attempts, error=str(error),
+                arxiv_id, member, status="blocked" if isinstance(error, S2PermanentError) else "error",
+                attempts=attempts, error=str(error),
+                error_type="blocked" if isinstance(error, S2PermanentError) else "transient",
             )
-            append_jsonl(paths.ledger, entry, fsync=True)
+            recovery.durable_append(paths.ledger, entry)
             ledger[key] = entry
             stats.add_error()
             log.error("[tab %d] Failed to process %s: %s", tab_id, arxiv_id, error)
@@ -694,6 +713,7 @@ async def crawl_references_async(
 
             append_jsonl_many(paths.references, new_records, fsync=True)
             pairs.update(seen)
+            edge_counts[key] = edge_counts.get(key, 0) + len(seen)
 
             # Problem C1/D1: extract per-paper metrics from ReferenceResult
             per_paper_raw = 0
@@ -722,8 +742,9 @@ async def crawl_references_async(
                 refs_unresolved=per_paper_unresolved,
                 fallback_requests=per_paper_fallback,
                 completeness=completeness,
+                refs_unique_total=edge_counts.get(key, 0),
             )
-            append_jsonl(paths.ledger, entry, fsync=True)
+            recovery.durable_append(paths.ledger, entry)
             ledger[key] = entry
             stats.add_paper(
                 refs,
@@ -827,157 +848,119 @@ def crawl_references_range(
     resume: bool = True,
     dry_run: bool = False,
     log: Optional[logging.Logger] = None,
+    retry_errors: bool = False,
+    retry_not_found: bool = False,
+    retry_partial: bool = False,
 ) -> Any:
-    """Crawl Semantic Scholar references for a list of arXiv IDs, generating Table 3 CSV.
+    """Collect Table 3 with state-aware resume and idempotent citation writes.
 
-    Exports:
-    - out_path (JSONL): Reference citation edges matching Milestone 1 requirements.
-    - csv_path (CSV): Table 3 (m1_reference_stats) with columns:
-      `arxiv_id`, `ref_status`, `num_crawled_refs`, `num_arxiv_refs`, `ref_time_sec`.
+    Retry flags match metadata/source: errors resume after cooldown, while
+    not_found and partial results require an explicit request to recheck.
     """
     import pandas as pd
 
     logger_inst = log or logger
-    if out_path is None:
-        out_path = config.DATA_DIR / "references.jsonl"
-    out_p = Path(out_path)
-    out_p.parent.mkdir(parents=True, exist_ok=True)
-
-    if csv_path is None:
-        csv_path = config.DATA_DIR / "csv" / "m1_reference_stats.csv"
-    csv_p = Path(csv_path)
-    csv_p.parent.mkdir(parents=True, exist_ok=True)
+    out_p = Path(out_path or config.DATA_DIR / "references.jsonl")
+    csv_p = Path(csv_path or config.DATA_DIR / "csv" / "m1_reference_stats.csv")
     jsonl_stats_p = csv_p.with_suffix(".jsonl")
-
-    expected_cols = ["arxiv_id", "ref_status", "num_crawled_refs", "num_arxiv_refs", "ref_time_sec"]
-
+    columns = ["arxiv_id", "ref_status", "num_crawled_refs", "num_arxiv_refs", "ref_time_sec"]
     if dry_run:
-        logger_inst.info("dry_run=True, skipping Semantic Scholar queries.")
-        return pd.DataFrame(columns=expected_cols)
+        return pd.DataFrame(columns=columns)
 
-    done_ids: set[str] = set()
-    records: list[dict[str, Any]] = []
-
-    if resume:
-        if jsonl_stats_p.exists():
-            for row in read_jsonl(jsonl_stats_p):
-                records.append(row)
-                if row.get("arxiv_id"):
-                    done_ids.add(str(row["arxiv_id"]))
-        elif csv_p.exists():
-            try:
-                df_existing = pd.read_csv(csv_p, dtype={"arxiv_id": str})
-                records = df_existing.to_dict(orient="records")
-                done_ids = set(df_existing["arxiv_id"].astype(str))
-            except Exception:
-                pass
-
-    todo_ids = [str(x).strip() for x in id_list if str(x).strip() and (not resume or str(x).strip() not in done_ids)]
+    records = recovery.load_stats(jsonl_stats_p, csv_p, canonical_arxiv_id)
+    ledger = recovery.RecoveryLedger(csv_p.with_suffix(".ledger.jsonl"), canonical_arxiv_id)
+    pairs = load_reference_pairs(out_p, compact=True)
+    counts = {}
+    for citing, cited in pairs:
+        counts[citing] = counts.get(citing, 0) + 1
+    pending = []
+    seen_ids = set()
+    for cid in id_list:
+        cid = str(cid).strip()
+        key = canonical_arxiv_id(cid)
+        if not cid or key in seen_ids:
+            continue
+        seen_ids.add(key)
+        previous = ledger.get(cid)
+        old = records.get(key, {})
+        if previous is None:
+            status = {"success": "ok", "not_found": "not_found"}.get(old.get("ref_status"), "error")
+            previous = {"status": status, "refs_unique_total": old.get("num_arxiv_refs", 0)}
+        if previous.get("status") in {"ok", "partial"}:
+            expected = int(previous.get("refs_unique_total") or 0)
+            if counts.get(key, 0) < expected:
+                previous = None
+        if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
+                retry_not_found=retry_not_found, retry_partial=retry_partial):
+            pending.append(cid)
     if limit > 0:
-        todo_ids = todo_ids[:limit]
+        pending = pending[:limit]
 
-    # Resolve client
-    owns_client = False
-    active_client = client
-    if active_client is None:
-        active_client = S2ApiClient()
-        owns_client = True
+    async def maybe_await(value):
+        return await value if inspect.isawaitable(value) else value
 
-    async def _fetch_one(cid: str) -> tuple[str, list[S2Paper]]:
-        page = active_client.pages[0] if getattr(active_client, "pages", None) else None
-        if asyncio.iscoroutinefunction(active_client.get_references):
-            refs = await active_client.get_references(page, cid)
-        else:
-            refs = active_client.get_references(page, cid)
-        return cid, refs
-
-    async def _run_crawl():
-        if hasattr(active_client, "start"):
-            if not getattr(active_client, "started", False):
-                if asyncio.iscoroutinefunction(active_client.start):
-                    await active_client.start(1)
-                else:
-                    active_client.start(1)
+    async def run_crawl():
+        # Owned clients are created inside the executing loop, including the
+        # notebook bridge thread; no task is scheduled on the notebook loop.
+        active = client if client is not None else S2ApiClient()
         try:
-            for cid in todo_ids:
+            if hasattr(active, "start") and not getattr(active, "started", False):
+                await maybe_await(active.start(1))
+            for cid in pending:
+                key = canonical_arxiv_id(cid)
                 t0 = time.perf_counter()
-                ref_status = "failed"
-                num_crawled_refs = 0
-                num_arxiv_refs = 0
-                raw_refs: list[S2Paper] = []
-
+                status, message, error_type = "ok", "", ""
+                refs = []
                 try:
-                    _, raw_refs = await _fetch_one(cid)
-                    ref_status = "success"
-                    num_crawled_refs = len(raw_refs)
-                except S2NotFound:
-                    ref_status = "not_found"
-                except Exception as err:
-                    logger_inst.warning("S2 query failed for %s: %s", cid, err)
-                    ref_status = "failed"
-
-                dt = time.perf_counter() - t0
-
-                # Process reference records
-                edge_records: list[dict] = []
-                for ref_item in raw_refs:
-                    rec = build_reference_record(cid, ref_item)
-                    if rec is not None:
-                        num_arxiv_refs += 1
-                        edge_records.append(rec)
-
-                if edge_records:
-                    append_jsonl_many(out_p, edge_records, fsync=True)
-
-                stat_item = {
-                    "arxiv_id": cid,
-                    "ref_status": ref_status,
-                    "num_crawled_refs": int(num_crawled_refs),
-                    "num_arxiv_refs": int(num_arxiv_refs),
-                    "ref_time_sec": round(float(dt), 4),
-                }
-                records.append(stat_item)
-                append_jsonl(jsonl_stats_p, stat_item)
-                done_ids.add(cid)
+                    page = active.pages[0] if getattr(active, "pages", None) else None
+                    refs = await maybe_await(active.get_references(page, cid))
+                except S2NotFound as exc:
+                    status, message, error_type = "not_found", str(exc), "not_found"
+                except (S2AuthError, S2PermanentError) as exc:
+                    status, message, error_type = "blocked", str(exc), "blocked"
+                except S2Error as exc:
+                    status, message, error_type = "error", str(exc), "transient"
+                if isinstance(refs, ReferenceResult) and refs.refs_unresolved > 0:
+                    status = "partial"
+                # A replay after a crash writes only missing edges. Existing
+                # good edges are preserved even if a forced refresh fails.
+                edges = []
+                current = set()
+                for ref in refs:
+                    row = build_reference_record(cid, ref)
+                    if row is None:
+                        continue
+                    pair = (row["arxiv_id"], row["ref_arxiv_id"])
+                    current.add(pair)
+                    if pair not in pairs:
+                        edges.append(row)
+                        pairs.add(pair)
+                append_jsonl_many(out_p, edges, fsync=True)
+                counts[key] = counts.get(key, 0) + len(edges)
+                stat = {"arxiv_id": cid,
+                        "ref_status": "success" if status in {"ok", "partial"} else "not_found" if status == "not_found" else "failed",
+                        "num_crawled_refs": len(refs), "num_arxiv_refs": len(current),
+                        "ref_time_sec": round(time.perf_counter() - t0, 4)}
+                recovery.durable_append(jsonl_stats_p, stat)
+                records[key] = stat
+                ledger.record(cid, status, error=message, error_type=error_type,
+                    refs_unique_total=counts.get(key, 0),
+                    refs_unresolved=getattr(refs, "refs_unresolved", 0))
+                if status in {"error", "blocked"}:
+                    logger_inst.warning("S2 query failed for %s: %s", cid, message)
         finally:
-            if owns_client and hasattr(active_client, "close"):
-                if asyncio.iscoroutinefunction(active_client.close):
-                    await active_client.close()
-                else:
-                    active_client.close()
+            if client is None and hasattr(active, "close"):
+                await maybe_await(active.close())
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Running inside existing loop
-        task = loop.create_task(_run_crawl())
-        # If in async loop without nest_asyncio, wait with asyncio.wait
-        import concurrent.futures
-        # Alternatively run in new thread or nest_asyncio
+    if pending:
         try:
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop.run_until_complete(_run_crawl())
-        except Exception:
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                pool.submit(lambda: asyncio.run(_run_crawl())).result()
-    else:
-        asyncio.run(_run_crawl())
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["arxiv_id"], keep="last")
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = None
-        df = df[expected_cols]
-    else:
-        df = pd.DataFrame(columns=expected_cols)
-
-    df.to_csv(csv_p, index=False)
-    logger_inst.info("Saved Table 3 stats to %s (%d rows)", csv_p, len(df))
-    return df
-
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(run_crawl())
+        else:
+            # Run exactly once. Do not create a background task and then call
+            # run_until_complete again, or retry the whole run on exceptions.
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(lambda: asyncio.run(run_crawl())).result()
+    return recovery.export_stats(records, columns, csv_p)

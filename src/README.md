@@ -1,12 +1,12 @@
 # Hướng Dẫn Chạy Pipeline Milestone 1 Trên Google Colab
 
-Tài liệu này hướng dẫn chi tiết quy trình chạy notebook [`milestone1_pipeline.ipynb`](file:///d:/Tài liệu CNTT-HCMUS K24/HK5/NM-KHDL/arXiv/arXiv-Project/src/milestone1_pipeline.ipynb) trên môi trường Google Colab. Pipeline này tích hợp toàn diện 4 giai đoạn của Milestone 1 theo đúng đặc tả dự án.
+Tài liệu này hướng dẫn chi tiết quy trình chạy notebook [`milestone1_pipeline.ipynb`](milestone1_pipeline.ipynb) trên môi trường Google Colab. Pipeline này tích hợp toàn diện 4 giai đoạn của Milestone 1 theo đúng đặc tả dự án.
 
 ---
 
 ## 1. Tổng quan Pipeline Milestone 1
 
-Notebook [`milestone1_pipeline.ipynb`](file:///d:/Tài liệu CNTT-HCMUS K24/HK5/NM-KHDL/arXiv/arXiv-Project/src/milestone1_pipeline.ipynb) tự động hóa toàn bộ luồng xử lý:
+Notebook [`milestone1_pipeline.ipynb`](milestone1_pipeline.ipynb) tự động hóa toàn bộ luồng xử lý:
 
 | Giai đoạn | Nhiệm vụ chính | Dữ liệu lưu trữ | Bảng thống kê đầu ra (`data/csv/`) |
 | :--- | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ Notebook [`milestone1_pipeline.ipynb`](file:///d:/Tài liệu CNTT-HCMUS K24/HK5
 
 ### Bước 1: Mở Notebook trên Google Colab
 - Truy cập [Google Colab](https://colab.research.google.com/).
-- Chọn tab **Upload** và tải file [`src/milestone1_pipeline.ipynb`](file:///d:/Tài liệu CNTT-HCMUS K24/HK5/NM-KHDL/arXiv/arXiv-Project/src/milestone1_pipeline.ipynb) lên, hoặc mở trực tiếp từ GitHub repository.
+- Chọn tab **Upload** và tải file [`src/milestone1_pipeline.ipynb`](milestone1_pipeline.ipynb) lên, hoặc mở trực tiếp từ GitHub repository.
 
 ### Bước 2: Kết nối Google Drive & Thiết lập Môi trường (Cell 1 & 2)
 Chạy cell kết nối Google Drive:
@@ -103,7 +103,7 @@ print(f"-> Tổng số bài báo sẽ xử lý: {len(id_list)}")
 > - **Đợt 4:** `start_id = "2502.16235"`, `end_id = "2502.17234"` (1.000 bài)
 > - **Đợt 5:** `start_id = "2502.17235"`, `end_id = "2502.18234"` (1.000 bài)
 > 
-> Nhờ tính năng `resume=True`, các dữ liệu được ghi tiếp (append) vào các file CSV và JSONL mà không làm mất dữ liệu cũ.
+> Nhờ `resume=True`, các ID hoàn tất được bỏ qua sau khi kiểm tra dữ liệu. JSONL lưu lịch sử/tiến độ; CSV được xuất lại theo kết quả mới nhất của từng ID, không cộng thêm dòng trùng.
 
 ---
 
@@ -140,3 +140,68 @@ Cell cuối cùng sẽ tự động nạp và hiển thị trực quan các bả
 > - `average_ram_mb`: Trung bình cộng RAM giữa các đợt ($\frac{1}{5} \sum \text{average\_ram}_i$).
 > - `peak_disk_mb`: Dung lượng đĩa tối đa đạt được ở đợt chạy cuối cùng.
 > - `final_storage_mb`: Dung lượng lưu trữ thư mục `data/` ghi nhận ở đợt cuối cùng sau khi đã cào xong toàn bộ 5.000 bài.
+
+
+### Q3: Các ID từng tải lỗi có được thử lại không?
+> **Trả lời:** Có. Cả `crawl_papers`, `download_papers_range` và `crawl_references_range` dùng cùng chính sách:
+>
+> - Mỗi request lỗi tạm thời có tối đa **5 lần gọi tổng cộng** (lần đầu + 4 lần thử lại). Hết lượt thì ghi `error`, chuyển sang ID tiếp theo.
+> - Chạy lại với `resume=True` sẽ thử những lỗi đã đến hạn. Thời gian chờ giữa các lượt là 60, 120, 240… giây, tối đa 1 giờ; bộ đếm reset khi thành công.
+> - Việc thử lại xảy ra khi bạn chạy hàm/cell lần nữa, không chạy nền. Lỗi cũ chưa có lịch chờ được xét lại ngay một lần để phân loại.
+
+Notebook có `RECOVERY_OPTIONS` ở cell cấu hình, truyền chung vào ba hàm:
+
+```python
+RECOVERY_OPTIONS = {
+    "resume": True,
+    "retry_errors": False,
+    "retry_not_found": False,
+    "retry_partial": False,
+}
+```
+
+Muốn thử lại lỗi ngay sau khi mạng ổn định hoặc đã sửa API key/quyền:
+
+```python
+RECOVERY_OPTIONS["retry_errors"] = True
+# Chạy lại các cell Metadata, Source và References; kết quả thành công vẫn được bỏ qua.
+# Sau đợt phục hồi, đặt lại False để áp dụng thời gian chờ bình thường.
+```
+
+| Trạng thái trong ledger | Ý nghĩa | Xử lý khi chạy lại |
+| :--- | :--- | :--- |
+| `ok` | Đã thu thập thành công | Bỏ qua nếu dữ liệu đầu ra còn hợp lệ |
+| `error` | Mạng/429/5xx hết retry hoặc gói source hỏng | Thử lại sau thời gian chờ; `retry_errors=True` để thử ngay |
+| `blocked` | Quyền/key/request không hợp lệ, không nên lặp lại nguyên trạng | Sửa nguyên nhân rồi dùng `retry_errors=True` |
+| `not_found` | HTTP 404 hoặc dịch vụ không tìm thấy paper | Chỉ thử lại với `retry_not_found=True` |
+| `pdf_only` | arXiv trả PDF, không có source TeX | Bỏ qua; đây là kết quả kiểm tra hợp lệ |
+| `partial` | References trả kết quả nhưng còn unresolved | Chỉ bổ sung với `retry_partial=True` |
+
+`retry_partial` được cả ba hàm chấp nhận để dùng chung cấu hình; chỉ bước references có trạng thái này. `resume=False` yêu cầu xử lý lại cả dải, thường không cần khi phục hồi lỗi.
+
+### Q4: Xem lỗi ở đâu và dữ liệu cũ được phục hồi như thế nào?
+
+Ba file ledger nằm cạnh thống kê:
+
+- `data/csv/m1_discovery_stats.ledger.jsonl` — metadata.
+- `data/csv/m1_download_stats.ledger.jsonl` — source.
+- `data/csv/m1_reference_stats.ledger.jsonl` — references trong pipeline.
+
+Mỗi dòng ghi một lần cập nhật. Phải lấy **dòng mới nhất theo ID**, không đếm số dòng để suy ra số bài hoàn tất:
+
+```python
+from src.recovery import latest_rows
+
+ledger = latest_rows(CSV_DIR / "m1_download_stats.ledger.jsonl")
+for arxiv_id, row in ledger.items():
+    if row["status"] in {"error", "blocked"}:
+        print(arxiv_id, row.get("error_type"), row.get("error"), row.get("next_retry_at"))
+```
+
+`attempts` là số lượt xử lý thất bại liên tiếp của paper, không phải số request bên trong một lượt. `next_retry_at` là Unix timestamp; chỉ dùng cho `error`. Schema CSV Bảng 1–3 giữ nguyên; `failed` vẫn là thất bại, `pdf_only` là kết quả riêng của source. References `partial` vẫn ghi `success` trong Bảng 3 vì truy vấn đã trả dữ liệu; xem ledger để biết mức đầy đủ.
+
+Dữ liệu tạo bằng code cũ được đọc tự động: metadata chứa `fetch_failed` và download/references `failed` được đưa về diện thử lại; `not_found`/`pdf_only` giữ chính sách trên. Source từng báo thành công nhưng mất file TeX hoặc chỉ có file rỗng sẽ được tải lại. Không cần xóa file cũ để bắt đầu phục hồi.
+
+Metadata ghi journal `papers.jsonl.journal` trước khi cập nhật ledger, rồi hợp nhất thành `papers.jsonl` khi kết thúc hoặc Ctrl-C. Nếu runtime bị tắt hẳn, lần chạy sau và API đọc metadata sẽ đọc cả journal. Source giải nén vào thư mục tạm `.<ID>.staging-*`, giữ backup `.<ID>.backup` khi thay thư mục và tự phục hồi ở lần chạy sau. References chống trùng theo cặp ID; các cạnh trùng từ dữ liệu cũ được hợp nhất khi chạy lại.
+
+Chỉ chạy **một lượt cho cùng bộ file đầu ra** tại một thời điểm. Source có khóa theo paper trên hệ thống hỗ trợ `fcntl`; crawler CLI có khóa theo member. Trên nền tảng không hỗ trợ khóa này, tránh chạy song song vào cùng thư mục. Không xóa journal/backup khi pipeline đang chạy. Lỗi ổ đĩa hoặc quyền ghi sẽ được báo ra thay vì bị ghi nhầm là thành công.

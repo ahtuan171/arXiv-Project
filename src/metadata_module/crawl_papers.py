@@ -20,8 +20,9 @@ from typing import Any, Iterable, Optional, Union
 
 import arxiv
 import pandas as pd
+import requests
 
-from src import config, utils
+from src import config, utils, recovery
 from src.utils import RateLimiter, parse_arxiv_range
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,26 @@ log = utils.setup_logging(
 # Rate limiter and arXiv client
 # ---------------------------------------------------------------------------
 _arxiv_limiter = RateLimiter(config.ARXIV_MIN_INTERVAL)
+
+
+class _MetadataSession(requests.Session):
+    """Keep Retry-After before arxiv.HTTPError discards the response headers."""
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        kwargs.setdefault("timeout", config.REQUEST_TIMEOUT)
+        response = super().get(url, **kwargs)
+        if response.status_code != 200:
+            error = arxiv.HTTPError(url, 0, response.status_code)
+            error.retry_after = recovery.parse_retry_after(response.headers.get("Retry-After"))
+            raise error
+        return response
+
+
 _client = arxiv.Client(delay_seconds=0.0, num_retries=0)
+# arxiv has no public session/timeout argument. Its requests transport is the
+# only private seam used here; request retries remain owned by try_fetch_arxiv.
+_client._session.close()
+_client._session = _MetadataSession()
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +101,7 @@ def build_record(paper: arxiv.Result, original_id: str) -> dict[str, Any]:
 
 
 def error_record(arxiv_id_clean: str, error: str) -> dict[str, Any]:
-    """Create error record for JSONL (to prevent duplicate queries on resume)."""
+    """Create a diagnostic record; the ledger decides when it can be retried."""
     return {
         "arxiv_id": arxiv_id_clean,
         "error": error,
@@ -111,6 +131,8 @@ def try_fetch_arxiv(
     Returns:
         arxiv.Result if found, or None if not found (fail fast, no retries on 404).
     """
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
     search = arxiv.Search(id_list=[canonical_id])
 
     for attempt in range(1, max_retries + 1):
@@ -119,11 +141,13 @@ def try_fetch_arxiv(
 
         error_msg = None
         is_429 = False
+        retry_after = None
 
         try:
             return next(_client.results(search), None)
         except arxiv.HTTPError as exc:
             status = getattr(exc, "status", None)
+            retry_after = getattr(exc, "retry_after", None)
             if status == 404:
                 return None
             elif status == 429:
@@ -132,7 +156,7 @@ def try_fetch_arxiv(
             elif status and 500 <= status < 600:
                 error_msg = f"HTTP {status} Server Overload"
             else:
-                error_msg = f"arXiv HTTP error: {exc}"
+                raise recovery.FetchFailure(f"arXiv HTTP error: {exc}", "blocked") from exc
         except Exception as exc:
             err_str = str(exc)
             if "429" in err_str:
@@ -145,10 +169,13 @@ def try_fetch_arxiv(
 
         if attempt == max_retries:
             log.error("arXiv query %s failed after %d attempts: %s", canonical_id, max_retries, error_msg)
-            raise RuntimeError(f"arXiv query failed for {canonical_id}: {error_msg}")
+            raise recovery.FetchFailure(f"arXiv query failed for {canonical_id}: {error_msg}")
 
-        delay = max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt) if is_429 else (backoff_base ** attempt)
-        delay = min(max(delay, 0.0), max_backoff)
+        if retry_after is not None:
+            delay = min(max(float(retry_after), 0.0), config.MAX_RETRY_AFTER)
+        else:
+            delay = max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt) if is_429 else (backoff_base ** attempt)
+            delay = min(max(delay, 0.0), max_backoff)
         if jitter > 0:
             delay += random.uniform(0.0, jitter)
 
@@ -173,6 +200,9 @@ def crawl_papers(
     limit: int = 0,
     rate_limiter: Optional[Any] = _arxiv_limiter,
     resume: bool = True,
+    retry_errors: bool = False,
+    retry_not_found: bool = False,
+    retry_partial: bool = False,
 ) -> dict[str, Any]:
     """Crawl arXiv paper metadata, saving JSONL and Table 1 (m1_discovery_stats) CSV.
 
@@ -186,7 +216,10 @@ def crawl_papers(
         csv_path: Destination Table 1 CSV path (default: data/csv/m1_discovery_stats.csv).
         limit: Max papers to crawl (0 = all).
         rate_limiter: Optional RateLimiter instance.
-        resume: Skip already completed papers if True.
+        resume: Skip completed papers and errors still in cooldown.
+        retry_errors: Retry failed/blocked papers immediately.
+        retry_not_found: Recheck papers previously missing.
+        retry_partial: Shared pipeline option; metadata has no partial state.
 
     Returns:
         dict summary with total, done, success, error, elapsed_sec, etc.
@@ -214,92 +247,83 @@ def crawl_papers(
     else:
         raise ValueError("Must provide id_list, (start_id, end_id), or id_list_path")
 
-    done: set[str] = set()
-    stats_records: list[dict[str, Any]] = []
-
-    if resume:
-        if out_p.exists():
-            done = utils.load_done_ids(out_p, key="arxiv_id")
-        # Load existing stats from CSV or JSONL
-        if jsonl_stats_p.exists():
-            for rec in utils.read_jsonl(jsonl_stats_p):
-                stats_records.append(rec)
-        elif csv_p.exists():
-            try:
-                existing_df = pd.read_csv(csv_p)
-                stats_records = existing_df.to_dict(orient="records")
-            except Exception:
-                pass
-
-    todo = [rid for rid in raw_ids if utils.clean_arxiv_id(rid) not in done]
+    store = recovery.RecordStore(out_p)
+    stats_records = recovery.load_stats(jsonl_stats_p, csv_p)
+    ledger = recovery.RecoveryLedger(csv_p.with_suffix(".ledger.jsonl"))
+    todo = []
+    already_done = deferred = 0
+    # Select once per run: exhaustion moves on to the next ID, never loops here.
+    for raw_id in dict.fromkeys(raw_ids):
+        key = utils.clean_arxiv_id(raw_id)
+        data = store.rows.get(key)
+        previous = ledger.get(raw_id)
+        if previous is None and data:
+            status = ("not_found" if data.get("error") == "not_found" else
+                      "error" if data.get("error") else "ok")
+            previous = {"status": status}
+        # The snapshot/journal is authoritative for the existence of usable data.
+        if previous and previous.get("status") == "ok" and (
+                not data or data.get("error") or not data.get("title")):
+            previous = None
+        if resume and recovery.should_skip(previous, retry_errors=retry_errors,
+                retry_not_found=retry_not_found, retry_partial=retry_partial):
+            if previous.get("status") in {"error", "blocked"}:
+                deferred += 1
+            else:
+                already_done += 1
+        else:
+            todo.append(raw_id)
     if limit > 0:
         todo = todo[:limit]
-
-    log.info("Tong ID: %d | Da co: %d | Can crawl: %d", len(raw_ids), len(done), len(todo))
+    log.info("Tong ID: %d | Da xong: %d | Cho retry: %d | Can crawl: %d", len(raw_ids), already_done, deferred, len(todo))
 
     success = error = 0
+    columns = ["arxiv_id", "discovery_status", "num_versions", "discovery_time_sec"]
     with utils.measure("crawl_papers", disk_path=out_p.parent) as perf:
-        for i, raw_id in enumerate(todo, start=1):
-            canonical_id = raw_id
-            t0 = time.perf_counter()
-            discovery_status = "failed"
-            num_versions = 0
-
-            try:
-                paper = try_fetch_arxiv(canonical_id, rate_limiter=rate_limiter)
-            except Exception as exc:
-                dt = time.perf_counter() - t0
-                log.error("[%d/%d] %s -> error: %s", i, len(todo), raw_id, exc)
-                record = error_record(utils.clean_arxiv_id(canonical_id), f"fetch_failed: {exc}")
-                error += 1
-            else:
-                dt = time.perf_counter() - t0
-                if paper is None:
-                    log.warning("[%d/%d] %s -> not_found", i, len(todo), raw_id)
-                    record = error_record(utils.clean_arxiv_id(canonical_id), "not_found")
-                    discovery_status = "not_found"
+        try:
+            for i, raw_id in enumerate(todo, start=1):
+                t0 = time.perf_counter()
+                status, error_type, message = "ok", "", ""
+                record = None
+                try:
+                    paper = try_fetch_arxiv(raw_id, rate_limiter=rate_limiter)
+                except OSError:
+                    # Local I/O failures are not recoverable remote fetch errors.
+                    raise
+                except Exception as exc:
+                    message = str(exc)
+                    error_type = getattr(exc, "error_type", "transient")
+                    status = "blocked" if error_type == "blocked" else "error"
+                    record = error_record(utils.clean_arxiv_id(raw_id), f"fetch_failed: {exc}")
                     error += 1
+                    log.error("[%d/%d] %s -> %s: %s", i, len(todo), raw_id, status, exc)
                 else:
-                    record = build_record(paper, canonical_id)
-                    num_versions = len(record["versions"])
-                    discovery_status = "success"
-                    log.info("[%d/%d] %s -> OK (%d version(s)): %s", i, len(todo), raw_id, num_versions, record["title"][:60])
-                    success += 1
+                    if paper is None:
+                        status, error_type, message = "not_found", "not_found", "not_found"
+                        record = error_record(utils.clean_arxiv_id(raw_id), "not_found")
+                        error += 1
+                    else:
+                        record = build_record(paper, raw_id)
+                        success += 1
+                # Journal first, then stats, then ledger. Restart can replay safely.
+                store.put(record)
+                stat_item = {
+                    "arxiv_id": raw_id,
+                    "discovery_status": "success" if status == "ok" else "not_found" if status == "not_found" else "failed",
+                    "num_versions": len(record.get("versions", [])),
+                    "discovery_time_sec": round(time.perf_counter() - t0, 4),
+                }
+                recovery.durable_append(jsonl_stats_p, stat_item)
+                stats_records[utils.clean_arxiv_id(raw_id)] = stat_item
+                ledger.record(raw_id, status, error=message, error_type=error_type)
+        finally:
+            # Ctrl-C still leaves a clean current snapshot; a hard crash is
+            # recovered from the journal by both resume and the metadata reader.
+            store.compact()
+            recovery.export_stats(stats_records, columns, csv_p)
 
-            utils.append_jsonl(out_p, record)
-
-            stat_item = {
-                "arxiv_id": canonical_id,
-                "discovery_status": discovery_status,
-                "num_versions": int(num_versions),
-                "discovery_time_sec": round(float(dt), 4),
-            }
-            stats_records.append(stat_item)
-            utils.append_jsonl(jsonl_stats_p, stat_item)
-            done.add(utils.clean_arxiv_id(canonical_id))
-
-    # Export Table 1 CSV
-    expected_cols = ["arxiv_id", "discovery_status", "num_versions", "discovery_time_sec"]
-    if stats_records:
-        df = pd.DataFrame(stats_records).drop_duplicates(subset=["arxiv_id"], keep="last")
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = None
-        df = df[expected_cols]
-    else:
-        df = pd.DataFrame(columns=expected_cols)
-
-    df.to_csv(csv_p, index=False)
-    log.info("Saved Table 1 stats to %s (%d rows)", csv_p, len(df))
-
-    return {
-        "total_ids": len(raw_ids),
-        "already_done": len(done) - (success + error),
-        "todo": len(todo),
-        "success": success,
-        "error": error,
-        "elapsed_sec": round(perf.seconds, 2),
-    }
+    return {"total_ids": len(raw_ids), "already_done": already_done, "deferred": deferred, "todo": len(todo),
+            "success": success, "error": error, "elapsed_sec": round(perf.seconds, 2)}
 
 
 def main() -> None:
@@ -311,6 +335,8 @@ def main() -> None:
     ap.add_argument("--out", default=str(config.DATA_DIR / "papers.jsonl"))
     ap.add_argument("--csv", default=str(config.DATA_DIR / "csv" / "m1_discovery_stats.csv"))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--retry-errors", action="store_true", help="Retry errors/blocked without cooldown")
+    ap.add_argument("--retry-not-found", action="store_true", help="Recheck missing papers")
     args = ap.parse_args()
 
     crawl_papers(
@@ -321,6 +347,8 @@ def main() -> None:
         out_path=args.out,
         csv_path=args.csv,
         limit=args.limit,
+        retry_errors=args.retry_errors,
+        retry_not_found=args.retry_not_found,
     )
 
 

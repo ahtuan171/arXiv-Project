@@ -121,7 +121,10 @@ MAX_RETRY_AFTER = 120.0
 REQUEST_TIMEOUT = 60  # seconds
 
 # --- Crawl behaviour -------------------------------------------------------
-MAX_PAPER_ATTEMPTS = 3
+MAX_PAPER_ATTEMPTS = 3  # Legacy setting; exhausted papers now resume via cooldown.
+# Paper-run cooldown is independent of the five request attempts within a run.
+RECOVERY_COOLDOWN = 60.0
+RECOVERY_MAX_COOLDOWN = 3600.0
 PROGRESS_INTERVAL_SECONDS = 30.0
 STATS_FLUSH_EVERY = 50
 

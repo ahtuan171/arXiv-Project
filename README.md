@@ -39,8 +39,17 @@ Quy tắc dữ liệu chung:
 - File trung gian và đầu ra dùng JSON Lines (`.jsonl`), UTF-8, một object mỗi dòng.
 - Giá trị thiếu: chuỗi → `""`, danh sách → `[]`, số → `null`.
 - Mọi arXiv ID trong dữ liệu và tên file đi qua `src.utils.clean_arxiv_id()`.
-- Nghỉ tối thiểu 3 giây giữa hai lần gọi arXiv (`utils.RateLimiter`); scraper phải chạy lại được từ chỗ dừng (`utils.load_done_ids`).
+- Nghỉ tối thiểu 3 giây giữa hai lần gọi arXiv (`utils.RateLimiter`); scraper tiếp tục theo trạng thái mới nhất của từng ID (`src.recovery`), chỉ bỏ qua kết quả hoàn tất còn hợp lệ.
 - Đo hiệu năng bằng `utils.measure` / `@utils.timed` (thời gian, RAM, disk); số liệu chính thức đo trên Google Colab chỉ CPU.
+
+## Retry và phục hồi lỗi
+
+Pipeline metadata, source và references dùng ledger riêng cho từng bước. Hết 5
+lần gọi request vẫn là lỗi; chạy lại với `resume=True` sẽ thử lỗi tạm thời sau
+thời gian chờ, không tải lại các ID thành công. Dùng `retry_errors=True` để thử
+ngay hoặc sau khi sửa key/quyền. Hướng dẫn cấu hình notebook và đọc ledger xem
+[Hướng dẫn pipeline](src/README.md#q3-các-id-từng-tải-lỗi-có-được-thử-lại-không);
+crawler CLI theo member xem [Cào references](docs/crawl-references.md).
 
 ## Build báo cáo
 
