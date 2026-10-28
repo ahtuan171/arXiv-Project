@@ -7,7 +7,6 @@ from src.download_module.downloader import (
     download_single_paper,
     extract_source_archive,
     parse_arxiv_range,
-    prune_figures,
 )
 
 __all__ = [
@@ -17,5 +16,4 @@ __all__ = [
     "download_single_paper",
     "extract_source_archive",
     "parse_arxiv_range",
-    "prune_figures",
 ]

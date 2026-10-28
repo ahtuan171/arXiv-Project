@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 import gzip
 import http.client
 import io
@@ -37,26 +37,6 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) arXiv-Project/1.
 
 # Default rate limiter enforcing the mandatory 3-second delay
 _default_arxiv_limiter = RateLimiter(config.ARXIV_MIN_INTERVAL)
-
-# Common figure/image extensions in LaTeX submissions
-IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".tiff",
-    ".tif",
-    ".pdf",
-    ".eps",
-    ".ps",
-    ".svg",
-    ".ai",
-    ".webp",
-    ".pbm",
-    ".pgm",
-    ".ppm",
-}
 
 
 @dataclass
@@ -102,47 +82,6 @@ class DownloadStats:
 def clean_arxiv_id(arxiv_id: str) -> str:
     """Passthrough to src.utils.clean_arxiv_id for convenience."""
     return utils.clean_arxiv_id(arxiv_id)
-
-
-def prune_figures(directory: Path) -> tuple[int, int]:
-    """Delete all figure/image binary files from directory to minimize disk space.
-
-    Traverses `directory` recursively and deletes any file whose extension
-    matches common image/figure formats (case-insensitive). Also removes
-    empty subdirectories left behind.
-
-    Args:
-        directory: Root path of the paper's extracted source files.
-
-    Returns:
-        tuple (num_deleted_files, total_deleted_bytes).
-    """
-    if not directory.exists() or not directory.is_dir():
-        return 0, 0
-
-    num_deleted = 0
-    bytes_deleted = 0
-
-    for file_path in list(directory.rglob("*")):
-        if file_path.is_file():
-            if file_path.suffix.lower() in IMAGE_EXTENSIONS:
-                try:
-                    file_size = file_path.stat().st_size
-                    file_path.unlink()
-                    num_deleted += 1
-                    bytes_deleted += file_size
-                except OSError as err:
-                    logger.warning("Failed to delete extra file %s: %s", file_path, err)
-
-    # Clean up empty subdirectories
-    for dir_path in sorted(directory.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        if dir_path.is_dir() and not any(dir_path.iterdir()):
-            try:
-                dir_path.rmdir()
-            except OSError:
-                pass
-
-    return num_deleted, bytes_deleted
 
 
 def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool, bool]:
@@ -318,6 +257,8 @@ def download_single_paper(
 
     if max_retries < 1:
         raise ValueError("max_retries must be at least 1")
+    if rate_limiter is not None:
+        rate_limiter.wait()
     with utils.file_lock(raw_dir / f".{clean_arxiv_id(arxiv_id)}.download.lock"):
         t0 = time.perf_counter()
         paper_dir = raw_dir / clean_arxiv_id(arxiv_id)
@@ -330,8 +271,6 @@ def download_single_paper(
         url = ARXIV_SRC_URL.format(arxiv_id=arxiv_id)
         headers = {"User-Agent": user_agent}
         for attempt in range(1, max_retries + 1):
-            if rate_limiter is not None:
-                rate_limiter.wait()
             retry_after = None
             try:
                 res = (session.get if session is not None else requests.get)(
@@ -372,7 +311,6 @@ def download_single_paper(
             extracted_ok, _ = extract_source_archive(content, staged)
             if not extracted_ok or not _has_source(staged):
                 return failed("invalid_archive", "Source archive is corrupt, unsupported, or has no nonempty TeX", size)
-            prune_figures(staged)
             files = [f for f in staged.rglob("*") if f.is_file()]
             num_tex = sum(f.suffix.lower() == ".tex" and f.stat().st_size > 0 for f in files)
             cleaned_size = sum(f.stat().st_size for f in files)
@@ -384,8 +322,8 @@ def download_single_paper(
 
 
 def download_papers_range(
-    start_id: str | int,
-    end_id: str | int,
+    start_id: Optional[str | int] = None,
+    end_id: Optional[str | int] = None,
     month: Optional[str] = None,
     raw_dir: Optional[Path] = None,
     csv_dir: Optional[Path] = None,
@@ -397,6 +335,7 @@ def download_papers_range(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     retry_partial: bool = False,
+    id_list: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -418,6 +357,7 @@ def download_papers_range(
         show_progress: Whether to display a tqdm progress bar.
         max_retries: Maximum attempts per paper download for transient errors.
         backoff_base: Base multiplier for exponential backoff (seconds).
+        id_list: Explicit list or iterable of arXiv IDs to process.
 
     Returns:
         pd.DataFrame containing the Table 2 statistics (m1_download_stats).
@@ -433,12 +373,17 @@ def download_papers_range(
     csv_file = csv_dir / "m1_download_stats.csv"
     jsonl_file = csv_dir / "m1_download_stats.jsonl"
 
-    id_list = parse_arxiv_range(start_id, end_id, month=month)
+    if id_list is not None:
+        target_ids = [str(i).strip() for i in id_list if str(i).strip()]
+    elif start_id is not None and end_id is not None:
+        target_ids = parse_arxiv_range(start_id, end_id, month=month)
+    else:
+        raise ValueError("Must provide either id_list or both start_id and end_id")
 
     records = recovery.load_stats(jsonl_file, csv_file)
     ledger = recovery.RecoveryLedger(csv_file.with_suffix(".ledger.jsonl"))
     pending = []
-    for arxiv_id in dict.fromkeys(id_list):
+    for arxiv_id in dict.fromkeys(target_ids):
         key = clean_arxiv_id(arxiv_id)
         paper_dir = raw_dir / key
         with utils.file_lock(raw_dir / f".{key}.download.lock"):

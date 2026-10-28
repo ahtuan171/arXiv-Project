@@ -115,7 +115,7 @@ def error_record(arxiv_id_clean: str, error: str) -> dict[str, Any]:
 
 def try_fetch_arxiv(
     canonical_id: str,
-    rate_limiter: Optional[Any] = _arxiv_limiter,
+    rate_limiter: Optional[Any] = None,
     max_retries: int = config.MAX_RETRIES,
     backoff_base: float = config.BACKOFF_BASE,
     max_backoff: float = config.MAX_BACKOFF,
@@ -136,9 +136,6 @@ def try_fetch_arxiv(
     search = arxiv.Search(id_list=[canonical_id])
 
     for attempt in range(1, max_retries + 1):
-        if rate_limiter is not None:
-            rate_limiter.wait()
-
         error_msg = None
         is_429 = False
         retry_after = None
@@ -282,11 +279,13 @@ def crawl_papers(
     with utils.measure("crawl_papers", disk_path=out_p.parent) as perf:
         try:
             for i, raw_id in enumerate(todo, start=1):
+                if rate_limiter is not None:
+                    rate_limiter.wait()
                 t0 = time.perf_counter()
                 status, error_type, message = "ok", "", ""
                 record = None
                 try:
-                    paper = try_fetch_arxiv(raw_id, rate_limiter=rate_limiter)
+                    paper = try_fetch_arxiv(raw_id)
                 except OSError:
                     # Local I/O failures are not recoverable remote fetch errors.
                     raise

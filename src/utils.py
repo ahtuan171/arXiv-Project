@@ -99,15 +99,18 @@ def setup_logging(name: str = "arxiv", log_file: Optional[Path] = None, level: i
         root._arxiv_configured = True  # type: ignore[attr-defined]
 
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        configured_files = getattr(root, "_arxiv_log_files", set())
-        resolved = str(log_file.resolve())
-        if resolved not in configured_files:
-            file_handler = logging.FileHandler(log_file, encoding="utf-8")
-            file_handler.setFormatter(formatter)
-            root.addHandler(file_handler)
-            configured_files.add(resolved)
-            root._arxiv_log_files = configured_files  # type: ignore[attr-defined]
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            configured_files = getattr(root, "_arxiv_log_files", set())
+            resolved = str(log_file.resolve())
+            if resolved not in configured_files:
+                file_handler = logging.FileHandler(log_file, encoding="utf-8")
+                file_handler.setFormatter(formatter)
+                root.addHandler(file_handler)
+                configured_files.add(resolved)
+                root._arxiv_log_files = configured_files  # type: ignore[attr-defined]
+        except OSError:
+            pass
 
     logger = logging.getLogger(name)
     logger.setLevel(level)

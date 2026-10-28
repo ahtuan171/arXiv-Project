@@ -917,7 +917,8 @@ def crawl_references_range(
                 except S2NotFound as exc:
                     status, message, error_type = "not_found", str(exc), "not_found"
                 except (S2AuthError, S2PermanentError) as exc:
-                    status, message, error_type = "blocked", str(exc), "blocked"
+                    logger_inst.error("S2 auth or permanent error for %s: %s. Aborting crawl.", cid, exc)
+                    raise
                 except S2Error as exc:
                     status, message, error_type = "error", str(exc), "transient"
                 if isinstance(refs, ReferenceResult) and refs.refs_unresolved > 0:
