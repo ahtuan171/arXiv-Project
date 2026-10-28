@@ -34,6 +34,7 @@ def test_download_time_excludes_rate_limit_wait(tmp_path, monkeypatch):
     mock_resp.status_code = 200
     mock_resp.headers = {"Content-Type": "application/pdf"}
     mock_resp.content = b"%PDF-1.4 test pdf content"
+    mock_resp.iter_content = lambda chunk_size=1024: [b"%PDF-1.4 test pdf content"]
     monkeypatch.setattr("requests.get", lambda *a, **kw: mock_resp)
 
     stats = download_single_paper(
@@ -42,3 +43,28 @@ def test_download_time_excludes_rate_limit_wait(tmp_path, monkeypatch):
         rate_limiter=_SlowLimiter(),
     )
     assert stats.download_time_sec < 0.25
+
+
+def test_download_429_backoff_delay(tmp_path, monkeypatch):
+    from src.download_module.downloader import download_single_paper
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    
+    resp_429 = MagicMock()
+    resp_429.status_code = 429
+    resp_429.headers = {}
+    
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.headers = {"Content-Type": "application/pdf"}
+    resp_200.content = b"%PDF-1.4 test"
+    resp_200.iter_content = lambda chunk_size=1024: [b"%PDF-1.4 test"]
+    
+    calls = [resp_429, resp_200]
+    monkeypatch.setattr("requests.get", lambda *a, **kw: calls.pop(0))
+    
+    stats = download_single_paper("2502.00001", raw_dir=tmp_path, max_retries=2, jitter=0.0)
+    assert stats.download_status == "pdf_only"
+    assert len(sleeps) == 1
+    # First 429 retry must wait at least 6.0 seconds
+    assert sleeps[0] >= 6.0
