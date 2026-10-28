@@ -212,7 +212,7 @@ def download_single_paper(
     raw_dir: Optional[Path] = None,
     rate_limiter: Optional[Any] = _default_arxiv_limiter,
     session: Optional[requests.Session] = None,
-    timeout: int = config.REQUEST_TIMEOUT,
+    timeout: int = max(config.REQUEST_TIMEOUT, 120),
     user_agent: str = DEFAULT_USER_AGENT,
     max_retries: int = config.MAX_RETRIES,
     backoff_base: float = config.BACKOFF_BASE,
@@ -272,18 +272,31 @@ def download_single_paper(
         headers = {"User-Agent": user_agent}
         for attempt in range(1, max_retries + 1):
             retry_after = None
+            is_429 = False
+            res = None
             try:
                 res = (session.get if session is not None else requests.get)(
-                    url, headers=headers, timeout=timeout)
+                    url, headers=headers, timeout=timeout, stream=True)
                 if res.status_code == 200:
-                    # Materialize body here so a truncated transfer receives retries.
-                    content = res.content
+                    if hasattr(res, "iter_content"):
+                        content_chunks = []
+                        for chunk in res.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                content_chunks.append(chunk)
+                        content = b"".join(content_chunks) if content_chunks else getattr(res, "content", b"")
+                    else:
+                        content = getattr(res, "content", b"")
+                    expected_len = res.headers.get("Content-Length")
+                    if expected_len and expected_len.isdigit() and len(content) < int(expected_len):
+                        raise http.client.IncompleteRead(len(content), int(expected_len) - len(content))
                     content_type = res.headers.get("Content-Type", "").lower()
                     break
                 message = f"HTTP {res.status_code}"
                 if res.status_code == 404:
                     return failed("not_found", message)
-                if res.status_code != 429 and not 500 <= res.status_code < 600:
+                if res.status_code == 429:
+                    is_429 = True
+                elif not 500 <= res.status_code < 600:
                     return failed("blocked", message)
                 retry_after = recovery.parse_retry_after(res.headers.get("Retry-After"))
             except (requests.exceptions.RequestException, http.client.IncompleteRead) as exc:
@@ -291,7 +304,12 @@ def download_single_paper(
             if attempt == max_retries:
                 logger.error("arXiv download %s failed after %d attempts: %s", arxiv_id, attempt, message)
                 return failed("transient", message)
-            delay = retry_after if retry_after is not None else min(backoff_base ** attempt, max_backoff)
+            if retry_after is not None:
+                delay = min(max(config.ARXIV_MIN_INTERVAL, float(retry_after)), config.MAX_RETRY_AFTER)
+            elif is_429:
+                delay = min(max(6.0, 6.0 * (2 ** (attempt - 1))), max_backoff)
+            else:
+                delay = min(max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt), max_backoff)
             if jitter > 0:
                 delay += random.uniform(0.0, jitter)
             logger.warning("arXiv download %s failed (%s); retry %d/%d in %.2fs",
