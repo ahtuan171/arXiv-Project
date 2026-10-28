@@ -32,7 +32,7 @@ from src.utils import RateLimiter, parse_arxiv_range
 
 logger = logging.getLogger(__name__)
 
-ARXIV_SRC_URL = "https://export.arxiv.org/src/{arxiv_id}"
+ARXIV_SRC_URL = "https://arxiv.org/src/{arxiv_id}"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) arXiv-Project/1.0 (academic research)"
 
 # Default rate limiter enforcing the mandatory 3-second delay
@@ -338,6 +338,12 @@ def download_single_paper(
                 retry_after = recovery.parse_retry_after(res.headers.get("Retry-After"))
             except (requests.exceptions.RequestException, http.client.IncompleteRead) as exc:
                 message = f"Network error: {exc}"
+            finally:
+                if res is not None:
+                    try:
+                        res.close()
+                    except Exception:
+                        pass
 
             if attempt == max_retries:
                 logger.error("arXiv download %s failed after %d attempts: %s", arxiv_id, attempt, message)
