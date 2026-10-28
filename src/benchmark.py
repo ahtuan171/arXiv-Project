@@ -35,6 +35,14 @@ def current_process_ram_mb() -> float:
         pass
 
     try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/statm", "r") as f:
+                pages = int(f.read().split()[1])
+                return (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
+    except Exception:
+        pass
+
+    try:
         import resource
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
@@ -68,17 +76,20 @@ class SystemBenchmarkTracker:
         self,
         storage_dirs: Optional[Iterable[Union[Path, str]]] = None,
         sample_interval_sec: float = 0.5,
+        disk_sample_interval_sec: float = 10.0,
     ) -> None:
         if storage_dirs is None:
-            self.storage_dirs = [config.RAW_DIR, config.DATA_DIR / "csv"]
+            self.storage_dirs = [config.DATA_DIR]
         else:
             self.storage_dirs = [Path(d) for d in storage_dirs]
 
         self.sample_interval_sec = max(0.01, float(sample_interval_sec))
+        self.disk_sample_interval_sec = max(0.0, float(disk_sample_interval_sec))
         self._start_time: float = 0.0
         self._end_time: float = 0.0
         self._ram_samples: list[float] = []
         self._peak_disk_mb: float = 0.0
+        self._last_disk_time: float = 0.0
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -88,11 +99,12 @@ class SystemBenchmarkTracker:
         initial_ram = current_process_ram_mb()
         self._ram_samples = [initial_ram] if initial_ram > 0 else []
         self._peak_disk_mb = calculate_storage_mb(self.storage_dirs)
+        self._last_disk_time = time.monotonic()
         self._running = True
 
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
-        logger.info("SystemBenchmarkTracker started (sampling every %.2fs)", self.sample_interval_sec)
+        logger.info("SystemBenchmarkTracker started (sampling every %.2fs, disk every %.1fs)", self.sample_interval_sec, self.disk_sample_interval_sec)
         return self
 
     def _sample_loop(self) -> None:
@@ -100,9 +112,12 @@ class SystemBenchmarkTracker:
             ram = current_process_ram_mb()
             if ram > 0:
                 self._ram_samples.append(ram)
-            disk = calculate_storage_mb(self.storage_dirs)
-            if disk > self._peak_disk_mb:
-                self._peak_disk_mb = disk
+            now = time.monotonic()
+            if self.disk_sample_interval_sec > 0 and (now - self._last_disk_time >= self.disk_sample_interval_sec):
+                disk = calculate_storage_mb(self.storage_dirs)
+                if disk > self._peak_disk_mb:
+                    self._peak_disk_mb = disk
+                self._last_disk_time = now
             time.sleep(self.sample_interval_sec)
 
     def stop(

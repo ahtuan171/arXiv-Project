@@ -19,22 +19,6 @@ import yaml
 # --- Paths -----------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
-# Load environment variables from .env file if present
-_env_file = ROOT_DIR / ".env"
-if _env_file.is_file():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(_env_file)
-    except ImportError:
-        with open(_env_file, encoding="utf-8") as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if _line and not _line.startswith("#") and "=" in _line:
-                    _k, _v = _line.split("=", 1)
-                    _k, _v = _k.strip(), _v.strip().strip("'\"")
-                    if _k and _k not in os.environ:
-                        os.environ[_k] = _v
-
 DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
@@ -121,7 +105,10 @@ MAX_RETRY_AFTER = 120.0
 REQUEST_TIMEOUT = 60  # seconds
 
 # --- Crawl behaviour -------------------------------------------------------
-MAX_PAPER_ATTEMPTS = 3
+MAX_PAPER_ATTEMPTS = 3  # Legacy setting; exhausted papers now resume via cooldown.
+# Paper-run cooldown is independent of the five request attempts within a run.
+RECOVERY_COOLDOWN = 60.0
+RECOVERY_MAX_COOLDOWN = 3600.0
 PROGRESS_INTERVAL_SECONDS = 30.0
 STATS_FLUSH_EVERY = 50
 

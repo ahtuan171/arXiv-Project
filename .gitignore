@@ -28,5 +28,3 @@ book/_build/
 .DS_Store
 
 Project_description/
-docs/
-tests/

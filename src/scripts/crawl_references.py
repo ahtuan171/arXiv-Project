@@ -17,7 +17,8 @@ Ledger Statuses:
     - partial: Successfully crawled, but some references were unresolvable.
                Skipped on resume unless --retry-partial is specified.
     - not_found: Paper was not found on Semantic Scholar (HTTP 404).
-    - error: Transient/transport errors exhausted retries. Retried with --retry-errors.
+    - error: Retries exhausted; automatically eligible after paper cooldown.
+    - blocked: Fix key/permissions, then use --retry-errors.
 
 Fallback & Completeness:
     Direct metadata extraction minimizes API calls by reading nested citedPaper
@@ -78,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=None, help="Process at most N pending papers")
     parser.add_argument("--dry-run", action="store_true", help="Show progress plan without API calls")
-    parser.add_argument("--retry-errors", action="store_true", help="Retry papers that previously ended in error status")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry error/blocked papers immediately, bypassing paper cooldown")
     parser.add_argument("--retry-not-found", action="store_true", help="Retry papers previously marked not_found")
     parser.add_argument(
         "--retry-partial",
@@ -167,10 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if result.dry_run:
         return 0
-    if result.stats.errors > args.tolerate_errors:
+    # Deferred errors are still unfinished work, even if no new request ran.
+    outstanding_errors = result.stats.errors + result.stats.deferred
+    if outstanding_errors > args.tolerate_errors:
         log.error(
-            "Finished with %d errors (tolerance %d); rerun to retry",
-            result.stats.errors, args.tolerate_errors,
+            "Finished with %d new and %d deferred errors (tolerance %d); rerun after cooldown or use --retry-errors",
+            result.stats.errors, result.stats.deferred, args.tolerate_errors,
         )
         return 2
 

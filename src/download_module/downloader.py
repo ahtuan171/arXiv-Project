@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 import gzip
 import http.client
 import io
@@ -20,40 +20,23 @@ import random
 import shutil
 import tarfile
 import time
+import tempfile
+import json
+import zlib
 
 import pandas as pd
 import requests
 
-from src import config, utils
+from src import config, utils, recovery
 from src.utils import RateLimiter, parse_arxiv_range
 
 logger = logging.getLogger(__name__)
 
-ARXIV_SRC_URL = "https://export.arxiv.org/src/{arxiv_id}"
+ARXIV_SRC_URL = "https://arxiv.org/src/{arxiv_id}"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) arXiv-Project/1.0 (academic research)"
 
 # Default rate limiter enforcing the mandatory 3-second delay
 _default_arxiv_limiter = RateLimiter(config.ARXIV_MIN_INTERVAL)
-
-# Common figure/image extensions in LaTeX submissions
-IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".tiff",
-    ".tif",
-    ".pdf",
-    ".eps",
-    ".ps",
-    ".svg",
-    ".ai",
-    ".webp",
-    ".pbm",
-    ".pgm",
-    ".ppm",
-}
 
 
 @dataclass
@@ -77,10 +60,15 @@ class DownloadStats:
     cleaned_size_bytes: int
     num_tex_files: int
     download_time_sec: float
+    # Operational detail stays in JSONL/ledger; Table 2 columns are unchanged.
+    error_type: str = ""
+    error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary matching the Table 2 CSV schema."""
+        """Return Table 2 fields plus error detail for the JSONL history."""
         return {
+            "error_type": self.error_type,
+            "error": self.error,
             "arxiv_id": self.arxiv_id,
             "download_status": self.download_status,
             "has_tex": self.has_tex,
@@ -94,47 +82,6 @@ class DownloadStats:
 def clean_arxiv_id(arxiv_id: str) -> str:
     """Passthrough to src.utils.clean_arxiv_id for convenience."""
     return utils.clean_arxiv_id(arxiv_id)
-
-
-def prune_figures(directory: Path) -> tuple[int, int]:
-    """Delete all figure/image binary files from directory to minimize disk space.
-
-    Traverses `directory` recursively and deletes any file whose extension
-    matches common image/figure formats (case-insensitive). Also removes
-    empty subdirectories left behind.
-
-    Args:
-        directory: Root path of the paper's extracted source files.
-
-    Returns:
-        tuple (num_deleted_files, total_deleted_bytes).
-    """
-    if not directory.exists() or not directory.is_dir():
-        return 0, 0
-
-    num_deleted = 0
-    bytes_deleted = 0
-
-    for file_path in list(directory.rglob("*")):
-        if file_path.is_file():
-            if file_path.suffix.lower() in IMAGE_EXTENSIONS:
-                try:
-                    file_size = file_path.stat().st_size
-                    file_path.unlink()
-                    num_deleted += 1
-                    bytes_deleted += file_size
-                except OSError as err:
-                    logger.warning("Failed to delete extra file %s: %s", file_path, err)
-
-    # Clean up empty subdirectories
-    for dir_path in sorted(directory.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        if dir_path.is_dir() and not any(dir_path.iterdir()):
-            try:
-                dir_path.rmdir()
-            except OSError:
-                pass
-
-    return num_deleted, bytes_deleted
 
 
 def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool, bool]:
@@ -182,22 +129,25 @@ def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool
                 extracted_any = True
 
             return True, has_tex
-    except (tarfile.TarError, EOFError):
+    except (tarfile.TarError, EOFError, zlib.error):
         pass
 
-    # Attempt 2: Single gzipped file (.gz containing plain TeX)
+    # Decompress separately: disk write errors must reach the caller, rather
+    # than being mistaken for an unsupported gzip response.
+    decompressed = None
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(archive_bytes)) as gz:
-            decompressed = gz.read()
-            if b"\\documentclass" in decompressed or b"\\begin" in decompressed or decompressed.startswith(b"%"):
-                out_file = target_dir / "main.tex"
-                out_file.write_bytes(decompressed)
-                return True, True
-    except (gzip.BadGzipFile, OSError, EOFError):
+        decompressed = gzip.decompress(archive_bytes)
+    except (gzip.BadGzipFile, OSError, EOFError, zlib.error):
         pass
+    if decompressed is not None and b"\x00" not in decompressed and (b"\\documentclass" in decompressed or
+            b"\\begin" in decompressed or decompressed.startswith(b"%")):
+        (target_dir / "main.tex").write_bytes(decompressed)
+        return True, True
 
     # Attempt 3: Plain uncompressed text / LaTeX
-    if b"\\documentclass" in archive_bytes or b"\\begin{" in archive_bytes or archive_bytes.startswith(b"%"):
+    # A broken tar can still contain readable TeX. Its binary header must not
+    # fall through and become a fake successful main.tex containing the tar.
+    if b"\x00" not in archive_bytes and (b"\\documentclass" in archive_bytes or b"\\begin{" in archive_bytes or archive_bytes.startswith(b"%")):
         out_file = target_dir / "main.tex"
         out_file.write_bytes(archive_bytes)
         return True, True
@@ -205,12 +155,64 @@ def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool
     return False, False
 
 
+def _has_source(directory: Path) -> bool:
+    """Completion requires a nonempty TeX file, not just an existing folder."""
+    return directory.is_dir() and any(
+        f.is_file() and f.suffix.lower() == ".tex" and f.stat().st_size > 0
+        for f in directory.rglob("*")
+    )
+
+
+def _recover_source(directory: Path, *, cleanup_staging: bool = False) -> None:
+    """Repair an interrupted two-rename publish before checking resume state."""
+    if cleanup_staging:
+        # The caller holds the per-paper lock, so these cannot be another
+        # active writer's files. They were left by a hard stop in an older run.
+        for stale in directory.parent.glob(f".{directory.name}.staging-*"):
+            if stale.is_dir():
+                shutil.rmtree(stale)
+    backup = directory.with_name(f".{directory.name}.backup")
+    if not backup.exists():
+        return
+    marker = directory / ".source-status.json"
+    pdf_only = False
+    if marker.exists():
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            pdf_only = isinstance(payload, dict) and payload.get("status") == "pdf_only"
+        except (ValueError, UnicodeDecodeError):
+            pass
+    valid = _has_source(directory) or pdf_only
+    if directory.exists() and valid:
+        shutil.rmtree(backup)
+    else:
+        if directory.exists():
+            shutil.rmtree(directory)
+        os.replace(backup, directory)
+
+
+def _publish_source(staged: Path, directory: Path) -> None:
+    """Preserve the old folder until a validated new folder has been installed."""
+    _recover_source(directory)
+    backup = directory.with_name(f".{directory.name}.backup")
+    if directory.exists():
+        os.replace(directory, backup)
+    try:
+        os.replace(staged, directory)
+    except BaseException:
+        if backup.exists() and not directory.exists():
+            os.replace(backup, directory)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+
+
 def download_single_paper(
     arxiv_id: str,
     raw_dir: Optional[Path] = None,
     rate_limiter: Optional[Any] = _default_arxiv_limiter,
     session: Optional[requests.Session] = None,
-    timeout: int = config.REQUEST_TIMEOUT,
+    timeout: int = max(config.REQUEST_TIMEOUT, 120),
     user_agent: str = DEFAULT_USER_AGENT,
     max_retries: int = config.MAX_RETRIES,
     backoff_base: float = config.BACKOFF_BASE,
@@ -253,159 +255,140 @@ def download_single_paper(
         raw_dir = config.RAW_DIR
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.perf_counter()
-    url = ARXIV_SRC_URL.format(arxiv_id=arxiv_id)
-    headers = {"User-Agent": user_agent}
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
+    if rate_limiter is not None:
+        rate_limiter.wait()
+    with utils.file_lock(raw_dir / f".{clean_arxiv_id(arxiv_id)}.download.lock"):
+        t0 = time.perf_counter()
+        paper_dir = raw_dir / clean_arxiv_id(arxiv_id)
+        _recover_source(paper_dir, cleanup_staging=True)
 
-    response: Optional[requests.Response] = None
-    for attempt in range(1, max_retries + 1):
-        if rate_limiter is not None:
-            rate_limiter.wait()
+        def failed(error_type: str, message: str, size: int = 0) -> DownloadStats:
+            return DownloadStats(arxiv_id, "failed", False, size, 0, 0,
+                                 time.perf_counter() - t0, error_type, message)
 
-        error_msg: Optional[str] = None
-        retry_after: Optional[float] = None
+        url = ARXIV_SRC_URL.format(arxiv_id=arxiv_id)
+        base_headers = {"User-Agent": user_agent}
+        downloaded_chunks: list[bytes] = []
+        downloaded_len = 0
+        total_expected_len: Optional[int] = None
+        content_type = ""
 
-        try:
-            get_func = session.get if session is not None else requests.get
-            res = get_func(url, headers=headers, timeout=timeout)
-            if res.status_code == 200:
-                response = res
-                break
-            elif res.status_code == 404:
-                # Permanent error: paper does not exist on arXiv (fail fast, no retry)
-                logger.warning("Paper not found on arXiv (HTTP 404): %s", arxiv_id)
-                return DownloadStats(
-                    arxiv_id=arxiv_id,
-                    download_status="failed",
-                    has_tex=False,
-                    raw_size_bytes=0,
-                    cleaned_size_bytes=0,
-                    num_tex_files=0,
-                    download_time_sec=time.perf_counter() - t0,
-                )
-            elif res.status_code == 429:
-                error_msg = "HTTP 429 Too Many Requests (Rate limit violated)"
-                retry_after_hdr = res.headers.get("Retry-After")
-                if retry_after_hdr:
+        for attempt in range(1, max_retries + 1):
+            retry_after = None
+            is_429 = False
+            res = None
+            req_headers = dict(base_headers)
+            if downloaded_len > 0:
+                req_headers["Range"] = f"bytes={downloaded_len}-"
+
+            try:
+                res = (session.get if session is not None else requests.get)(
+                    url, headers=req_headers, timeout=timeout, stream=True)
+
+                if res.status_code == 416:
+                    downloaded_chunks.clear()
+                    downloaded_len = 0
+                    req_headers.pop("Range", None)
+                    res = (session.get if session is not None else requests.get)(
+                        url, headers=req_headers, timeout=timeout, stream=True)
+
+                if res.status_code in (200, 206):
+                    content_type = res.headers.get("Content-Type", "").lower()
+                    if res.status_code == 200:
+                        downloaded_chunks.clear()
+                        downloaded_len = 0
+                        exp_hdr = res.headers.get("Content-Length")
+                        if exp_hdr and exp_hdr.isdigit():
+                            total_expected_len = int(exp_hdr)
+                    elif res.status_code == 206:
+                        cr = res.headers.get("Content-Range", "")
+                        if "/" in cr:
+                            tot_str = cr.split("/")[-1].strip()
+                            if tot_str.isdigit():
+                                total_expected_len = int(tot_str)
+
+                    if hasattr(res, "iter_content"):
+                        for chunk in res.iter_content(chunk_size=512 * 1024):
+                            if chunk:
+                                downloaded_chunks.append(chunk)
+                                downloaded_len += len(chunk)
+                    else:
+                        c = getattr(res, "content", b"")
+                        if c:
+                            downloaded_chunks.append(c)
+                            downloaded_len += len(c)
+
+                    if total_expected_len is not None and downloaded_len < total_expected_len:
+                        raise requests.exceptions.RequestException(
+                            f"IncompleteRead: {downloaded_len} bytes read, {total_expected_len - downloaded_len} more expected"
+                        )
+
+                    content = b"".join(downloaded_chunks)
+                    break
+
+                message = f"HTTP {res.status_code}"
+                if res.status_code == 404:
+                    return failed("not_found", message)
+                if res.status_code == 429:
+                    is_429 = True
+                elif not 500 <= res.status_code < 600:
+                    return failed("blocked", message)
+                retry_after = recovery.parse_retry_after(res.headers.get("Retry-After"))
+            except (requests.exceptions.RequestException, http.client.IncompleteRead) as exc:
+                message = f"Network error: {exc}"
+            finally:
+                if res is not None:
                     try:
-                        retry_after = float(retry_after_hdr)
-                    except ValueError:
+                        res.close()
+                    except Exception:
                         pass
-            elif 500 <= res.status_code < 600:
-                error_msg = f"HTTP {res.status_code} Server Overload/Error"
+
+            if attempt == max_retries:
+                logger.error("arXiv download %s failed after %d attempts: %s", arxiv_id, attempt, message)
+                return failed("transient", message, size=downloaded_len)
+
+            if retry_after is not None:
+                delay = min(max(config.ARXIV_MIN_INTERVAL, float(retry_after)), config.MAX_RETRY_AFTER)
+            elif is_429:
+                delay = min(max(6.0, 6.0 * (2 ** (attempt - 1))), max_backoff)
             else:
-                error_msg = f"HTTP {res.status_code}"
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, http.client.IncompleteRead) as err:
-            error_msg = f"Network connection drop / timeout: {err}"
-        except Exception as err:
-            error_msg = f"Unexpected error: {err}"
+                delay = min(max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt), max_backoff)
+            if jitter > 0:
+                delay += random.uniform(0.0, jitter)
 
-        if attempt == max_retries:
-            logger.error(
-                "arXiv download %s failed after %d attempts: %s",
-                arxiv_id, max_retries, error_msg,
-            )
-            return DownloadStats(
-                arxiv_id=arxiv_id,
-                download_status="failed",
-                has_tex=False,
-                raw_size_bytes=0,
-                cleaned_size_bytes=0,
-                num_tex_files=0,
-                download_time_sec=time.perf_counter() - t0,
-            )
+            resume_note = f" (resuming from {downloaded_len / (1024 * 1024):.1f} MB)" if downloaded_len > 0 else ""
+            logger.warning("arXiv download %s failed (%s)%s; retry %d/%d in %.2fs",
+                           arxiv_id, message, resume_note, attempt, max_retries, delay)
+            time.sleep(max(0.0, delay))
 
-        # Calculate backoff delay
-        if retry_after is not None:
-            delay = float(retry_after)
-        elif "HTTP 429" in (error_msg or ""):
-            delay = max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt)
-        else:
-            delay = backoff_base ** attempt
-
-        delay = min(max(delay, 0.0), max_backoff)
-        if jitter > 0:
-            delay += random.uniform(0.0, jitter)
-
-        logger.warning(
-            "arXiv download %s failed (%s); retry %d/%d in %.2fs",
-            arxiv_id, error_msg, attempt, max_retries, delay,
-        )
-        time.sleep(delay)
-
-    if response is None:
-        return DownloadStats(
-            arxiv_id=arxiv_id,
-            download_status="failed",
-            has_tex=False,
-            raw_size_bytes=0,
-            cleaned_size_bytes=0,
-            num_tex_files=0,
-            download_time_sec=time.perf_counter() - t0,
-        )
-
-    content = response.content
-    raw_size_bytes = len(content)
-    content_type = response.headers.get("Content-Type", "").lower()
-    is_pdf = "application/pdf" in content_type or content.startswith(b"%PDF")
-
-    paper_folder_name = clean_arxiv_id(arxiv_id)
-    paper_dir = raw_dir / paper_folder_name
-
-    if is_pdf:
-        # Paper submitted as PDF only. Keep an empty record folder per crawling.md
-        paper_dir.mkdir(parents=True, exist_ok=True)
-        return DownloadStats(
-            arxiv_id=arxiv_id,
-            download_status="pdf_only",
-            has_tex=False,
-            raw_size_bytes=raw_size_bytes,
-            cleaned_size_bytes=0,
-            num_tex_files=0,
-            download_time_sec=time.perf_counter() - t0,
-        )
-
-    # Extract source archive (keeping only .tex and .bib)
-    extracted_ok, _ = extract_source_archive(content, paper_dir)
-    if not extracted_ok:
-        logger.warning("Failed to unpack source archive for %s", arxiv_id)
-        return DownloadStats(
-            arxiv_id=arxiv_id,
-            download_status="failed",
-            has_tex=False,
-            raw_size_bytes=raw_size_bytes,
-            cleaned_size_bytes=0,
-            num_tex_files=0,
-            download_time_sec=time.perf_counter() - t0,
-        )
-
-    # Secondary prune to ensure no stray files remain
-    prune_figures(paper_dir)
-
-    # Count TeX files uniquely
-    tex_files = [f for f in paper_dir.rglob("*") if f.is_file() and f.suffix.lower() == ".tex"]
-    num_tex_files = len(tex_files)
-    has_tex = num_tex_files > 0
-
-    # Calculate cleaned size (sum of remaining .tex/.bib files)
-    cleaned_size_bytes = sum(f.stat().st_size for f in paper_dir.rglob("*") if f.is_file())
-
-    download_status = "success" if has_tex else "failed"
-
-    return DownloadStats(
-        arxiv_id=arxiv_id,
-        download_status=download_status,
-        has_tex=has_tex,
-        raw_size_bytes=raw_size_bytes,
-        cleaned_size_bytes=cleaned_size_bytes,
-        num_tex_files=num_tex_files,
-        download_time_sec=time.perf_counter() - t0,
-    )
+        size = len(content)
+        is_pdf = "application/pdf" in content_type or content.startswith(b"%PDF")
+        # Extract outside the HTTP retry loop: archive errors are classified for a
+        # later run; local disk errors propagate and never commit a success ledger.
+        with tempfile.TemporaryDirectory(prefix=f".{paper_dir.name}.staging-", dir=raw_dir) as temp:
+            staged = Path(temp)
+            if is_pdf:
+                (staged / ".source-status.json").write_text(json.dumps({"status": "pdf_only"}))
+                _publish_source(staged, paper_dir)
+                return DownloadStats(arxiv_id, "pdf_only", False, size, 0, 0, time.perf_counter() - t0)
+            extracted_ok, _ = extract_source_archive(content, staged)
+            if not extracted_ok or not _has_source(staged):
+                return failed("invalid_archive", "Source archive is corrupt, unsupported, or has no nonempty TeX", size)
+            files = [f for f in staged.rglob("*") if f.is_file()]
+            num_tex = sum(f.suffix.lower() == ".tex" and f.stat().st_size > 0 for f in files)
+            cleaned_size = sum(f.stat().st_size for f in files)
+            for file in files:
+                with file.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            _publish_source(staged, paper_dir)
+        return DownloadStats(arxiv_id, "success", True, size, cleaned_size, num_tex, time.perf_counter() - t0)
 
 
 def download_papers_range(
-    start_id: str | int,
-    end_id: str | int,
+    start_id: Optional[str | int] = None,
+    end_id: Optional[str | int] = None,
     month: Optional[str] = None,
     raw_dir: Optional[Path] = None,
     csv_dir: Optional[Path] = None,
@@ -414,6 +397,10 @@ def download_papers_range(
     show_progress: bool = True,
     max_retries: int = config.MAX_RETRIES,
     backoff_base: float = config.BACKOFF_BASE,
+    retry_errors: bool = False,
+    retry_not_found: bool = False,
+    retry_partial: bool = False,
+    id_list: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -428,10 +415,14 @@ def download_papers_range(
         raw_dir: Path to directory where raw files will be saved. Defaults to config.RAW_DIR.
         csv_dir: Path to directory where CSV summary will be saved. Defaults to DATA_DIR / "csv".
         delay: Delay in seconds between requests (minimum 3.0s per crawling.md).
-        resume: If True, skips IDs already recorded in previous runs.
+        resume: Skip completed outputs and errors still in cooldown.
+        retry_errors: Retry failed/blocked papers immediately.
+        retry_not_found: Recheck HTTP 404 results.
+        retry_partial: Shared pipeline option; source has no partial state.
         show_progress: Whether to display a tqdm progress bar.
         max_retries: Maximum attempts per paper download for transient errors.
         backoff_base: Base multiplier for exponential backoff (seconds).
+        id_list: Explicit list or iterable of arXiv IDs to process.
 
     Returns:
         pd.DataFrame containing the Table 2 statistics (m1_download_stats).
@@ -447,75 +438,51 @@ def download_papers_range(
     csv_file = csv_dir / "m1_download_stats.csv"
     jsonl_file = csv_dir / "m1_download_stats.jsonl"
 
-    id_list = parse_arxiv_range(start_id, end_id, month=month)
+    if id_list is not None:
+        target_ids = [str(i).strip() for i in id_list if str(i).strip()]
+    elif start_id is not None and end_id is not None:
+        target_ids = parse_arxiv_range(start_id, end_id, month=month)
+    else:
+        raise ValueError("Must provide either id_list or both start_id and end_id")
 
-    done_ids: set[str] = set()
-    records: list[dict[str, Any]] = []
+    records = recovery.load_stats(jsonl_file, csv_file)
+    ledger = recovery.RecoveryLedger(csv_file.with_suffix(".ledger.jsonl"))
+    pending = []
+    for arxiv_id in dict.fromkeys(target_ids):
+        key = clean_arxiv_id(arxiv_id)
+        paper_dir = raw_dir / key
+        with utils.file_lock(raw_dir / f".{key}.download.lock"):
+            _recover_source(paper_dir)
+        previous = ledger.get(arxiv_id)
+        old = records.get(key, {})
+        if previous is None:
+            status = {"success": "ok", "pdf_only": "pdf_only"}.get(old.get("download_status"), "error")
+            previous = {"status": status}
+        if previous.get("status") == "ok" and not _has_source(paper_dir):
+            previous = None
+        if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
+                retry_not_found=retry_not_found, retry_partial=retry_partial):
+            pending.append(arxiv_id)
 
-    if resume:
-        # Load completed IDs from jsonl or csv
-        if jsonl_file.exists():
-            done_ids = utils.load_done_ids(jsonl_file, key="arxiv_id")
-            for record in utils.read_jsonl(jsonl_file):
-                if record.get("arxiv_id") in done_ids:
-                    records.append(record)
-        elif csv_file.exists():
-            try:
-                existing_df = pd.read_csv(csv_file)
-                done_ids = set(existing_df["arxiv_id"].astype(str))
-                records = existing_df.to_dict(orient="records")
-            except Exception as e:
-                logger.warning("Could not read existing CSV for resume: %s", e)
-
+    columns = ["arxiv_id", "download_status", "has_tex", "raw_size_bytes",
+               "cleaned_size_bytes", "num_tex_files", "download_time_sec"]
     limiter = RateLimiter(delay) if delay > 0 else None
     session = requests.Session()
-
     from tqdm import tqdm
-    iterator = tqdm(id_list, desc="Downloading arXiv sources", disable=not show_progress)
-
-    for arxiv_id in iterator:
-        if resume and arxiv_id in done_ids:
-            continue
-
-        stats = download_single_paper(
-            arxiv_id=arxiv_id,
-            raw_dir=raw_dir,
-            rate_limiter=limiter,
-            session=session,
-            max_retries=max_retries,
-            backoff_base=backoff_base,
-        )
-        rec = stats.to_dict()
-        records.append(rec)
-        done_ids.add(arxiv_id)
-
-        # Incrementally persist to jsonl for fault-tolerance
-        utils.append_jsonl(jsonl_file, rec)
-
-    session.close()
-
-    # Reorder and filter records to match requested Table 2 columns
-    expected_cols = [
-        "arxiv_id",
-        "download_status",
-        "has_tex",
-        "raw_size_bytes",
-        "cleaned_size_bytes",
-        "num_tex_files",
-        "download_time_sec",
-    ]
-    df = pd.DataFrame(records)
-    if not df.empty:
-        # Deduplicate on arxiv_id preserving latest
-        df = df.drop_duplicates(subset=["arxiv_id"], keep="last")
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = None
-        df = df[expected_cols]
-    else:
-        df = pd.DataFrame(columns=expected_cols)
-
-    df.to_csv(csv_file, index=False)
+    try:
+        for arxiv_id in tqdm(pending, desc="Downloading arXiv sources", disable=not show_progress):
+            stats = download_single_paper(arxiv_id=arxiv_id, raw_dir=raw_dir,
+                rate_limiter=limiter, session=session, max_retries=max_retries,
+                backoff_base=backoff_base)
+            rec = stats.to_dict()
+            recovery.durable_append(jsonl_file, rec)
+            records[clean_arxiv_id(arxiv_id)] = rec
+            status = {"success": "ok", "pdf_only": "pdf_only"}.get(stats.download_status, "error")
+            if stats.error_type in {"not_found", "blocked"}:
+                status = stats.error_type
+            ledger.record(arxiv_id, status, error_type=stats.error_type, error=stats.error)
+    finally:
+        session.close()
+    df = recovery.export_stats(records, columns, csv_file)
     logger.info("Saved %d records to %s", len(df), csv_file)
-
     return df

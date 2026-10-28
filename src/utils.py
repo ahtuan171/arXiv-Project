@@ -99,15 +99,18 @@ def setup_logging(name: str = "arxiv", log_file: Optional[Path] = None, level: i
         root._arxiv_configured = True  # type: ignore[attr-defined]
 
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        configured_files = getattr(root, "_arxiv_log_files", set())
-        resolved = str(log_file.resolve())
-        if resolved not in configured_files:
-            file_handler = logging.FileHandler(log_file, encoding="utf-8")
-            file_handler.setFormatter(formatter)
-            root.addHandler(file_handler)
-            configured_files.add(resolved)
-            root._arxiv_log_files = configured_files  # type: ignore[attr-defined]
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            configured_files = getattr(root, "_arxiv_log_files", set())
+            resolved = str(log_file.resolve())
+            if resolved not in configured_files:
+                file_handler = logging.FileHandler(log_file, encoding="utf-8")
+                file_handler.setFormatter(formatter)
+                root.addHandler(file_handler)
+                configured_files.add(resolved)
+                root._arxiv_log_files = configured_files  # type: ignore[attr-defined]
+        except OSError:
+            pass
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -225,8 +228,15 @@ def append_jsonl_many(path: Path, records: Iterable[dict], *, fsync: bool = Fals
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(payload)
+    # A hard stop may leave an unterminated final line. Isolate it before
+    # appending so read_jsonl can skip only that line, not the next valid batch.
+    with open(path, "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.write(b"\n")
+        handle.write(payload.encode("utf-8"))
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
@@ -247,15 +257,19 @@ def write_jsonl(path: Path, records: Iterable[dict]) -> None:
 
 
 def read_jsonl(path: Path) -> Iterator[dict]:
-    """Yield records of a ``.jsonl`` file, skipping a truncated last line."""
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
+    """Yield object records, tolerating a torn JSON or UTF-8 line after a crash."""
+    # Decode per line: an incomplete Vietnamese character at EOF must not make
+    # Python's text decoder reject the complete records preceding that line.
+    with open(path, "rb") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
                 continue
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
+                row = json.loads(raw_line.decode("utf-8"))
+                if not isinstance(row, dict):
+                    raise ValueError("JSONL record must be an object")
+                yield row
+            except (UnicodeDecodeError, ValueError):
                 logging.getLogger(__name__).warning("Skipping malformed line in %s", path)
 
 

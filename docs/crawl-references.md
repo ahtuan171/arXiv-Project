@@ -67,7 +67,7 @@ python src/scripts/crawl_references.py --client browser   # scrape website bằn
 python src/scripts/crawl_references.py --client both      # API + browser, log chỗ lệch
 python src/scripts/crawl_references.py --api-min-interval 1.0  # giãn nhịp gọi API
 python src/scripts/crawl_references.py --tabs 3           # số worker API / số tab Chromium
-python src/scripts/crawl_references.py --retry-errors     # thử lại paper từng lỗi
+python src/scripts/crawl_references.py --retry-errors     # bỏ thời gian chờ, thử lại error/blocked
 python src/scripts/crawl_references.py --retry-not-found  # thử lại paper S2 chưa index
 python src/scripts/crawl_references.py --retry-partial    # thử lại paper hoàn thành nhưng còn unresolved
 python src/scripts/crawl_references.py --verbose          # log từng paper + từng request S2
@@ -105,8 +105,18 @@ thống kê.
 - Mỗi paper xong được ghi ngay vào ledger (fsync), nên Ctrl-C an toàn: paper
   đang làm dở không bị đánh dấu `ok` và sẽ được làm lại ở lần chạy sau.
 - Paper 0 reference, paper `not_found`, paper `partial` (có reference unresolved)
-  và paper `error` đều có trạng thái riêng, tránh lặp vô hạn. Dùng
-  `--retry-errors` / `--retry-not-found` / `--retry-partial` để thử lại.
+  và paper `error` đều có trạng thái riêng. Lỗi tạm thời được thử lại ở lần chạy
+  tiếp theo khi hết thời gian chờ 60, 120, 240… giây (tối đa 1 giờ), tối đa một
+  lượt/paper/run. Hết số lượt không bao giờ biến lỗi thành hoàn tất.
+- `--retry-errors` bỏ qua thời gian chờ và thử lại cả `blocked` sau khi sửa
+  key/quyền. `--retry-not-found` / `--retry-partial` kiểm tra lại hai nhóm tương ứng.
+  Không có tác vụ retry chạy nền; cần chạy lại lệnh sau khi lỗi tạm thời hết.
+- Khi resume, kiểm tra số cạnh đã lưu so với ledger để phát hiện file bị mất hoặc
+  thiếu cạnh. Paper thật sự có 0 references vẫn được coi là hoàn tất.
+- Ledger cũ không có `next_retry_at` vẫn được đọc; `error` cũ đã vượt
+  `MAX_PAPER_ATTEMPTS` được thử lại, không bị bỏ qua vĩnh viễn.
+- Các cạnh trùng trong dữ liệu cũ được hợp nhất bằng thay file an toàn. Một replay
+  sau khi dừng giữa ghi cạnh và ghi ledger chỉ thêm những cạnh còn thiếu.
 - Một file lock (`.crawler.lock`) ngăn hai tiến trình cùng ghi vào một member.
 
 ## Exit code
@@ -115,7 +125,7 @@ thống kê.
 |---:|---|
 | `0` | Thành công, hoặc `--dry-run` |
 | `1` | Lỗi fatal (không đọc được range, không mở được browser, lock, exception) |
-| `2` | Chạy xong nhưng số lỗi vượt `--tolerate-errors` (mặc định 0) |
+| `2` | Số lỗi mới + lỗi đang chờ thử lại/sửa cấu hình vượt `--tolerate-errors` (mặc định 0) |
 | `130` | Bị Ctrl-C; tiến độ đã được lưu |
 
 ## Dữ liệu đầu ra
@@ -125,7 +135,7 @@ hoặc `--data-dir`):
 
 - `references.jsonl` — cạnh trích dẫn, mỗi dòng gồm `arxiv_id`,
   `ref_arxiv_id`, `ref_title`, `ref_authors`, `ref_submission_date`, `ref_s2_id`.
-- `ledger.jsonl` — trạng thái từng paper (`ok` / `partial` / `not_found` / `error`,
+- `ledger.jsonl` — trạng thái từng paper (`ok` / `partial` / `not_found` / `error` / `blocked`,
   số lần thử, số reference tìm thấy/ghi được, và các metrics chi tiết); đây là
   cơ sở để resume.
 - File cũ dùng chung `data/raw/references.jsonl` được tự động nhập một lần vào
@@ -157,6 +167,10 @@ Ví dụ một dòng `references.jsonl`:
   "member": "member3",
   "status": "ok",
   "attempts": 0,
+  "last_attempt_at": "2026-01-01T00:00:00+00:00",
+  "next_retry_at": null,
+  "error_type": "",
+  "refs_unique_total": 38,
   "refs_total": 45,
   "refs_with_arxiv": 38,
   "refs_written": 38,
@@ -177,7 +191,15 @@ Ví dụ một dòng `references.jsonl`:
 | `ok` | Crawl thành công, tất cả reference đều resolved | Bỏ qua |
 | `partial` | Crawl thành công nhưng một vài reference **unresolved** | Bỏ qua (trừ `--retry-partial`) |
 | `not_found` | Paper chưa có trên S2 (HTTP 404) | Bỏ qua (trừ `--retry-not-found`) |
-| `error` | Lỗi transport/API sau khi hết retry | Thử lại nếu `--retry-errors`, hoặc đã hết `MAX_PAPER_ATTEMPTS` |
+| `error` | Lỗi transport/API sau khi hết retry | Thử lại sau thời gian chờ, hoặc ngay với `--retry-errors` |
+| `blocked` | Key/quyền hoặc request bị từ chối, đã hết đường fallback | Sửa nguyên nhân rồi dùng `--retry-errors` |
+
+`attempts` đếm các lượt paper thất bại liên tiếp, reset khi thành công; khác với
+5 lần gọi tối đa cho từng request. `next_retry_at` là Unix timestamp của thời
+điểm được thử lại; null với trạng thái khác `error`. `refs_unique_total` là số
+cạnh duy nhất đang lưu của paper, giúp phát hiện mất dữ liệu khi resume.
+`skipped` gồm cả paper hoàn tất và paper tạm hoãn; `deferred` đếm nhóm lỗi đang
+chờ, còn `already_done` trong báo cáo chỉ đếm kết quả đã hoàn tất.
 
 **Metrics chi tiết trong ledger:**
 - `refs_total`: tổng references API trả về cho paper này
@@ -236,7 +258,7 @@ tail -f logs/crawl_references_member3.log
 # Số cạnh đã ghi
 wc -l data/raw/member3/references.jsonl
 
-# Số paper đã có trạng thái trong ledger
+# Số lần cập nhật ledger (một paper có thể có nhiều dòng)
 wc -l data/raw/member3/ledger.jsonl
 
 # Báo cáo lần chạy gần nhất
@@ -253,6 +275,6 @@ cat statistics/crawl_references_member3.md
 | `Target page, context or browser has been closed` | Browser bị đóng khi debug | Chạy lại; không đóng cửa sổ Chromium |
 | `KeyError: memberX` | Sai `ARXIV_MEMBER` | Kiểm tra `ranges.yaml` |
 | `month_sizes is missing` | Thiếu config tháng | Điền `month_sizes` hoặc dùng `--month-size` |
-| Exit code `2` | Có lỗi tạm thời sau retry | Chạy lại, hoặc `--tolerate-errors N` |
+| Exit code `2` | Có lỗi mới hoặc lỗi đang tạm hoãn | Chạy lại sau thời gian chờ; `--retry-errors` để thử ngay sau khi sửa nguyên nhân |
 
 (End of file - total 216 lines)

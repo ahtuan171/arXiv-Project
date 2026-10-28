@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from src import config, utils
+from src.recovery import RecordStore
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ def load_papers(
     skip_errors: bool = True,
 ) -> Iterator[dict]:
     """Yield tung record paper tu papers.jsonl."""
-    for record in utils.read_jsonl(path or _papers_path()):
+    for record in RecordStore(Path(path or _papers_path())).rows.values():
         if skip_errors and "error" in record:
             continue
         yield record
@@ -50,7 +51,10 @@ def load_references(
     skip_errors: bool = True,
 ) -> Iterator[dict]:
     """Yield tung record reference tu references.jsonl."""
-    for record in utils.read_jsonl(path or _refs_path()):
+    p = Path(path or _refs_path())
+    if not p.exists():
+        return
+    for record in utils.read_jsonl(p):
         if skip_errors and "error" in record:
             continue
         yield record
@@ -66,10 +70,7 @@ def get_paper(
 ) -> Optional[dict]:
     """Tra ve dict cua mot paper theo arXiv ID, hoac None neu khong tim thay."""
     target = utils.clean_arxiv_id(arxiv_id)
-    for record in utils.read_jsonl(path or _papers_path()):
-        if record.get("arxiv_id") == target:
-            return record
-    return None
+    return RecordStore(Path(path or _papers_path())).rows.get(target)
 
 
 def get_refs(
@@ -77,8 +78,11 @@ def get_refs(
     path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Tra ve dict reference cua mot paper theo arXiv ID, hoac None."""
+    p = Path(path or _refs_path())
+    if not p.exists():
+        return None
     target = utils.clean_arxiv_id(arxiv_id)
-    for record in utils.read_jsonl(path or _refs_path()):
+    for record in utils.read_jsonl(p):
         if record.get("arxiv_id") == target:
             return record
     return None
@@ -125,7 +129,7 @@ def summarize(
     refs_path: Optional[Path] = None,
 ) -> dict:
     """Tinh cac thong ke tong hop."""
-    all_paper_records = list(utils.read_jsonl(papers_path or _papers_path()))
+    all_paper_records = list(load_papers(papers_path, skip_errors=False))
     n_ok = sum(1 for r in all_paper_records if "error" not in r)
     n_err = sum(1 for r in all_paper_records if "error" in r)
 
