@@ -51,7 +51,10 @@ def load_references(
     skip_errors: bool = True,
 ) -> Iterator[dict]:
     """Yield tung record reference tu references.jsonl."""
-    for record in utils.read_jsonl(path or _refs_path()):
+    p = Path(path or _refs_path())
+    if not p.exists():
+        return
+    for record in utils.read_jsonl(p):
         if skip_errors and "error" in record:
             continue
         yield record
@@ -67,10 +70,7 @@ def get_paper(
 ) -> Optional[dict]:
     """Tra ve dict cua mot paper theo arXiv ID, hoac None neu khong tim thay."""
     target = utils.clean_arxiv_id(arxiv_id)
-    for record in RecordStore(Path(path or _papers_path())).rows.values():
-        if record.get("arxiv_id") == target:
-            return record
-    return None
+    return RecordStore(Path(path or _papers_path())).rows.get(target)
 
 
 def get_refs(
@@ -78,8 +78,11 @@ def get_refs(
     path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Tra ve dict reference cua mot paper theo arXiv ID, hoac None."""
+    p = Path(path or _refs_path())
+    if not p.exists():
+        return None
     target = utils.clean_arxiv_id(arxiv_id)
-    for record in utils.read_jsonl(path or _refs_path()):
+    for record in utils.read_jsonl(p):
         if record.get("arxiv_id") == target:
             return record
     return None
