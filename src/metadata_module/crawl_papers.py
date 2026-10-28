@@ -113,27 +113,30 @@ def error_record(arxiv_id_clean: str, error: str) -> dict[str, Any]:
 # Fetch function with retries for HTTP 429, 5xx, and network drops
 # ---------------------------------------------------------------------------
 
-def try_fetch_arxiv(
-    canonical_id: str,
+def try_fetch_arxiv_batch(
+    canonical_ids: list[str],
     rate_limiter: Optional[Any] = None,
     max_retries: int = config.MAX_RETRIES,
     backoff_base: float = config.BACKOFF_BASE,
     max_backoff: float = config.MAX_BACKOFF,
     jitter: float = getattr(config, "JITTER", 0.5),
-) -> Optional[arxiv.Result]:
-    """Query arXiv API for metadata, retrying on transient errors.
+) -> dict[str, Optional[arxiv.Result]]:
+    """Query arXiv API for a batch of paper metadata, retrying on transient errors.
 
     Retries on:
-    - HTTP 429 Too Many Requests (enforces at least 3s rate-limit interval)
+    - HTTP 429 Too Many Requests (enforces rate-limit interval)
     - HTTP 500, 502, 503, 504 server overload
     - Connection timeouts or drops (URLError, ConnectionError, IncompleteRead, Timeout)
 
     Returns:
-        arxiv.Result if found, or None if not found (fail fast, no retries on 404).
+        dict mapping canonical_id -> arxiv.Result (or None if not found).
     """
     if max_retries < 1:
         raise ValueError("max_retries must be at least 1")
-    search = arxiv.Search(id_list=[canonical_id])
+    if not canonical_ids:
+        return {}
+
+    search = arxiv.Search(id_list=canonical_ids)
 
     for attempt in range(1, max_retries + 1):
         error_msg = None
@@ -141,12 +144,41 @@ def try_fetch_arxiv(
         retry_after = None
 
         try:
-            return next(_client.results(search), None)
+            results = list(_client.results(search))
+            mapping: dict[str, Optional[arxiv.Result]] = {cid: None for cid in canonical_ids}
+            if len(canonical_ids) == 1 and results:
+                mapping[canonical_ids[0]] = results[0]
+                return mapping
+
+            for paper in results:
+                entry = getattr(paper, "entry_id", "")
+                short = getattr(paper, "get_short_id", lambda: "")() if hasattr(paper, "get_short_id") else ""
+                key = ""
+                if short:
+                    key = utils.canonical_arxiv_id(short)
+                elif "arxiv.org/abs/" in entry:
+                    key = utils.canonical_arxiv_id(entry.split("arxiv.org/abs/")[-1])
+                elif entry:
+                    key = utils.canonical_arxiv_id(entry)
+
+                matched = False
+                for cid in canonical_ids:
+                    if utils.canonical_arxiv_id(cid) == key:
+                        mapping[cid] = paper
+                        matched = True
+                        break
+                if not matched and entry:
+                    for cid in canonical_ids:
+                        clean_c = utils.clean_arxiv_id(cid)
+                        if clean_c in entry or cid in entry:
+                            mapping[cid] = paper
+                            break
+            return mapping
         except arxiv.HTTPError as exc:
             status = getattr(exc, "status", None)
             retry_after = getattr(exc, "retry_after", None)
             if status == 404:
-                return None
+                return {cid: None for cid in canonical_ids}
             elif status == 429:
                 is_429 = True
                 error_msg = "HTTP 429 Too Many Requests"
@@ -165,8 +197,8 @@ def try_fetch_arxiv(
                 error_msg = f"Network drop / timeout: {exc}"
 
         if attempt == max_retries:
-            log.error("arXiv query %s failed after %d attempts: %s", canonical_id, max_retries, error_msg)
-            raise recovery.FetchFailure(f"arXiv query failed for {canonical_id}: {error_msg}")
+            log.error("arXiv batch query (%d IDs) failed after %d attempts: %s", len(canonical_ids), max_retries, error_msg)
+            raise recovery.FetchFailure(f"arXiv batch query failed: {error_msg}")
 
         if retry_after is not None:
             delay = min(max(float(retry_after), 0.0), config.MAX_RETRY_AFTER)
@@ -176,10 +208,39 @@ def try_fetch_arxiv(
         if jitter > 0:
             delay += random.uniform(0.0, jitter)
 
-        log.warning("arXiv query %s failed (%s); retry %d/%d in %.2fs", canonical_id, error_msg, attempt, max_retries, delay)
+        log.warning("arXiv batch query failed (%s); retry %d/%d in %.2fs", error_msg, attempt, max_retries, delay)
         time.sleep(delay)
 
-    return None
+    return {cid: None for cid in canonical_ids}
+
+
+def try_fetch_arxiv(
+    canonical_id: str,
+    rate_limiter: Optional[Any] = None,
+    max_retries: int = config.MAX_RETRIES,
+    backoff_base: float = config.BACKOFF_BASE,
+    max_backoff: float = config.MAX_BACKOFF,
+    jitter: float = getattr(config, "JITTER", 0.5),
+) -> Optional[arxiv.Result]:
+    """Query arXiv API for metadata, retrying on transient errors.
+
+    Retries on:
+    - HTTP 429 Too Many Requests (enforces at least 3s rate-limit interval)
+    - HTTP 500, 502, 503, 504 server overload
+    - Connection timeouts or drops (URLError, ConnectionError, IncompleteRead, Timeout)
+
+    Returns:
+        arxiv.Result if found, or None if not found (fail fast, no retries on 404).
+    """
+    res = try_fetch_arxiv_batch(
+        [canonical_id],
+        rate_limiter=rate_limiter,
+        max_retries=max_retries,
+        backoff_base=backoff_base,
+        max_backoff=max_backoff,
+        jitter=jitter,
+    )
+    return res.get(canonical_id)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +256,7 @@ def crawl_papers(
     out_path: Union[Path, str] = config.DATA_DIR / "papers.jsonl",
     csv_path: Optional[Union[Path, str]] = None,
     limit: int = 0,
+    batch_size: int = getattr(config, "ARXIV_BATCH_SIZE", 100),
     rate_limiter: Optional[Any] = _arxiv_limiter,
     resume: bool = True,
     retry_errors: bool = False,
@@ -212,6 +274,7 @@ def crawl_papers(
         out_path: Destination JSONL path.
         csv_path: Destination Table 1 CSV path (default: data/csv/m1_discovery_stats.csv).
         limit: Max papers to crawl (0 = all).
+        batch_size: Number of arXiv IDs to query per batch (default from config).
         rate_limiter: Optional RateLimiter instance.
         resume: Skip completed papers and errors still in cooldown.
         retry_errors: Retry failed/blocked papers immediately.
@@ -276,45 +339,57 @@ def crawl_papers(
 
     success = error = 0
     columns = ["arxiv_id", "discovery_status", "num_versions", "discovery_time_sec"]
+    batch_size = max(1, int(batch_size))
     with utils.measure("crawl_papers", disk_path=out_p.parent) as perf:
         try:
-            for i, raw_id in enumerate(todo, start=1):
+            for b_idx in range(0, len(todo), batch_size):
+                batch_ids = todo[b_idx : b_idx + batch_size]
                 if rate_limiter is not None:
                     rate_limiter.wait()
                 t0 = time.perf_counter()
-                status, error_type, message = "ok", "", ""
-                record = None
+                batch_results: dict[str, Optional[arxiv.Result]] = {}
+                batch_err: Optional[Exception] = None
                 try:
-                    paper = try_fetch_arxiv(raw_id)
+                    batch_results = try_fetch_arxiv_batch(batch_ids)
                 except OSError:
                     # Local I/O failures are not recoverable remote fetch errors.
                     raise
                 except Exception as exc:
-                    message = str(exc)
-                    error_type = getattr(exc, "error_type", "transient")
-                    status = "blocked" if error_type == "blocked" else "error"
-                    record = error_record(utils.clean_arxiv_id(raw_id), f"fetch_failed: {exc}")
-                    error += 1
-                    log.error("[%d/%d] %s -> %s: %s", i, len(todo), raw_id, status, exc)
-                else:
-                    if paper is None:
-                        status, error_type, message = "not_found", "not_found", "not_found"
-                        record = error_record(utils.clean_arxiv_id(raw_id), "not_found")
+                    batch_err = exc
+
+                batch_elapsed = max(0.0, time.perf_counter() - t0)
+                per_item_time = round(batch_elapsed / max(1, len(batch_ids)), 4)
+
+                for raw_id in batch_ids:
+                    status, error_type, message = "ok", "", ""
+                    record = None
+                    if batch_err is not None:
+                        message = str(batch_err)
+                        error_type = getattr(batch_err, "error_type", "transient")
+                        status = "blocked" if error_type == "blocked" else "error"
+                        record = error_record(utils.clean_arxiv_id(raw_id), f"fetch_failed: {batch_err}")
                         error += 1
+                        log.error("%s -> %s: %s", raw_id, status, batch_err)
                     else:
-                        record = build_record(paper, raw_id)
-                        success += 1
-                # Journal first, then stats, then ledger. Restart can replay safely.
-                store.put(record)
-                stat_item = {
-                    "arxiv_id": raw_id,
-                    "discovery_status": "success" if status == "ok" else "not_found" if status == "not_found" else "failed",
-                    "num_versions": len(record.get("versions", [])),
-                    "discovery_time_sec": round(time.perf_counter() - t0, 4),
-                }
-                recovery.durable_append(jsonl_stats_p, stat_item)
-                stats_records[utils.clean_arxiv_id(raw_id)] = stat_item
-                ledger.record(raw_id, status, error=message, error_type=error_type)
+                        paper = batch_results.get(raw_id)
+                        if paper is None:
+                            status, error_type, message = "not_found", "not_found", "not_found"
+                            record = error_record(utils.clean_arxiv_id(raw_id), "not_found")
+                            error += 1
+                        else:
+                            record = build_record(paper, raw_id)
+                            success += 1
+                    # Journal first, then stats, then ledger. Restart can replay safely.
+                    store.put(record)
+                    stat_item = {
+                        "arxiv_id": raw_id,
+                        "discovery_status": "success" if status == "ok" else "not_found" if status == "not_found" else "failed",
+                        "num_versions": len(record.get("versions", [])),
+                        "discovery_time_sec": per_item_time,
+                    }
+                    recovery.durable_append(jsonl_stats_p, stat_item)
+                    stats_records[utils.clean_arxiv_id(raw_id)] = stat_item
+                    ledger.record(raw_id, status, error=message, error_type=error_type)
         finally:
             # Ctrl-C still leaves a clean current snapshot; a hard crash is
             # recovered from the journal by both resume and the metadata reader.
@@ -334,6 +409,7 @@ def main() -> None:
     ap.add_argument("--out", default=str(config.DATA_DIR / "papers.jsonl"))
     ap.add_argument("--csv", default=str(config.DATA_DIR / "csv" / "m1_discovery_stats.csv"))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--batch-size", type=int, default=getattr(config, "ARXIV_BATCH_SIZE", 100), help="Batch size for arXiv queries")
     ap.add_argument("--retry-errors", action="store_true", help="Retry errors/blocked without cooldown")
     ap.add_argument("--retry-not-found", action="store_true", help="Recheck missing papers")
     args = ap.parse_args()
@@ -346,6 +422,7 @@ def main() -> None:
         out_path=args.out,
         csv_path=args.csv,
         limit=args.limit,
+        batch_size=args.batch_size,
         retry_errors=args.retry_errors,
         retry_not_found=args.retry_not_found,
     )

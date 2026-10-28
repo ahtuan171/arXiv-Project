@@ -58,14 +58,26 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
         if not p.exists():
             continue
         if p.is_file():
-            total_bytes += p.stat().st_size
+            try:
+                total_bytes += p.stat().st_size
+            except OSError:
+                pass
         else:
-            for child in p.rglob("*"):
-                if child.is_file():
-                    try:
-                        total_bytes += child.stat().st_size
-                    except OSError:
-                        pass
+            stack = [str(p)]
+            while stack:
+                curr = stack.pop()
+                try:
+                    with os.scandir(curr) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    total_bytes += entry.stat(follow_symlinks=False).st_size
+                                elif entry.is_dir(follow_symlinks=False):
+                                    stack.append(entry.path)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
     return round(total_bytes / (1024 * 1024), 4)
 
 

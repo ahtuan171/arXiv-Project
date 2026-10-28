@@ -58,6 +58,10 @@ load_env_file()
 # --- Network politeness ----------------------------------------------------
 # arXiv requires at least 3 seconds between requests.
 ARXIV_MIN_INTERVAL = 3.2
+try:
+    ARXIV_BATCH_SIZE = max(1, min(int(os.environ.get("ARXIV_BATCH_SIZE", "100")), 200))
+except ValueError:
+    ARXIV_BATCH_SIZE = 100
 # The website JSON endpoints tolerate a few requests/second, but be polite
 # enough to avoid WAF challenges. All tabs share one limiter.
 try:
