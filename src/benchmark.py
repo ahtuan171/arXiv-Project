@@ -104,15 +104,22 @@ class SystemBenchmarkTracker:
         self._last_disk_time: float = 0.0
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._last_record: Optional[dict[str, Any]] = None
 
     def start(self) -> "SystemBenchmarkTracker":
         """Start wall-clock timer and background resource sampling thread."""
+        if self._running:
+            self._running = False
+            if self._thread is not None:
+                self._thread.join(timeout=1.0)
+
         self._start_time = time.perf_counter()
         initial_ram = current_process_ram_mb()
         self._ram_samples = [initial_ram] if initial_ram > 0 else []
         self._peak_disk_mb = calculate_storage_mb(self.storage_dirs)
         self._last_disk_time = time.monotonic()
         self._running = True
+        self._last_record = None
 
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
@@ -138,6 +145,18 @@ class SystemBenchmarkTracker:
         csv_path: Optional[Union[Path, str]] = None,
     ) -> pd.DataFrame:
         """Stop tracking, calculate benchmark metrics, and export to CSV."""
+        expected_cols = [
+            "total_papers",
+            "total_wall_time_sec",
+            "peak_ram_mb",
+            "average_ram_mb",
+            "peak_disk_mb",
+            "final_storage_mb",
+        ]
+
+        if not self._running and self._end_time > 0 and self._last_record is not None:
+            return pd.DataFrame([self._last_record])[expected_cols]
+
         self._end_time = time.perf_counter()
         self._running = False
         if self._thread is not None:
@@ -152,7 +171,7 @@ class SystemBenchmarkTracker:
         if final_storage > self._peak_disk_mb:
             self._peak_disk_mb = final_storage
 
-        total_wall_time = max(0.0, self._end_time - self._start_time)
+        total_wall_time = max(0.0, self._end_time - self._start_time) if self._start_time > 0 else 0.0
         peak_ram = max(self._ram_samples) if self._ram_samples else current_process_ram_mb()
         avg_ram = sum(self._ram_samples) / len(self._ram_samples) if self._ram_samples else peak_ram
 
@@ -164,6 +183,7 @@ class SystemBenchmarkTracker:
             "peak_disk_mb": round(float(self._peak_disk_mb), 2),
             "final_storage_mb": round(float(final_storage), 2),
         }
+        self._last_record = record
 
         if csv_path is None:
             csv_path = config.DATA_DIR / "csv" / "m1_system_benchmark.csv"
