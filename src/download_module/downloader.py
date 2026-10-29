@@ -196,15 +196,29 @@ def _publish_source(staged: Path, directory: Path) -> None:
     _recover_source(directory)
     backup = directory.with_name(f".{directory.name}.backup")
     if directory.exists():
-        os.replace(directory, backup)
+        try:
+            os.replace(directory, backup)
+        except OSError:
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            shutil.move(str(directory), str(backup))
     try:
-        os.replace(staged, directory)
+        try:
+            os.replace(staged, directory)
+        except OSError as err:
+            if err.errno == 18 or getattr(err, "winerror", None) == 17:
+                shutil.move(str(staged), str(directory))
+            else:
+                raise
     except BaseException:
         if backup.exists() and not directory.exists():
-            os.replace(backup, directory)
+            try:
+                os.replace(backup, directory)
+            except OSError:
+                shutil.move(str(backup), str(directory))
         raise
     if backup.exists():
-        shutil.rmtree(backup)
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def download_single_paper(
@@ -365,9 +379,9 @@ def download_single_paper(
 
         size = len(content)
         is_pdf = "application/pdf" in content_type or content.startswith(b"%PDF")
-        # Extract outside the HTTP retry loop: archive errors are classified for a
-        # later run; local disk errors propagate and never commit a success ledger.
-        with tempfile.TemporaryDirectory(prefix=f".{paper_dir.name}.staging-", dir=raw_dir) as temp:
+        # Extract outside the HTTP retry loop in fast local temporary directory.
+        # This completely avoids creating/deleting temporary trees and unneeded files on slow network/Google Drive storage.
+        with tempfile.TemporaryDirectory(prefix=f".{paper_dir.name}.staging-") as temp:
             staged = Path(temp)
             if is_pdf:
                 (staged / ".source-status.json").write_text(json.dumps({"status": "pdf_only"}))
@@ -379,9 +393,6 @@ def download_single_paper(
             files = [f for f in staged.rglob("*") if f.is_file()]
             num_tex = sum(f.suffix.lower() == ".tex" and f.stat().st_size > 0 for f in files)
             cleaned_size = sum(f.stat().st_size for f in files)
-            for file in files:
-                with file.open("rb") as handle:
-                    os.fsync(handle.fileno())
             _publish_source(staged, paper_dir)
         return DownloadStats(arxiv_id, "success", True, size, cleaned_size, num_tex, time.perf_counter() - t0)
 
@@ -451,23 +462,27 @@ def download_papers_range(
     for arxiv_id in dict.fromkeys(target_ids):
         key = clean_arxiv_id(arxiv_id)
         paper_dir = raw_dir / key
-        with utils.file_lock(raw_dir / f".{key}.download.lock"):
-            _recover_source(paper_dir)
         previous = ledger.get(arxiv_id)
         old = records.get(key, {})
         if previous is None:
             status = {"success": "ok", "pdf_only": "pdf_only"}.get(old.get("download_status"), "error")
             previous = {"status": status}
-        if previous.get("status") == "ok" and not _has_source(paper_dir):
+        if previous.get("status") in {"ok", "pdf_only"} and not paper_dir.exists():
             previous = None
         if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
                 retry_not_found=retry_not_found, retry_partial=retry_partial):
+            if paper_dir.with_name(f".{key}.backup").exists():
+                with utils.file_lock(raw_dir / f".{key}.download.lock"):
+                    _recover_source(paper_dir)
             pending.append(arxiv_id)
 
     columns = ["arxiv_id", "download_status", "has_tex", "raw_size_bytes",
                "cleaned_size_bytes", "num_tex_files", "download_time_sec"]
     limiter = RateLimiter(delay) if delay > 0 else None
     session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     from tqdm import tqdm
     try:
         for arxiv_id in tqdm(pending, desc="Downloading arXiv sources", disable=not show_progress):
