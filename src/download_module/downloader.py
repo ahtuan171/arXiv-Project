@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+import contextlib
 import gzip
 import http.client
 import io
@@ -232,6 +233,8 @@ def download_single_paper(
     backoff_base: float = config.BACKOFF_BASE,
     max_backoff: float = config.MAX_BACKOFF,
     jitter: float = config.JITTER,
+    staging_dir: Optional[Path] = None,
+    lock: bool = True,
 ) -> DownloadStats:
     """Download, extract, and clean the source files of a single arXiv paper.
 
@@ -261,6 +264,8 @@ def download_single_paper(
         backoff_base: Exponential backoff base multiplier (seconds).
         max_backoff: Maximum delay cap for exponential backoff (seconds).
         jitter: Random jitter added to backoff (seconds).
+        staging_dir: Optional custom directory for extraction staging.
+        lock: Whether to acquire per-paper lock (can be False for single-process runs).
 
     Returns:
         DownloadStats object recording all attributes required by Table 2.
@@ -273,7 +278,8 @@ def download_single_paper(
         raise ValueError("max_retries must be at least 1")
     if rate_limiter is not None:
         rate_limiter.wait()
-    with utils.file_lock(raw_dir / f".{clean_arxiv_id(arxiv_id)}.download.lock"):
+    lock_ctx = utils.file_lock(raw_dir / f".{clean_arxiv_id(arxiv_id)}.download.lock") if lock else contextlib.nullcontext()
+    with lock_ctx:
         t0 = time.perf_counter()
         paper_dir = raw_dir / clean_arxiv_id(arxiv_id)
         _recover_source(paper_dir, cleanup_staging=True)
@@ -379,9 +385,10 @@ def download_single_paper(
 
         size = len(content)
         is_pdf = "application/pdf" in content_type or content.startswith(b"%PDF")
-        # Extract outside the HTTP retry loop in fast local temporary directory.
-        # This completely avoids creating/deleting temporary trees and unneeded files on slow network/Google Drive storage.
-        with tempfile.TemporaryDirectory(prefix=f".{paper_dir.name}.staging-") as temp:
+        # Extract outside the HTTP retry loop. Prefer staging in paper_dir.parent (same filesystem)
+        # to allow an atomic os.replace without cross-device shutil.move copying overhead.
+        st_parent = staging_dir if staging_dir is not None else (paper_dir.parent if paper_dir.parent.exists() else None)
+        with tempfile.TemporaryDirectory(prefix=f".{paper_dir.name}.staging-", dir=st_parent) as temp:
             staged = Path(temp)
             if is_pdf:
                 (staged / ".source-status.json").write_text(json.dumps({"status": "pdf_only"}))
@@ -412,6 +419,9 @@ def download_papers_range(
     retry_not_found: bool = False,
     retry_partial: bool = False,
     id_list: Optional[Iterable[str]] = None,
+    batch_size: int = 10,
+    staging_dir: Optional[Path] = None,
+    lock: bool = False,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -434,6 +444,9 @@ def download_papers_range(
         max_retries: Maximum attempts per paper download for transient errors.
         backoff_base: Base multiplier for exponential backoff (seconds).
         id_list: Explicit list or iterable of arXiv IDs to process.
+        batch_size: Number of records to buffer before a batched fsync (default 10).
+        staging_dir: Optional staging directory for extraction.
+        lock: Whether to acquire file locks (default False to avoid bottlenecking single-process runs).
 
     Returns:
         pd.DataFrame containing the Table 2 statistics (m1_download_stats).
@@ -472,7 +485,8 @@ def download_papers_range(
         if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
                 retry_not_found=retry_not_found, retry_partial=retry_partial):
             if paper_dir.with_name(f".{key}.backup").exists():
-                with utils.file_lock(raw_dir / f".{key}.download.lock"):
+                lock_ctx = utils.file_lock(raw_dir / f".{key}.download.lock") if lock else contextlib.nullcontext()
+                with lock_ctx:
                     _recover_source(paper_dir)
             pending.append(arxiv_id)
 
@@ -484,19 +498,42 @@ def download_papers_range(
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     from tqdm import tqdm
+
+    batch_stats_buf: list[dict] = []
+    batch_ledger_buf: list[tuple[str, str, dict]] = []
+
+    def flush_buffers() -> None:
+        if batch_stats_buf:
+            recovery.durable_append_many(jsonl_file, batch_stats_buf)
+            batch_stats_buf.clear()
+        if batch_ledger_buf:
+            ledger.record_many(batch_ledger_buf)
+            batch_ledger_buf.clear()
+
     try:
         for arxiv_id in tqdm(pending, desc="Downloading arXiv sources", disable=not show_progress):
-            stats = download_single_paper(arxiv_id=arxiv_id, raw_dir=raw_dir,
-                rate_limiter=limiter, session=session, max_retries=max_retries,
-                backoff_base=backoff_base)
+            stats = download_single_paper(
+                arxiv_id=arxiv_id,
+                raw_dir=raw_dir,
+                rate_limiter=limiter,
+                session=session,
+                max_retries=max_retries,
+                backoff_base=backoff_base,
+                staging_dir=staging_dir,
+                lock=lock,
+            )
             rec = stats.to_dict()
-            recovery.durable_append(jsonl_file, rec)
             records[clean_arxiv_id(arxiv_id)] = rec
+            batch_stats_buf.append(rec)
             status = {"success": "ok", "pdf_only": "pdf_only"}.get(stats.download_status, "error")
             if stats.error_type in {"not_found", "blocked"}:
                 status = stats.error_type
-            ledger.record(arxiv_id, status, error_type=stats.error_type, error=stats.error)
+            batch_ledger_buf.append((arxiv_id, status, {"error_type": stats.error_type, "error": stats.error}))
+
+            if len(batch_stats_buf) >= max(1, batch_size):
+                flush_buffers()
     finally:
+        flush_buffers()
         session.close()
     df = recovery.export_stats(records, columns, csv_file)
     logger.info("Saved %d records to %s", len(df), csv_file)

@@ -173,8 +173,16 @@ class SystemBenchmarkTracker:
         self,
         total_papers: int,
         csv_path: Optional[Union[Path, str]] = None,
+        final_storage_mb: Optional[float] = None,
     ) -> pd.DataFrame:
-        """Stop tracking, calculate benchmark metrics, and export to CSV."""
+        """Stop tracking, calculate benchmark metrics, and export to CSV.
+
+        Args:
+            total_papers: Total number of papers processed.
+            csv_path: Output CSV file path (defaults to config.DATA_DIR / 'csv' / 'm1_system_benchmark.csv').
+            final_storage_mb: Optional pre-calculated disk footprint in MB (e.g. from download stats
+                or external calculation). If provided, avoids slow filesystem directory scans.
+        """
         expected_cols = [
             "total_papers",
             "total_wall_time_sec",
@@ -197,9 +205,13 @@ class SystemBenchmarkTracker:
         if final_ram > 0:
             self._ram_samples.append(final_ram)
 
-        # Avoid redundant disk scan if one just completed within 3 seconds
+        # Avoid slow recursive du -sb / os.scandir over network filesystems / Google Drive
         now = time.monotonic()
-        if self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
+        if final_storage_mb is not None:
+            final_storage = max(0.0, float(final_storage_mb))
+        elif self.disk_sample_interval_sec == 0.0:
+            final_storage = self._peak_disk_mb
+        elif self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
             final_storage = self._peak_disk_mb
         else:
             final_storage = calculate_storage_mb(self.storage_dirs)

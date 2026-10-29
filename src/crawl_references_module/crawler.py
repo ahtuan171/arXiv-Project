@@ -922,6 +922,10 @@ def crawl_references_range(
                     batch_elapsed = max(0.0, time.perf_counter() - t0)
                     per_item_time = round(batch_elapsed / max(1, len(batch_cids)), 4)
 
+                    batch_edges: list[dict] = []
+                    batch_stats: list[dict] = []
+                    batch_ledger: list[tuple[str, str, dict]] = []
+
                     for item in batch_results:
                         cid = item["arxiv_id"]
                         status = item["status"]
@@ -942,7 +946,7 @@ def crawl_references_range(
                             if pair not in pairs:
                                 edges.append(row)
                                 pairs.add(pair)
-                        append_jsonl_many(out_p, edges, fsync=True)
+                        batch_edges.extend(edges)
                         counts[key] = counts.get(key, 0) + len(edges)
                         stat = {
                             "arxiv_id": cid,
@@ -951,15 +955,27 @@ def crawl_references_range(
                             "num_arxiv_refs": len(current),
                             "ref_time_sec": per_item_time,
                         }
-                        recovery.durable_append(jsonl_stats_p, stat)
                         records[key] = stat
-                        ledger.record(
-                            cid, status, error=message, error_type=error_type,
-                            refs_unique_total=counts.get(key, 0),
-                            refs_unresolved=refs_unresolved,
-                        )
+                        batch_stats.append(stat)
+                        batch_ledger.append((
+                            cid,
+                            status,
+                            {
+                                "error": message,
+                                "error_type": error_type,
+                                "refs_unique_total": counts.get(key, 0),
+                                "refs_unresolved": refs_unresolved,
+                            },
+                        ))
                         if status in {"error", "blocked"}:
                             logger_inst.warning("S2 query failed for %s: %s", cid, message)
+
+                    if batch_edges:
+                        append_jsonl_many(out_p, batch_edges, fsync=True)
+                    if batch_stats:
+                        recovery.durable_append_many(jsonl_stats_p, batch_stats)
+                    if batch_ledger:
+                        ledger.record_many(batch_ledger)
             else:
                 for cid in pending:
                     key = canonical_arxiv_id(cid)

@@ -64,4 +64,37 @@ def test_calculate_storage_mb_fallback(tmp_path, monkeypatch):
     assert round(size, 1) == 1.0
 
 
+def test_tracker_stop_skips_disk_scan_when_interval_zero(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        benchmark, "calculate_storage_mb", lambda paths: calls.append(1) or 99.0
+    )
+    tracker = benchmark.SystemBenchmarkTracker(
+        storage_dirs=[tmp_path],
+        sample_interval_sec=0.01,
+        disk_sample_interval_sec=0.0,
+    ).start()
+    time.sleep(0.05)
+    df = tracker.stop(total_papers=1, csv_path=tmp_path / "bench.csv")
+    assert len(calls) == 0
+    assert df["final_storage_mb"].iloc[0] == 0.0
+
+
+def test_tracker_stop_uses_provided_final_storage_mb(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        benchmark, "calculate_storage_mb", lambda paths: calls.append(1) or 99.0
+    )
+    tracker = benchmark.SystemBenchmarkTracker(
+        storage_dirs=[tmp_path],
+        sample_interval_sec=0.01,
+        disk_sample_interval_sec=10.0,
+    ).start()
+    time.sleep(0.05)
+    df = tracker.stop(total_papers=1, csv_path=tmp_path / "bench.csv", final_storage_mb=12.34)
+    # calculate_storage_mb called at start in background thread, but stop() should use 12.34 directly
+    assert df["final_storage_mb"].iloc[0] == 12.34
+
+
+
 

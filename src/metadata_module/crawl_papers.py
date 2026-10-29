@@ -360,6 +360,10 @@ def crawl_papers(
                 batch_elapsed = max(0.0, time.perf_counter() - t0)
                 per_item_time = round(batch_elapsed / max(1, len(batch_ids)), 4)
 
+                batch_records: list[dict] = []
+                batch_stats: list[dict] = []
+                batch_ledger: list[tuple[str, str, dict]] = []
+
                 for raw_id in batch_ids:
                     status, error_type, message = "ok", "", ""
                     record = None
@@ -379,17 +383,24 @@ def crawl_papers(
                         else:
                             record = build_record(paper, raw_id)
                             success += 1
-                    # Journal first, then stats, then ledger. Restart can replay safely.
-                    store.put(record)
                     stat_item = {
                         "arxiv_id": raw_id,
                         "discovery_status": "success" if status == "ok" else "not_found" if status == "not_found" else "failed",
                         "num_versions": len(record.get("versions", [])),
                         "discovery_time_sec": per_item_time,
                     }
-                    recovery.durable_append(jsonl_stats_p, stat_item)
                     stats_records[utils.clean_arxiv_id(raw_id)] = stat_item
-                    ledger.record(raw_id, status, error=message, error_type=error_type)
+                    batch_records.append(record)
+                    batch_stats.append(stat_item)
+                    batch_ledger.append((raw_id, status, {"error": message, "error_type": error_type}))
+
+                # Journal first, then stats, then ledger. Batched with single fsync per file!
+                if batch_records:
+                    store.put_many(batch_records)
+                if batch_stats:
+                    recovery.durable_append_many(jsonl_stats_p, batch_stats)
+                if batch_ledger:
+                    ledger.record_many(batch_ledger)
         finally:
             # Ctrl-C still leaves a clean current snapshot; a hard crash is
             # recovered from the journal by both resume and the metadata reader.
