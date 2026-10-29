@@ -1,0 +1,3 @@
+# Optional dependencies for browser-based Semantic Scholar crawler (fallback mode)
+-r requirements.txt
+playwright>=1.40
