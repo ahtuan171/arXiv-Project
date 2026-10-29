@@ -340,7 +340,7 @@ def crawl_papers(
     success = error = 0
     columns = ["arxiv_id", "discovery_status", "num_versions", "discovery_time_sec"]
     batch_size = max(1, int(batch_size))
-    with utils.measure("crawl_papers", disk_path=out_p.parent) as perf:
+    with utils.measure("crawl_papers") as perf:
         try:
             for b_idx in range(0, len(todo), batch_size):
                 batch_ids = todo[b_idx : b_idx + batch_size]

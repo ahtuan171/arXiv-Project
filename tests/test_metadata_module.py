@@ -116,3 +116,24 @@ def test_crawl_papers_batching_success_and_not_found(tmp_path, monkeypatch):
     assert row3["discovery_status"] == "success"
     assert row3["num_versions"] == 2
 
+
+def test_crawl_papers_does_not_scan_disk(tmp_path, monkeypatch):
+    import src.metadata_module.crawl_papers as cp_module
+    from src import utils
+
+    dir_size_calls = []
+    monkeypatch.setattr(utils, "dir_size_mb", lambda path: dir_size_calls.append(path) or 0.0)
+    paper = _mock_paper()
+    monkeypatch.setattr(cp_module._client, "results", lambda search: iter([paper]))
+
+    crawl_papers(
+        id_list=["2502.00001"],
+        out_path=tmp_path / "papers.jsonl",
+        csv_path=tmp_path / "m1_discovery_stats.csv",
+        resume=False,
+    )
+
+    # crawl_papers must NOT invoke dir_size_mb (which causes severe freeze on large data dirs)
+    assert len(dir_size_calls) == 0
+
+

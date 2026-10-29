@@ -34,3 +34,24 @@ def test_tracker_safe_restart_and_stop(tmp_path):
     assert df2["total_wall_time_sec"].iloc[0] > 0
     assert df2["total_papers"].iloc[0] == 2
 
+
+def test_dir_size_mb_file_and_dir(tmp_path):
+    from src.utils import dir_size_mb
+    f = tmp_path / "test.txt"
+    f.write_bytes(b"x" * 1024 * 1024)  # 1 MB
+    sub = tmp_path / "subdir"
+    sub.mkdir()
+    (sub / "subfile.bin").write_bytes(b"y" * 1024 * 1024)  # 1 MB
+
+    # Test directory calculation
+    mb_dir = dir_size_mb(tmp_path)
+    assert round(mb_dir, 1) == 2.0
+
+    # Test single file calculation
+    mb_file = dir_size_mb(f)
+    assert round(mb_file, 1) == 1.0
+
+    # Test non-existent path
+    assert dir_size_mb(tmp_path / "does_not_exist") == 0.0
+
+
