@@ -80,15 +80,38 @@ from src.benchmark import SystemBenchmarkTracker
 utils.setup_logging("m1_pipeline", config.LOG_DIR / "m1_pipeline.log")
 
 # Cấu hình Fast Scratch NVMe storage trên Colab để loại bỏ độ trễ Google Drive FUSE
-DRIVE_DATA_DIR = config.DATA_DIR
-if use_fast_scratch_disk and Path("/content").exists():
+# Thư mục dữ liệu bền vững trên Drive (luôn dựa trên config.DEFAULT_DATA_DIR để không bị ghi đè khi chạy lại nhiều lần trong cùng phiên)
+PERSISTENT_DATA_DIR = getattr(config, "DEFAULT_DATA_DIR", Path(os.environ.get("ARXIV_DATA_DIR", config.ROOT_DIR / "data")))
+DRIVE_DATA_DIR = PERSISTENT_DATA_DIR
+
+if use_fast_scratch_disk and Path("/content").exists() and DRIVE_DATA_DIR.resolve() != Path("/content/data").resolve():
     SCRATCH_DATA_DIR = Path("/content/data")
-    if DRIVE_DATA_DIR.exists() and any(DRIVE_DATA_DIR.iterdir()):
-        print(f"-> Đang sao chép dữ liệu hiện có từ Drive ({DRIVE_DATA_DIR}) sang ổ cục bộ ({SCRATCH_DATA_DIR}) để hỗ trợ resume...")
-        shutil.copytree(DRIVE_DATA_DIR, SCRATCH_DATA_DIR, dirs_exist_ok=True)
+    if DRIVE_DATA_DIR.exists():
+        print(f"-> Đồng bộ siêu tốc metadata & ledger từ Drive ({DRIVE_DATA_DIR}) sang ổ cục bộ ({SCRATCH_DATA_DIR})...")
+        SCRATCH_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 1. Chỉ copy thư mục CSV, JSONL và Ledger (chỉ vài KB/MB, KHÔNG copy hàng nghìn file raw TeX)
+        drive_csv = DRIVE_DATA_DIR / "csv"
+        scratch_csv = SCRATCH_DATA_DIR / "csv"
+        if drive_csv.exists() and drive_csv.resolve() != scratch_csv.resolve():
+            scratch_csv.mkdir(parents=True, exist_ok=True)
+            for item in drive_csv.iterdir():
+                if item.is_file():
+                    target = scratch_csv / item.name
+                    # Chỉ copy từ Drive sang Scratch nếu file ở Scratch chưa có hoặc file trên Drive mới hơn
+                    if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
+                        shutil.copy2(item, target)
+        # 2. Copy các file snapshot tổng hợp (Metadata & References)
+        for name in ["papers.jsonl", "papers.jsonl.journal", "references.jsonl"]:
+            f = DRIVE_DATA_DIR / name
+            dst = SCRATCH_DATA_DIR / name
+            if f.exists() and f.resolve() != dst.resolve():
+                if not dst.exists() or f.stat().st_mtime > dst.stat().st_mtime:
+                    shutil.copy2(f, dst)
+        print("✅ Hoàn tất đồng bộ metadata phục vụ Resume trong < 1s (bỏ qua copy đĩa raw TeX nặng)!")
     config.DATA_DIR = SCRATCH_DATA_DIR
     print(f"-> Đã kích hoạt Fast Scratch Storage tại {config.DATA_DIR} (NVMe).")
 else:
+    config.DATA_DIR = DRIVE_DATA_DIR
     print(f"-> Sử dụng thư mục dữ liệu tại: {config.DATA_DIR}")
 
 # Các thư mục lưu trữ theo đúng quy định:
@@ -184,6 +207,7 @@ try:
             download_papers_range,
             id_list=id_list,
             raw_dir=RAW_DIR,
+            alt_raw_dir=DRIVE_DATA_DIR / "raw" if (use_fast_scratch_disk and DRIVE_DATA_DIR.resolve() != config.DATA_DIR.resolve()) else None,
             csv_dir=CSV_DIR,
             delay=arxiv_download_delay,
             **RECOVERY_OPTIONS,
@@ -234,9 +258,12 @@ finally:
     display(df_benchmark)
 
     # Tự động đồng bộ dữ liệu từ Fast Scratch sang Google Drive nếu được kích hoạt
-    if use_fast_scratch_disk and Path("/content").exists() and DRIVE_DATA_DIR != config.DATA_DIR:
+    if use_fast_scratch_disk and Path("/content").exists() and DRIVE_DATA_DIR.resolve() != config.DATA_DIR.resolve():
         print(f"\\n-> Đang đồng bộ kết quả từ ổ cục bộ ({config.DATA_DIR}) vào Google Drive ({DRIVE_DATA_DIR})...")
-        shutil.copytree(config.DATA_DIR, DRIVE_DATA_DIR, dirs_exist_ok=True)
+        def _copy_newer(src, dst):
+            if not os.path.exists(dst) or os.stat(src).st_mtime > os.stat(dst).st_mtime:
+                shutil.copy2(src, dst)
+        shutil.copytree(config.DATA_DIR, DRIVE_DATA_DIR, dirs_exist_ok=True, copy_function=_copy_newer)
         print("✅ Đồng bộ hoàn tất! Dữ liệu đã được lưu an toàn trên Google Drive.")
 """
     nb['cells'][11]['source'] = [line + '\n' for line in cell11_code.splitlines()]

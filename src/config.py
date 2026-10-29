@@ -19,7 +19,8 @@ import yaml
 # --- Paths -----------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
-DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
+DEFAULT_DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
+DATA_DIR = DEFAULT_DATA_DIR
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 LOG_DIR = ROOT_DIR / "logs"
