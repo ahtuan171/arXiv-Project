@@ -100,3 +100,36 @@ def test_download_resumes_via_http_range(tmp_path, monkeypatch):
     assert stats.download_status == "pdf_only"
     assert stats.raw_size_bytes == 100
     assert range_headers_received == ["bytes=50-"]
+
+
+def test_download_papers_range_skips_when_in_alt_raw_dir(tmp_path, monkeypatch):
+    from src import recovery
+    raw_dir = tmp_path / "scratch_raw"
+    alt_raw_dir = tmp_path / "drive_raw"
+    csv_dir = tmp_path / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+
+    # Simulate existing paper on Drive (alt_raw_dir)
+    paper_drive = alt_raw_dir / "2502_00001"
+    paper_drive.mkdir(parents=True, exist_ok=True)
+    (paper_drive / "main.tex").write_text("dummy tex content")
+
+    # Seed ledger so recovery knows it was ok
+    ledger = recovery.RecoveryLedger(csv_dir / "m1_download_stats.ledger.jsonl")
+    ledger.record("2502.00001", "ok")
+
+    downloaded = []
+    monkeypatch.setattr(
+        "src.download_module.downloader.download_single_paper",
+        lambda arxiv_id, **kw: downloaded.append(arxiv_id) or _fake_stats(arxiv_id),
+    )
+
+    df = download_papers_range(
+        raw_dir=raw_dir,
+        alt_raw_dir=alt_raw_dir,
+        csv_dir=csv_dir,
+        id_list=["2502.00001", "2502.00002"],
+        resume=True,
+    )
+    # 2502.00001 should be skipped because it exists in alt_raw_dir!
+    assert downloaded == ["2502.00002"]

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 import contextlib
 import gzip
 import http.client
@@ -422,6 +422,7 @@ def download_papers_range(
     batch_size: int = 10,
     staging_dir: Optional[Path] = None,
     lock: bool = False,
+    alt_raw_dir: Optional[Union[Path, str]] = None,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -447,6 +448,8 @@ def download_papers_range(
         batch_size: Number of records to buffer before a batched fsync (default 10).
         staging_dir: Optional staging directory for extraction.
         lock: Whether to acquire file locks (default False to avoid bottlenecking single-process runs).
+        alt_raw_dir: Optional fallback raw directory (e.g. Google Drive storage) to check if a paper
+            was already downloaded in a previous run without copying all raw folders locally.
 
     Returns:
         pd.DataFrame containing the Table 2 statistics (m1_download_stats).
@@ -480,7 +483,8 @@ def download_papers_range(
         if previous is None:
             status = {"success": "ok", "pdf_only": "pdf_only"}.get(old.get("download_status"), "error")
             previous = {"status": status}
-        if previous.get("status") in {"ok", "pdf_only"} and not paper_dir.exists():
+        paper_exists = paper_dir.exists() or (alt_raw_dir is not None and (Path(alt_raw_dir) / key).exists())
+        if previous.get("status") in {"ok", "pdf_only"} and not paper_exists:
             previous = None
         if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
                 retry_not_found=retry_not_found, retry_partial=retry_partial):
