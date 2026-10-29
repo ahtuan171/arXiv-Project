@@ -80,3 +80,22 @@ def test_crawl_references_range_uses_batch_client(tmp_path: Path):
     lines = out_p.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
 
+
+def test_crawl_references_range_custom_batch_size(tmp_path: Path):
+    client = MockBatchClient()
+    out_p = tmp_path / "references.jsonl"
+    csv_p = tmp_path / "m1_reference_stats.csv"
+
+    # 4 papers with batch_size=2 should result in exactly 2 batch API calls
+    df = crawl_references_range(
+        id_list=["2502.00001", "2502.00002", "2502.00003", "2502.00004"],
+        client=client,
+        out_path=out_p,
+        csv_path=csv_p,
+        batch_size=2,
+        resume=False,
+    )
+    assert len(df) == 4
+    assert client.batch_calls == 2
+
+

@@ -845,6 +845,7 @@ def crawl_references_range(
     csv_path: Optional[Union[Path, str]] = None,
     client: Optional[Any] = None,
     limit: int = 0,
+    batch_size: Optional[int] = None,
     resume: bool = True,
     dry_run: bool = False,
     log: Optional[logging.Logger] = None,
@@ -907,9 +908,15 @@ def crawl_references_range(
             if hasattr(active, "start") and not getattr(active, "started", False):
                 await maybe_await(active.start(1))
             if hasattr(active, "get_references_batch"):
-                batch_size = getattr(active, "batch_size", 100) or 100
-                for b_start in range(0, len(pending), batch_size):
-                    batch_cids = pending[b_start : b_start + batch_size]
+                eff_batch_size = (
+                    max(1, min(int(batch_size), 500))
+                    if batch_size is not None
+                    else getattr(active, "batch_size", 100) or 100
+                )
+                if hasattr(active, "batch_size"):
+                    active.batch_size = eff_batch_size
+                for b_start in range(0, len(pending), eff_batch_size):
+                    batch_cids = pending[b_start : b_start + eff_batch_size]
                     t0 = time.perf_counter()
                     batch_results = await maybe_await(active.get_references_batch(batch_cids))
                     batch_elapsed = max(0.0, time.perf_counter() - t0)
