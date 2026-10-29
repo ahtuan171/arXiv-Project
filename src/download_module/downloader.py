@@ -474,6 +474,14 @@ def download_papers_range(
 
     records = recovery.load_stats(jsonl_file, csv_file)
     ledger = recovery.RecoveryLedger(csv_file.with_suffix(".ledger.jsonl"))
+    existing_alt_ids: set[str] = set()
+    if alt_raw_dir is not None:
+        try:
+            alt_path = Path(alt_raw_dir)
+            if alt_path.exists():
+                existing_alt_ids = set(os.listdir(alt_path))
+        except OSError:
+            pass
     pending = []
     for arxiv_id in dict.fromkeys(target_ids):
         key = clean_arxiv_id(arxiv_id)
@@ -483,7 +491,7 @@ def download_papers_range(
         if previous is None:
             status = {"success": "ok", "pdf_only": "pdf_only"}.get(old.get("download_status"), "error")
             previous = {"status": status}
-        paper_exists = paper_dir.exists() or (alt_raw_dir is not None and (Path(alt_raw_dir) / key).exists())
+        paper_exists = paper_dir.exists() or (key in existing_alt_ids)
         if previous.get("status") in {"ok", "pdf_only"} and not paper_exists:
             previous = None
         if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,

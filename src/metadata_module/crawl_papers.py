@@ -152,7 +152,16 @@ def try_fetch_arxiv_batch(
 
             for paper in results:
                 entry = getattr(paper, "entry_id", "")
-                short = getattr(paper, "get_short_id", lambda: "")() if hasattr(paper, "get_short_id") else ""
+                if not isinstance(entry, str):
+                    entry = str(entry)
+                short = ""
+                if hasattr(paper, "get_short_id"):
+                    try:
+                        s = paper.get_short_id()
+                        if isinstance(s, str):
+                            short = s
+                    except Exception:
+                        pass
                 key = ""
                 if short:
                     key = utils.canonical_arxiv_id(short)
@@ -161,18 +170,10 @@ def try_fetch_arxiv_batch(
                 elif entry:
                     key = utils.canonical_arxiv_id(entry)
 
-                matched = False
                 for cid in canonical_ids:
                     if utils.canonical_arxiv_id(cid) == key:
                         mapping[cid] = paper
-                        matched = True
                         break
-                if not matched and entry:
-                    for cid in canonical_ids:
-                        clean_c = utils.clean_arxiv_id(cid)
-                        if clean_c in entry or cid in entry:
-                            mapping[cid] = paper
-                            break
             return mapping
         except arxiv.HTTPError as exc:
             status = getattr(exc, "status", None)

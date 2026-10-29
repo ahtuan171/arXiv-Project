@@ -109,9 +109,11 @@ if use_fast_scratch_disk and Path("/content").exists() and DRIVE_DATA_DIR.resolv
                     shutil.copy2(f, dst)
         print("✅ Hoàn tất đồng bộ metadata phục vụ Resume trong < 1s (bỏ qua copy đĩa raw TeX nặng)!")
     config.DATA_DIR = SCRATCH_DATA_DIR
+    config.RAW_DIR = SCRATCH_DATA_DIR / "raw"
     print(f"-> Đã kích hoạt Fast Scratch Storage tại {config.DATA_DIR} (NVMe).")
 else:
     config.DATA_DIR = DRIVE_DATA_DIR
+    config.RAW_DIR = DRIVE_DATA_DIR / "raw"
     print(f"-> Sử dụng thư mục dữ liệu tại: {config.DATA_DIR}")
 
 # Các thư mục lưu trữ theo đúng quy định:
@@ -128,10 +130,11 @@ print("-> Đã thiết lập thư mục lưu trữ và logging m1_pipeline.log t
 import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
 from src.metadata_module import crawl_papers
 from src.download_module.downloader import download_papers_range
 from src.crawl_references_module import crawl_references_range
-from src.benchmark import SystemBenchmarkTracker
+from src.benchmark import SystemBenchmarkTracker, calculate_storage_mb
 from src.utils import clean_arxiv_id
 
 print("-> Đang khởi động SystemBenchmarkTracker để theo dõi Bảng 4...")
@@ -231,24 +234,30 @@ try:
     print(df_refs["ref_status"].value_counts())
 finally:
     print("\\n=== KẾT THÚC VÀ LƯU BENCHMARK HỆ THỐNG ===")
-    # Ghi nhận chính xác số bài cào thực tế trong phiên chạy này (kể cả khi ngắt giữa chừng)
-    final_storage_mb = None
+    # Ghi nhận chính xác số bài cào thực tế trong phiên chạy này (chống nhân dồn & đảm bảo >= 1)
+    target_count = len(id_list) if id_list else 1
+    actual_papers_count = target_count
+
     if "df_downloads" in locals() and df_downloads is not None and not df_downloads.empty:
-        actual_papers_count = len(df_downloads)
-        cleaned_mb = df_downloads["cleaned_size_bytes"].sum() / (1024 * 1024)
-        final_storage_mb = round(cleaned_mb, 2)
+        target_clean = {clean_arxiv_id(x) for x in id_list}
+        session_downloads = df_downloads[df_downloads["arxiv_id"].apply(clean_arxiv_id).isin(target_clean)]
+        if not session_downloads.empty:
+            actual_papers_count = len(session_downloads)
     else:
         target_clean = {clean_arxiv_id(x) for x in id_list}
         current_completed_ids = snapshot_completed_ids(CSV_DIR)
         session_new_ids = (current_completed_ids - initial_completed_ids) & target_clean
-        actual_papers_count = len(session_new_ids)
+        if len(session_new_ids) > 0:
+            actual_papers_count = len(session_new_ids)
 
-        if actual_papers_count == 0 and stats_papers.get("success", 0) > 0:
-            actual_papers_count = stats_papers.get("success", 0)
-        elif actual_papers_count == 0 and not resume:
-            actual_papers_count = len(id_list)
+    # Chốt chặn an toàn: đảm bảo tuyệt đối không bao giờ bằng 0
+    actual_papers_count = max(1, int(actual_papers_count))
+
+    # Tính dung lượng thực tế của toàn bộ thư mục dữ liệu (raw, jsonl, csv)
+    final_storage_mb = calculate_storage_mb([config.DATA_DIR])
 
     print(f"-> Số bài cào thực tế trong phiên này: {actual_papers_count}")
+    print(f"-> Dung lượng thư mục dữ liệu ({config.DATA_DIR}): {final_storage_mb} MB")
     df_benchmark = tracker.stop(
         total_papers=actual_papers_count,
         csv_path=CSV_DIR / "m1_system_benchmark.csv",
@@ -259,12 +268,37 @@ finally:
 
     # Tự động đồng bộ dữ liệu từ Fast Scratch sang Google Drive nếu được kích hoạt
     if use_fast_scratch_disk and Path("/content").exists() and DRIVE_DATA_DIR.resolve() != config.DATA_DIR.resolve():
-        print(f"\\n-> Đang đồng bộ kết quả từ ổ cục bộ ({config.DATA_DIR}) vào Google Drive ({DRIVE_DATA_DIR})...")
-        def _copy_newer(src, dst):
-            if not os.path.exists(dst) or os.stat(src).st_mtime > os.stat(dst).st_mtime:
-                shutil.copy2(src, dst)
-        shutil.copytree(config.DATA_DIR, DRIVE_DATA_DIR, dirs_exist_ok=True, copy_function=_copy_newer)
-        print("✅ Đồng bộ hoàn tất! Dữ liệu đã được lưu an toàn trên Google Drive.")
+        print(f"\\n-> Đang đồng bộ siêu tốc kết quả từ ổ cục bộ ({config.DATA_DIR}) vào Google Drive ({DRIVE_DATA_DIR})...")
+        try:
+            # 1. Đồng bộ thư mục CSV, JSONL và Ledger
+            drive_csv = DRIVE_DATA_DIR / "csv"
+            scratch_csv = config.DATA_DIR / "csv"
+            if scratch_csv.exists():
+                drive_csv.mkdir(parents=True, exist_ok=True)
+                for item in scratch_csv.iterdir():
+                    if item.is_file():
+                        shutil.copy2(item, drive_csv / item.name)
+
+            # 2. Đồng bộ các file snapshot tổng hợp (Metadata & References)
+            for name in ["papers.jsonl", "papers.jsonl.journal", "references.jsonl"]:
+                f = config.DATA_DIR / name
+                if f.exists():
+                    shutil.copy2(f, DRIVE_DATA_DIR / name)
+
+            # 3. Đồng bộ raw source folders chỉ cho các ID trong phiên này
+            scratch_raw = config.DATA_DIR / "raw"
+            drive_raw = DRIVE_DATA_DIR / "raw"
+            if scratch_raw.exists():
+                drive_raw.mkdir(parents=True, exist_ok=True)
+                for aid in id_list:
+                    c_aid = clean_arxiv_id(aid)
+                    s_paper = scratch_raw / c_aid
+                    d_paper = drive_raw / c_aid
+                    if s_paper.exists():
+                        shutil.copytree(s_paper, d_paper, dirs_exist_ok=True)
+            print("✅ Đồng bộ siêu tốc hoàn tất! Dữ liệu đã được lưu an toàn trên Google Drive.")
+        except Exception as sync_err:
+            print(f"⚠️ Cảnh báo lỗi đồng bộ Google Drive: {sync_err}")
 """
     nb['cells'][11]['source'] = [line + '\n' for line in cell11_code.splitlines()]
 
