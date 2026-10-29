@@ -87,13 +87,19 @@ try:
     S2_API_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_API_MIN_INTERVAL", "1.2")))
 except ValueError:
     S2_API_MIN_INTERVAL = 1.2
+S2_API_ANONYMOUS_MIN_INTERVAL = 3.0  # Safe interval when unauthenticated (shared public quota)
 S2_API_MAX_RETRIES = 5
 S2_API_TIMEOUT = 30
 try:
     S2_API_PAGE_SIZE = max(1, min(int(os.environ.get("S2_API_PAGE_SIZE", "500")), 1000))
 except ValueError:
     S2_API_PAGE_SIZE = 500
-S2_API_BATCH_SIZE = 100
+S2_API_MAX_BATCH_SIZE = 500  # Official Semantic Scholar limit for /paper/batch
+try:
+    S2_API_BATCH_SIZE = max(1, min(int(os.environ.get("S2_API_BATCH_SIZE", "500")), S2_API_MAX_BATCH_SIZE))
+except ValueError:
+    S2_API_BATCH_SIZE = 500
+S2_API_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024  # 10MB payload size limit
 S2_API_PAPER_FIELDS = "paperId,externalIds,title,authors,year,publicationDate"
 S2_API_REF_FIELDS = os.environ.get(
     "S2_API_REF_FIELDS",
