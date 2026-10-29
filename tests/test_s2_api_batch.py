@@ -75,10 +75,11 @@ class TestS2ApiClientBatch(unittest.IsolatedAsyncioTestCase):
             await client._request("GET", "/paper/arXiv:2502.00001")
         self.assertEqual(mock_http.request.call_count, 1)
 
-    async def test_rate_limit_and_exponential_backoff(self):
-        """Test HTTP 429 handles Retry-After header and exponential progression."""
+    @patch("asyncio.sleep", new_callable=AsyncMock)
+    async def test_rate_limit_and_exponential_backoff(self, mock_sleep):
+        """Test HTTP 429 handles exponential backoff, jitter, and ceiling without Retry-After."""
         mock_http = AsyncMock()
-        resp_429 = DummyResponse(status_code=429, headers={"retry-after": "0.01"})
+        resp_429 = DummyResponse(status_code=429)
         resp_200 = DummyResponse(status_code=200, json_data={"paperId": "abc12345"})
         mock_http.request.side_effect = [resp_429, resp_200]
 
@@ -89,6 +90,13 @@ class TestS2ApiClientBatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res, {"paperId": "abc12345"})
         self.assertEqual(mock_http.request.call_count, 2)
         self.assertEqual(client.rate_limit_hits, 1)
+
+        # Verify that sleep was called with exponential backoff delay (cooldown + jitter <= max_backoff)
+        self.assertGreaterEqual(mock_sleep.call_count, 1)
+        slept_delay = mock_sleep.call_args_list[0][0][0]
+        self.assertGreaterEqual(slept_delay, config.S2_RATE_LIMIT_COOLDOWN)
+        self.assertLessEqual(slept_delay, config.S2_RATE_LIMIT_COOLDOWN + config.RETRY_JITTER)
+        self.assertLessEqual(slept_delay, config.MAX_BACKOFF)
 
     async def test_batch_500_papers(self):
         """Test batching up to 500 papers in a single request."""

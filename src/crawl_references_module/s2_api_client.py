@@ -33,7 +33,6 @@ from src.crawl_references_module.s2_client import (
     S2RateLimited,
     S2TransientError,
 )
-from src.recovery import parse_retry_after
 from src.utils import AsyncRateLimiter, is_valid_arxiv_id, normalize_arxiv_id
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,7 @@ class S2ApiAuthError(S2ApiError, S2AuthError):
 
 
 class S2ApiRateLimited(S2ApiError, S2RateLimited):
-    """The API quota is exhausted (HTTP 429); ``retry_after`` is honoured."""
+    """The API quota is exhausted (HTTP 429); retried with exponential backoff and jitter."""
 
 
 class S2ApiPayloadTooLarge(S2ApiError, S2TransientError):
@@ -65,9 +64,6 @@ class S2ApiTransientError(S2ApiError, S2TransientError):
 
 class S2ApiPermanentError(S2ApiError, S2PermanentError):
     """A request that will fail again unchanged (other 4xx)."""
-
-
-_parse_retry_after = parse_retry_after
 
 
 def _authors(value: Any) -> list[str]:
@@ -251,7 +247,7 @@ class S2ApiClient:
         """Perform one API request, retrying transient failures.
 
         404, 401/403, and 413 (>10MB payload) are never retried directly.
-        429 honours ``Retry-After`` and pauses every worker through the shared rate limiter.
+        429 pauses every worker using exponential backoff with jitter and ceiling.
         """
         if self._http is None:
             raise S2ApiTransientError("S2ApiClient.start() was not called")
@@ -260,7 +256,6 @@ class S2ApiClient:
         for attempt in range(1, self.max_retries + 1):
             await self.rate_limiter.wait()
             self.api_calls += 1
-            retry_after: Optional[float] = None
             try:
                 response = await self._http.request(
                     method, path, params=params, json=payload,
@@ -279,11 +274,7 @@ class S2ApiClient:
                     raise S2ApiPayloadTooLarge(f"HTTP 413 from Semantic Scholar API: payload too large for {path}")
                 if status == 429:
                     self.rate_limit_hits += 1
-                    retry_after = _parse_retry_after(response.headers.get("retry-after"))
-                    last_error = S2ApiRateLimited(
-                        f"rate limited (Retry-After={retry_after})",
-                        retry_after=retry_after,
-                    )
+                    last_error = S2ApiRateLimited("rate limited (HTTP 429)")
                 elif 500 <= status < 600:
                     last_error = S2ApiTransientError(f"HTTP {status} from Semantic Scholar API")
                 elif status >= 400:
@@ -314,19 +305,19 @@ class S2ApiClient:
                 raise last_error
 
             is_rate_limited = isinstance(last_error, S2ApiRateLimited)
-            if retry_after is not None:
-                delay = float(retry_after)
-            elif is_rate_limited:
+            if is_rate_limited:
                 base_wait = max(config.S2_RATE_LIMIT_COOLDOWN, config.BACKOFF_BASE)
                 delay = base_wait * (config.BACKOFF_BASE ** (attempt - 1))
             else:
                 delay = config.BACKOFF_BASE ** attempt
 
-            if is_rate_limited or retry_after is not None:
-                self.rate_limiter.block(delay)
-
+            # Capped exponential backoff (thời gian trần) + random jitter
             delay = min(max(delay, 0.0), config.MAX_BACKOFF)
             delay += random.uniform(0.0, config.RETRY_JITTER)
+
+            if is_rate_limited:
+                self.rate_limiter.block(delay)
+
             logger.warning(
                 "%s failed (%s); retry %d/%d in %.1fs",
                 path, last_error, attempt, self.max_retries, delay,
