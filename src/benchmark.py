@@ -116,7 +116,7 @@ class SystemBenchmarkTracker:
         self._start_time = time.perf_counter()
         initial_ram = current_process_ram_mb()
         self._ram_samples = [initial_ram] if initial_ram > 0 else []
-        self._peak_disk_mb = calculate_storage_mb(self.storage_dirs)
+        self._peak_disk_mb = 0.0
         self._last_disk_time = time.monotonic()
         self._running = True
         self._last_record = None
@@ -127,6 +127,15 @@ class SystemBenchmarkTracker:
         return self
 
     def _sample_loop(self) -> None:
+        # Initial disk sample runs asynchronously in background thread to avoid blocking caller/main thread
+        if self.disk_sample_interval_sec > 0:
+            try:
+                disk = calculate_storage_mb(self.storage_dirs)
+                if disk > self._peak_disk_mb:
+                    self._peak_disk_mb = disk
+            except Exception:
+                pass
+
         while self._running:
             ram = current_process_ram_mb()
             if ram > 0:

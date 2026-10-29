@@ -105,6 +105,10 @@ S2_API_REF_FIELDS = os.environ.get(
     "S2_API_REF_FIELDS",
     ",".join(f"citedPaper.{f}" for f in S2_API_PAPER_FIELDS.split(",")),
 )
+S2_API_BATCH_REF_FIELDS = os.environ.get(
+    "S2_API_BATCH_REF_FIELDS",
+    "paperId,title,references.paperId,references.title,references.authors,references.year,references.publicationDate,references.externalIds",
+)
 
 MAX_RETRIES = 5
 BACKOFF_BASE = 2.0  # seconds; wait = BACKOFF_BASE ** attempt

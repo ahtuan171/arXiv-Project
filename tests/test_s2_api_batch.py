@@ -263,6 +263,50 @@ class TestS2ApiClientBatch(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(raw_results[1])
         self.assertEqual(raw_results[2]["paperId"], "p2")
 
+    async def test_get_references_batch(self):
+        """Test get_references_batch sends POST /paper/batch with json ids and extracts references."""
+        query_ids = ["2502.00001", "2502.00002"]
+        mock_response = [
+            {
+                "paperId": "p1",
+                "title": "Paper One",
+                "references": [
+                    {
+                        "paperId": "ref_p1",
+                        "title": "Cited Paper",
+                        "authors": [{"name": "Alice"}],
+                        "year": 2023,
+                        "externalIds": {"ArXiv": "2301.00001"},
+                    }
+                ],
+            },
+            None,  # Not found
+        ]
+
+        mock_http = AsyncMock()
+        mock_http.request.return_value = DummyResponse(status_code=200, json_data=mock_response)
+
+        client = S2ApiClient(http_client=mock_http)
+        client.rate_limiter.min_interval = 0.0
+
+        results = await client.get_references_batch(query_ids)
+        self.assertEqual(len(results), 2)
+        # Check call payload
+        call_kwargs = mock_http.request.call_args.kwargs
+        self.assertEqual(call_kwargs["json"]["ids"], ["ARXIV:2502.00001", "ARXIV:2502.00002"])
+        self.assertIn("references.paperId", call_kwargs["params"]["fields"])
+
+        # Check item 0 (found with 1 ref)
+        self.assertEqual(results[0]["arxiv_id"], "2502.00001")
+        self.assertEqual(results[0]["status"], "ok")
+        self.assertEqual(len(results[0]["refs"]), 1)
+        self.assertEqual(results[0]["refs"][0].arxiv_id, "2301.00001")
+
+        # Check item 1 (not found)
+        self.assertEqual(results[1]["arxiv_id"], "2502.00002")
+        self.assertEqual(results[1]["status"], "not_found")
+        self.assertEqual(len(results[1]["refs"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

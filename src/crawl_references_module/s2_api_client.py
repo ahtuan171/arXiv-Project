@@ -66,6 +66,34 @@ class S2ApiPermanentError(S2ApiError, S2PermanentError):
     """A request that will fail again unchanged (other 4xx)."""
 
 
+def format_id_for_s2(pid: str) -> str:
+    """Format any identifier for Semantic Scholar API batch payload.
+
+    Accepts:
+    - Already prefixed IDs: ARXIV:<id>, CorpusId:<id>, DOI:<doi>, ACL:<id>, PMID:<id>, PMCID:<id>, URL:<url>
+    - 40-character hex SHA (e.g. 649def34f8be52c8b66281af98ae884c09aef38b)
+    - Raw arXiv ID (e.g. 2502.13235, 2502_13235) -> prefixed as ARXIV:<normalized_id>
+    - Other identifiers (e.g. unit test mock IDs like p1, p2) preserved as-is.
+    """
+    pid = str(pid).strip()
+    if not pid:
+        return ""
+    lower = pid.lower()
+    for prefix in ("arxiv:", "corpusid:", "doi:", "acl:", "pmid:", "pmcid:", "url:"):
+        if lower.startswith(prefix):
+            if lower.startswith("arxiv:"):
+                raw_arxiv = pid[6:].strip()
+                norm = normalize_arxiv_id(raw_arxiv) or raw_arxiv
+                return f"ARXIV:{norm}"
+            return pid
+    if len(pid) == 40 and all(c in "0123456789abcdefABCDEF" for c in pid):
+        return pid
+    norm = normalize_arxiv_id(pid)
+    if norm and is_valid_arxiv_id(norm):
+        return f"ARXIV:{norm}"
+    return pid
+
+
 def _authors(value: Any) -> list[str]:
     authors: list[str] = []
     for item in value or []:
@@ -354,12 +382,13 @@ class S2ApiClient:
         """Fetch a chunk of paper IDs (<= 500), recursively subdividing on 413, >10MB, or timeout."""
         if not chunk:
             return []
+        formatted_chunk = [format_id_for_s2(pid) for pid in chunk]
         try:
             data = await self._request(
                 "POST",
                 "/paper/batch",
                 params={"fields": fields_str},
-                payload={"ids": chunk},
+                payload={"ids": formatted_chunk},
             )
             if not isinstance(data, list):
                 raise S2ApiTransientError("unexpected batch response from Semantic Scholar API")
@@ -448,6 +477,85 @@ class S2ApiClient:
             batch = unique[start:start + self.batch_size]
             items = await self._fetch_chunk_with_subdivision(batch, fields_str)
             results.extend(items)
+        return results
+
+    async def get_references_batch(
+        self,
+        arxiv_ids: list[str],
+        fields: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch references for multiple arXiv IDs in batch via POST /paper/batch.
+
+        Returns a list of dictionaries matching input arxiv_ids 1-to-1:
+            - "arxiv_id": str (original input ID)
+            - "status": "ok", "partial", or "not_found"
+            - "refs": list[S2Paper]
+            - "refs_unresolved": int
+            - "message": str
+            - "error_type": str
+        """
+        if not arxiv_ids:
+            return []
+
+        clean_ids = [self._clean_id(cid) for cid in arxiv_ids]
+        formatted_ids = [f"ARXIV:{cid}" for cid in clean_ids]
+        fields_str = fields if fields is not None else getattr(
+            config,
+            "S2_API_BATCH_REF_FIELDS",
+            "paperId,title,references.paperId,references.title,references.authors,references.year,references.publicationDate,references.externalIds",
+        )
+
+        raw_items = await self.fetch_papers_batch_raw(formatted_ids, fields=fields_str)
+        results: list[dict[str, Any]] = []
+
+        for cid, clean_id, item in zip(arxiv_ids, clean_ids, raw_items):
+            if item is None:
+                results.append({
+                    "arxiv_id": cid,
+                    "status": "not_found",
+                    "refs": [],
+                    "refs_unresolved": 0,
+                    "message": f"paper arXiv:{clean_id} not indexed by Semantic Scholar",
+                    "error_type": "not_found",
+                })
+                continue
+
+            raw_refs = item.get("references")
+            if not isinstance(raw_refs, list):
+                raw_refs = []
+
+            refs: list[S2Paper] = []
+            refs_unresolved = 0
+            seen_keys: set[str] = set()
+
+            for ref_dict in raw_refs:
+                if not isinstance(ref_dict, dict):
+                    refs_unresolved += 1
+                    continue
+                paper = _paper_from_api(ref_dict)
+                if paper is not None:
+                    key = paper.paper_id or (f"arxiv:{paper.arxiv_id}" if paper.arxiv_id else None)
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        refs.append(paper)
+                        if paper.paper_id:
+                            self._ref_cache[paper.paper_id] = paper
+                        if paper.arxiv_id:
+                            self._ref_cache[f"ARXIV:{paper.arxiv_id}"] = paper
+                            self._ref_cache[paper.arxiv_id] = paper
+                else:
+                    refs_unresolved += 1
+
+            status = "partial" if refs_unresolved > 0 else "ok"
+            results.append({
+                "arxiv_id": cid,
+                "status": status,
+                "refs": refs,
+                "refs_unresolved": refs_unresolved,
+                "message": "",
+                "error_type": "",
+            })
+
         return results
 
     async def get_papers_batch(
