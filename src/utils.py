@@ -344,30 +344,8 @@ def peak_rss_mb() -> float:
 
 def dir_size_mb(path: Path) -> float:
     """Total size of all files under ``path`` in MB."""
-    if not path.exists():
-        return 0.0
-    if path.is_file():
-        try:
-            return path.stat().st_size / (1024 * 1024)
-        except OSError:
-            return 0.0
-    total_bytes = 0
-    stack = [str(path)]
-    while stack:
-        curr = stack.pop()
-        try:
-            with os.scandir(curr) as it:
-                for entry in it:
-                    try:
-                        if entry.is_file(follow_symlinks=False):
-                            total_bytes += entry.stat(follow_symlinks=False).st_size
-                        elif entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    return total_bytes / (1024 * 1024)
+    from src.benchmark import calculate_storage_mb
+    return calculate_storage_mb([path])
 
 
 @contextmanager

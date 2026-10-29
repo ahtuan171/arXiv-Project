@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -57,27 +58,47 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
         p = Path(item)
         if not p.exists():
             continue
-        if p.is_file():
+
+        # Fast path: try 'du -sb' on Linux systems (up to 100x faster than recursive scandir)
+        used_fast = False
+        if sys.platform.startswith("linux"):
             try:
-                total_bytes += p.stat().st_size
-            except OSError:
-                pass
-        else:
-            stack = [str(p)]
-            while stack:
-                curr = stack.pop()
+                res = subprocess.run(
+                    ["du", "-sb", str(p)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=True,
+                )
+                output = res.stdout.strip()
+                if output:
+                    total_bytes += int(output.split()[0])
+                    used_fast = True
+            except Exception:
+                used_fast = False
+
+        if not used_fast:
+            if p.is_file():
                 try:
-                    with os.scandir(curr) as it:
-                        for entry in it:
-                            try:
-                                if entry.is_file(follow_symlinks=False):
-                                    total_bytes += entry.stat(follow_symlinks=False).st_size
-                                elif entry.is_dir(follow_symlinks=False):
-                                    stack.append(entry.path)
-                            except OSError:
-                                pass
+                    total_bytes += p.stat().st_size
                 except OSError:
                     pass
+            else:
+                stack = [str(p)]
+                while stack:
+                    curr = stack.pop()
+                    try:
+                        with os.scandir(curr) as it:
+                            for entry in it:
+                                try:
+                                    if entry.is_file(follow_symlinks=False):
+                                        total_bytes += entry.stat(follow_symlinks=False).st_size
+                                    elif entry.is_dir(follow_symlinks=False):
+                                        stack.append(entry.path)
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
     return round(total_bytes / (1024 * 1024), 4)
 
 
@@ -176,7 +197,14 @@ class SystemBenchmarkTracker:
         if final_ram > 0:
             self._ram_samples.append(final_ram)
 
-        final_storage = calculate_storage_mb(self.storage_dirs)
+        # Avoid redundant disk scan if one just completed within 3 seconds
+        now = time.monotonic()
+        if self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
+            final_storage = self._peak_disk_mb
+        else:
+            final_storage = calculate_storage_mb(self.storage_dirs)
+            self._last_disk_time = time.monotonic()
+
         if final_storage > self._peak_disk_mb:
             self._peak_disk_mb = final_storage
 

@@ -55,3 +55,13 @@ def test_dir_size_mb_file_and_dir(tmp_path):
     assert dir_size_mb(tmp_path / "does_not_exist") == 0.0
 
 
+def test_calculate_storage_mb_fallback(tmp_path, monkeypatch):
+    f = tmp_path / "test.txt"
+    f.write_bytes(b"x" * 1024 * 1024)
+    # Force fast path to fail and trigger fallback
+    monkeypatch.setattr(benchmark.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("No du")))
+    size = benchmark.calculate_storage_mb([tmp_path])
+    assert round(size, 1) == 1.0
+
+
+
