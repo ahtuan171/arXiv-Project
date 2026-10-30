@@ -117,35 +117,79 @@ def test_alt_raw_dir_existing_papers_skipped(tmp_path, monkeypatch):
 
 
 def test_notebook_actual_papers_count_never_zero():
-    """Verify the calculation logic used in milestone1_pipeline.ipynb never yields 0."""
+    """Verify the calculation logic used in milestone1_pipeline.ipynb never yields 0 and properly assigns session_downloads or session_new_ids."""
     from src.utils import clean_arxiv_id
 
-    id_list = ["2502.00001", "2502.00002"]
+    # Scenario 1: Fresh run where all papers are newly downloaded
+    id_list = ["2502.00001", "2502.00002", "2502.00003"]
+    target_clean = {clean_arxiv_id(x) for x in id_list}
     target_count = len(id_list) if id_list else 1
+    initial_download_ids = set()
 
-    # Scenario 1: df_downloads contains past cumulative records + current records
     df_downloads = pd.DataFrame([
-        {"arxiv_id": "2501.99999", "download_status": "success"}, # from past run
+        {"arxiv_id": "2501.99999", "download_status": "success"},  # past run
         {"arxiv_id": "2502.00001", "download_status": "success"},
         {"arxiv_id": "2502.00002", "download_status": "success"},
+        {"arxiv_id": "2502.00003", "download_status": "success"},
     ])
-    target_clean = {clean_arxiv_id(x) for x in id_list}
-    session_downloads = df_downloads[df_downloads["arxiv_id"].apply(clean_arxiv_id).isin(target_clean)]
-    actual_papers_count = len(session_downloads) if not session_downloads.empty else target_count
-    actual_papers_count = max(1, int(actual_papers_count))
-    assert actual_papers_count == 2  # exactly 2, not cumulative 3!
+    df_target = df_downloads[df_downloads["arxiv_id"].apply(clean_arxiv_id).isin(target_clean)]
+    session_downloads = df_target[~df_target["arxiv_id"].apply(clean_arxiv_id).isin(initial_download_ids)]
+    assert len(session_downloads) == 3
 
-    # Scenario 2: df_downloads was None / empty (e.g. early interrupt or error)
+    actual_papers_count = len(session_downloads) if len(session_downloads) > 0 else target_count
+    actual_papers_count = max(1, int(actual_papers_count))
+    assert actual_papers_count == 3  # all 3 newly downloaded!
+
+    # Scenario 2: Partial resume run (1 paper already downloaded, 2 newly downloaded)
+    # Target has 3 papers (LIMIT = 3), but only 2 were downloaded in this session!
+    initial_download_ids = {clean_arxiv_id("2502.00001")}
+    session_downloads = df_target[~df_target["arxiv_id"].apply(clean_arxiv_id).isin(initial_download_ids)]
+    assert len(session_downloads) == 2
+
+    actual_papers_count = len(session_downloads) if len(session_downloads) > 0 else target_count
+    actual_papers_count = max(1, int(actual_papers_count))
+    assert actual_papers_count == 2  # touches len(session_downloads) = 2, strictly < LIMIT!
+
+    # Scenario 3: df_downloads was None / interrupted, but some papers were completed mid-run
     df_downloads = None
-    initial_completed_ids = set()
-    current_completed_ids = set()
-    session_new_ids = (current_completed_ids - initial_completed_ids) & target_clean
-    actual_papers_count = len(session_new_ids) if len(session_new_ids) > 0 else target_count
-    actual_papers_count = max(1, int(actual_papers_count))
-    assert actual_papers_count == 2  # falls back to target_count = 2, never 0!
+    session_downloads = None
+    initial_discovery_ids = set()
+    initial_download_ids = set()
+    initial_reference_ids = set()
+    current_download_ids = {clean_arxiv_id("2502.00001")}
+    current_discovery_ids = {clean_arxiv_id("2502.00001"), clean_arxiv_id("2502.00002")}
+    current_reference_ids = set()
 
-    # Scenario 3: edge case with empty id_list
+    new_download = (current_download_ids - initial_download_ids) & target_clean
+    new_discovery = (current_discovery_ids - initial_discovery_ids) & target_clean
+    new_reference = (current_reference_ids - initial_reference_ids) & target_clean
+    session_new_ids = new_download | new_discovery | new_reference
+    assert len(session_new_ids) == 2
+
+    if session_downloads is not None and len(session_downloads) > 0:
+        actual_papers_count = len(session_downloads)
+    elif len(session_new_ids) > 0:
+        actual_papers_count = len(session_new_ids)
+    else:
+        actual_papers_count = target_count
+    actual_papers_count = max(1, int(actual_papers_count))
+    assert actual_papers_count == 2  # touches len(session_new_ids) = 2, strictly < LIMIT!
+
+    # Scenario 4: All papers already completed, 0 new downloads and 0 new IDs across stages
+    all_cleaned = {clean_arxiv_id(x) for x in id_list}
+    session_downloads = df_target[~df_target["arxiv_id"].apply(clean_arxiv_id).isin(all_cleaned)]
+    session_new_ids = set()
+    if session_downloads is not None and len(session_downloads) > 0:
+        actual_papers_count = len(session_downloads)
+    elif len(session_new_ids) > 0:
+        actual_papers_count = len(session_new_ids)
+    else:
+        actual_papers_count = target_count
+    actual_papers_count = max(1, int(actual_papers_count))
+    assert actual_papers_count == 3  # falls back to target_count = len(id_list) = LIMIT
+
+    # Scenario 5: Edge case with empty id_list
     empty_list = []
     target_count_empty = len(empty_list) if empty_list else 1
     actual_empty = max(1, target_count_empty)
-    assert actual_empty == 1  # strictly >= 1
+    assert actual_empty == 1

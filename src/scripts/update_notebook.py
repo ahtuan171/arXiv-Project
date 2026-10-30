@@ -148,9 +148,12 @@ tracker = SystemBenchmarkTracker(
 print("-> Đã kích hoạt SystemBenchmarkTracker để theo dõi Bảng 4 (m1_system_benchmark.csv).")
 
 # Snapshot tập hợp ID đã có kết quả trước khi bắt đầu phiên chạy
-def snapshot_completed_ids(csv_dir):
+def snapshot_completed_ids(csv_dir, stages=None):
+    if stages is None:
+        stages = ["m1_discovery_stats", "m1_download_stats", "m1_reference_stats"]
+    elif isinstance(stages, str):
+        stages = [stages]
     seen = set()
-    stages = ["m1_discovery_stats", "m1_download_stats", "m1_reference_stats"]
     for base in stages:
         ledger_p = csv_dir / f"{base}.ledger.jsonl"
         jsonl_p = csv_dir / f"{base}.jsonl"
@@ -188,7 +191,14 @@ def snapshot_completed_ids(csv_dir):
                 pass
     return seen
 
-initial_completed_ids = snapshot_completed_ids(CSV_DIR)
+# Snapshot trạng thái trước khi chạy cho từng công đoạn riêng biệt
+initial_download_ids = snapshot_completed_ids(CSV_DIR, stages="m1_download_stats")
+initial_discovery_ids = snapshot_completed_ids(CSV_DIR, stages="m1_discovery_stats")
+initial_reference_ids = snapshot_completed_ids(CSV_DIR, stages="m1_reference_stats")
+
+# Khởi tạo lại biến kết quả trước khối try để tránh rò rỉ từ các cell chạy trước đó trong notebook
+df_downloads = None
+df_refs = None
 stats_papers = {}
 try:
     print(f"=== BẮT ĐẦU CÀO METADATA BÀI BÁO (arXiv API - Batch size: {batch_size_metadata}) ===")
@@ -236,19 +246,39 @@ finally:
     print("\\n=== KẾT THÚC VÀ LƯU BENCHMARK HỆ THỐNG ===")
     # Ghi nhận chính xác số bài cào thực tế trong phiên chạy này (chống nhân dồn & đảm bảo >= 1)
     target_count = len(id_list) if id_list else 1
-    actual_papers_count = target_count
+    target_clean = {clean_arxiv_id(x) for x in id_list}
 
-    if "df_downloads" in locals() and df_downloads is not None and not df_downloads.empty:
-        target_clean = {clean_arxiv_id(x) for x in id_list}
-        session_downloads = df_downloads[df_downloads["arxiv_id"].apply(clean_arxiv_id).isin(target_clean)]
-        if not session_downloads.empty:
-            actual_papers_count = len(session_downloads)
+    # 1. Xác định số bài tải mã nguồn thực tế trong phiên chạy này (session_downloads)
+    session_downloads = None
+    if df_downloads is not None and not df_downloads.empty:
+        df_target = df_downloads[df_downloads["arxiv_id"].apply(clean_arxiv_id).isin(target_clean)]
+        if not RECOVERY_OPTIONS.get("resume", True):
+            # Khi resume=False, toàn bộ target_ids đều được tải lại trong phiên này
+            session_downloads = df_target
+        else:
+            # Khi resume=True, chỉ lấy các bài mới được tải trong phiên này (chưa có trước đó)
+            session_downloads = df_target[~df_target["arxiv_id"].apply(clean_arxiv_id).isin(initial_download_ids)]
+
+    # 2. Xác định các bài mới hoàn thành qua các công đoạn (session_new_ids)
+    current_download_ids = snapshot_completed_ids(CSV_DIR, stages="m1_download_stats")
+    current_discovery_ids = snapshot_completed_ids(CSV_DIR, stages="m1_discovery_stats")
+    current_reference_ids = snapshot_completed_ids(CSV_DIR, stages="m1_reference_stats")
+
+    new_download = (current_download_ids - initial_download_ids) & target_clean
+    new_discovery = (current_discovery_ids - initial_discovery_ids) & target_clean
+    new_reference = (current_reference_ids - initial_reference_ids) & target_clean
+    session_new_ids = new_download | new_discovery | new_reference
+
+    # 3. Gán actual_papers_count theo thứ tự ưu tiên:
+    # - Ưu tiên 1: Có bài tải mã nguồn mới trong phiên này (session_downloads)
+    if session_downloads is not None and len(session_downloads) > 0:
+        actual_papers_count = len(session_downloads)
+    # - Ưu tiên 2: Có bài mới hoàn thành ở công đoạn bất kỳ (session_new_ids, ví dụ ngắt giữa chừng hoặc chỉ chạy metadata/refs)
+    elif len(session_new_ids) > 0:
+        actual_papers_count = len(session_new_ids)
+    # - Ưu tiên 3: Dự phòng khi toàn bộ bài đã hoàn thành từ trước (không có bài mới), gán bằng target_count (len(id_list))
     else:
-        target_clean = {clean_arxiv_id(x) for x in id_list}
-        current_completed_ids = snapshot_completed_ids(CSV_DIR)
-        session_new_ids = (current_completed_ids - initial_completed_ids) & target_clean
-        if len(session_new_ids) > 0:
-            actual_papers_count = len(session_new_ids)
+        actual_papers_count = target_count
 
     # Chốt chặn an toàn: đảm bảo tuyệt đối không bao giờ bằng 0
     actual_papers_count = max(1, int(actual_papers_count))
