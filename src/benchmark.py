@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -57,13 +58,45 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
         p = Path(item)
         if not p.exists():
             continue
-        if p.is_file():
-            total_bytes += p.stat().st_size
-        else:
-            for child in p.rglob("*"):
-                if child.is_file():
+
+        # Fast path: try 'du -sb' on Linux systems (up to 100x faster than recursive scandir)
+        used_fast = False
+        if sys.platform.startswith("linux"):
+            try:
+                res = subprocess.run(
+                    ["du", "-sb", str(p)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=True,
+                )
+                output = res.stdout.strip()
+                if output:
+                    total_bytes += int(output.split()[0])
+                    used_fast = True
+            except Exception:
+                used_fast = False
+
+        if not used_fast:
+            if p.is_file():
+                try:
+                    total_bytes += p.stat().st_size
+                except OSError:
+                    pass
+            else:
+                stack = [str(p)]
+                while stack:
+                    curr = stack.pop()
                     try:
-                        total_bytes += child.stat().st_size
+                        with os.scandir(curr) as it:
+                            for entry in it:
+                                try:
+                                    if entry.is_file(follow_symlinks=False):
+                                        total_bytes += entry.stat(follow_symlinks=False).st_size
+                                    elif entry.is_dir(follow_symlinks=False):
+                                        stack.append(entry.path)
+                                except OSError:
+                                    pass
                     except OSError:
                         pass
     return round(total_bytes / (1024 * 1024), 4)
@@ -92,15 +125,22 @@ class SystemBenchmarkTracker:
         self._last_disk_time: float = 0.0
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._last_record: Optional[dict[str, Any]] = None
 
     def start(self) -> "SystemBenchmarkTracker":
         """Start wall-clock timer and background resource sampling thread."""
+        if self._running:
+            self._running = False
+            if self._thread is not None:
+                self._thread.join(timeout=1.0)
+
         self._start_time = time.perf_counter()
         initial_ram = current_process_ram_mb()
         self._ram_samples = [initial_ram] if initial_ram > 0 else []
-        self._peak_disk_mb = calculate_storage_mb(self.storage_dirs)
+        self._peak_disk_mb = 0.0
         self._last_disk_time = time.monotonic()
         self._running = True
+        self._last_record = None
 
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
@@ -108,6 +148,15 @@ class SystemBenchmarkTracker:
         return self
 
     def _sample_loop(self) -> None:
+        # Initial disk sample runs asynchronously in background thread to avoid blocking caller/main thread
+        if self.disk_sample_interval_sec > 0:
+            try:
+                disk = calculate_storage_mb(self.storage_dirs)
+                if disk > self._peak_disk_mb:
+                    self._peak_disk_mb = disk
+            except Exception:
+                pass
+
         while self._running:
             ram = current_process_ram_mb()
             if ram > 0:
@@ -124,8 +173,28 @@ class SystemBenchmarkTracker:
         self,
         total_papers: int,
         csv_path: Optional[Union[Path, str]] = None,
+        final_storage_mb: Optional[float] = None,
     ) -> pd.DataFrame:
-        """Stop tracking, calculate benchmark metrics, and export to CSV."""
+        """Stop tracking, calculate benchmark metrics, and export to CSV.
+
+        Args:
+            total_papers: Total number of papers processed.
+            csv_path: Output CSV file path (defaults to config.DATA_DIR / 'csv' / 'm1_system_benchmark.csv').
+            final_storage_mb: Optional pre-calculated disk footprint in MB (e.g. from download stats
+                or external calculation). If provided, avoids slow filesystem directory scans.
+        """
+        expected_cols = [
+            "total_papers",
+            "total_wall_time_sec",
+            "peak_ram_mb",
+            "average_ram_mb",
+            "peak_disk_mb",
+            "final_storage_mb",
+        ]
+
+        if not self._running and self._end_time > 0 and self._last_record is not None:
+            return pd.DataFrame([self._last_record])[expected_cols]
+
         self._end_time = time.perf_counter()
         self._running = False
         if self._thread is not None:
@@ -136,11 +205,22 @@ class SystemBenchmarkTracker:
         if final_ram > 0:
             self._ram_samples.append(final_ram)
 
-        final_storage = calculate_storage_mb(self.storage_dirs)
+        # Avoid slow recursive du -sb / os.scandir over network filesystems / Google Drive
+        now = time.monotonic()
+        if final_storage_mb is not None:
+            final_storage = max(0.0, float(final_storage_mb))
+        elif self.disk_sample_interval_sec == 0.0:
+            final_storage = self._peak_disk_mb
+        elif self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
+            final_storage = self._peak_disk_mb
+        else:
+            final_storage = calculate_storage_mb(self.storage_dirs)
+            self._last_disk_time = time.monotonic()
+
         if final_storage > self._peak_disk_mb:
             self._peak_disk_mb = final_storage
 
-        total_wall_time = max(0.0, self._end_time - self._start_time)
+        total_wall_time = max(0.0, self._end_time - self._start_time) if self._start_time > 0 else 0.0
         peak_ram = max(self._ram_samples) if self._ram_samples else current_process_ram_mb()
         avg_ram = sum(self._ram_samples) / len(self._ram_samples) if self._ram_samples else peak_ram
 
@@ -152,6 +232,7 @@ class SystemBenchmarkTracker:
             "peak_disk_mb": round(float(self._peak_disk_mb), 2),
             "final_storage_mb": round(float(final_storage), 2),
         }
+        self._last_record = record
 
         if csv_path is None:
             csv_path = config.DATA_DIR / "csv" / "m1_system_benchmark.csv"

@@ -51,7 +51,11 @@ class S2ApiAuthError(S2ApiError, S2AuthError):
 
 
 class S2ApiRateLimited(S2ApiError, S2RateLimited):
-    """The API quota is exhausted (HTTP 429); ``retry_after`` is honoured."""
+    """The API quota is exhausted (HTTP 429); retried with exponential backoff and jitter."""
+
+
+class S2ApiPayloadTooLarge(S2ApiError, S2TransientError):
+    """The request or response payload exceeded the size limit (HTTP 413 or >10MB)."""
 
 
 class S2ApiTransientError(S2ApiError, S2TransientError):
@@ -62,22 +66,32 @@ class S2ApiPermanentError(S2ApiError, S2PermanentError):
     """A request that will fail again unchanged (other 4xx)."""
 
 
-def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-    """Parse Retry-After header supporting both delay-seconds and HTTP-date."""
-    if value is None:
-        return None
-    val = value.strip()
-    try:
-        seconds = float(val)
-    except (TypeError, ValueError):
-        try:
-            dt = parsedate_to_datetime(val)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            seconds = (dt - datetime.now(timezone.utc)).total_seconds()
-        except Exception:
-            return None
-    return min(max(seconds, 0.0), config.MAX_RETRY_AFTER)
+def format_id_for_s2(pid: str) -> str:
+    """Format any identifier for Semantic Scholar API batch payload.
+
+    Accepts:
+    - Already prefixed IDs: ARXIV:<id>, CorpusId:<id>, DOI:<doi>, ACL:<id>, PMID:<id>, PMCID:<id>, URL:<url>
+    - 40-character hex SHA (e.g. 649def34f8be52c8b66281af98ae884c09aef38b)
+    - Raw arXiv ID (e.g. 2502.13235, 2502_13235) -> prefixed as ARXIV:<normalized_id>
+    - Other identifiers (e.g. unit test mock IDs like p1, p2) preserved as-is.
+    """
+    pid = str(pid).strip()
+    if not pid:
+        return ""
+    lower = pid.lower()
+    for prefix in ("arxiv:", "corpusid:", "doi:", "acl:", "pmid:", "pmcid:", "url:"):
+        if lower.startswith(prefix):
+            if lower.startswith("arxiv:"):
+                raw_arxiv = pid[6:].strip()
+                norm = normalize_arxiv_id(raw_arxiv) or raw_arxiv
+                return f"ARXIV:{norm}"
+            return pid
+    if len(pid) == 40 and all(c in "0123456789abcdefABCDEF" for c in pid):
+        return pid
+    norm = normalize_arxiv_id(pid)
+    if norm and is_valid_arxiv_id(norm):
+        return f"ARXIV:{norm}"
+    return pid
 
 
 def _authors(value: Any) -> list[str]:
@@ -199,11 +213,11 @@ class S2ApiClient:
     ) -> None:
         self.api_key = (api_key if api_key is not None else config.S2_API_KEY).strip()
         if min_interval is None:
-            min_interval = config.S2_API_MIN_INTERVAL
+            min_interval = config.S2_API_MIN_INTERVAL if self.api_key else config.S2_API_ANONYMOUS_MIN_INTERVAL
         self.rate_limiter = AsyncRateLimiter(max(0.0, float(min_interval)))
         self.timeout = timeout
         self.page_size = max(1, min(int(page_size), 1000))
-        self.batch_size = max(1, min(int(batch_size), 1000))
+        self.batch_size = max(1, min(int(batch_size), config.S2_API_MAX_BATCH_SIZE))
         self.max_retries = max(1, int(max_retries))
         self.base_url = base_url.rstrip("/")
         self.pages: list[Any] = []
@@ -217,7 +231,8 @@ class S2ApiClient:
         self._ref_cache: dict[str, S2Paper] = {}
         if not self.api_key:
             logger.warning(
-                "S2_API_KEY is not set; using the anonymous Semantic Scholar quota"
+                "S2_API_KEY is not set; using the anonymous Semantic Scholar quota (%.2fs/req)",
+                self.rate_limiter.min_interval,
             )
 
     async def start(self, tabs: int = 1) -> "S2ApiClient":
@@ -259,8 +274,8 @@ class S2ApiClient:
     ) -> Any:
         """Perform one API request, retrying transient failures.
 
-        404 and 401/403 are never retried. 429 honours ``Retry-After`` and
-        pauses every worker through the shared rate limiter.
+        404, 401/403, and 413 (>10MB payload) are never retried directly.
+        429 pauses every worker using exponential backoff with jitter and ceiling.
         """
         if self._http is None:
             raise S2ApiTransientError("S2ApiClient.start() was not called")
@@ -269,7 +284,6 @@ class S2ApiClient:
         for attempt in range(1, self.max_retries + 1):
             await self.rate_limiter.wait()
             self.api_calls += 1
-            retry_after: Optional[float] = None
             try:
                 response = await self._http.request(
                     method, path, params=params, json=payload,
@@ -284,19 +298,26 @@ class S2ApiClient:
                 if status in (401, 403):
                     self.auth_errors += 1
                     raise S2ApiAuthError(f"HTTP {status} from Semantic Scholar API")
+                if status == 413:
+                    raise S2ApiPayloadTooLarge(f"HTTP 413 from Semantic Scholar API: payload too large for {path}")
                 if status == 429:
                     self.rate_limit_hits += 1
-                    retry_after = _parse_retry_after(response.headers.get("retry-after"))
-                    last_error = S2ApiRateLimited(
-                        f"rate limited (Retry-After={retry_after})",
-                        retry_after=retry_after,
-                    )
+                    last_error = S2ApiRateLimited("rate limited (HTTP 429)")
                 elif 500 <= status < 600:
                     last_error = S2ApiTransientError(f"HTTP {status} from Semantic Scholar API")
                 elif status >= 400:
                     body = response.text[:200].replace("\n", " ")
                     raise S2ApiPermanentError(f"HTTP {status} from Semantic Scholar API: {body}")
                 else:
+                    content_len_hdr = response.headers.get("content-length")
+                    if content_len_hdr and content_len_hdr.isdigit() and int(content_len_hdr) > config.S2_API_MAX_PAYLOAD_BYTES:
+                        raise S2ApiPayloadTooLarge(
+                            f"response Content-Length ({content_len_hdr} bytes) exceeds limit ({config.S2_API_MAX_PAYLOAD_BYTES} bytes)"
+                        )
+                    if len(response.content) > config.S2_API_MAX_PAYLOAD_BYTES:
+                        raise S2ApiPayloadTooLarge(
+                            f"response body length ({len(response.content)} bytes) exceeds limit ({config.S2_API_MAX_PAYLOAD_BYTES} bytes)"
+                        )
                     try:
                         data = response.json()
                     except ValueError:
@@ -312,18 +333,19 @@ class S2ApiClient:
                 raise last_error
 
             is_rate_limited = isinstance(last_error, S2ApiRateLimited)
-            if retry_after is not None:
-                delay = float(retry_after)
-            elif is_rate_limited:
-                delay = max(config.S2_RATE_LIMIT_COOLDOWN, config.BACKOFF_BASE ** attempt)
+            if is_rate_limited:
+                base_wait = max(config.S2_RATE_LIMIT_COOLDOWN, config.BACKOFF_BASE)
+                delay = base_wait * (config.BACKOFF_BASE ** (attempt - 1))
             else:
                 delay = config.BACKOFF_BASE ** attempt
 
-            if is_rate_limited or retry_after is not None:
-                self.rate_limiter.block(delay)
-
+            # Capped exponential backoff (thời gian trần) + random jitter
             delay = min(max(delay, 0.0), config.MAX_BACKOFF)
             delay += random.uniform(0.0, config.RETRY_JITTER)
+
+            if is_rate_limited:
+                self.rate_limiter.block(delay)
+
             logger.warning(
                 "%s failed (%s); retry %d/%d in %.1fs",
                 path, last_error, attempt, self.max_retries, delay,
@@ -352,36 +374,197 @@ class S2ApiClient:
         logger.debug("Resolved arXiv:%s -> %s", clean_id, paper_id)
         return paper_id
 
-    async def fetch_papers_batch(self, paper_ids: list[str]) -> list[S2Paper]:
-        """Fetch metadata for many paper IDs, using the cache when possible."""
-        unique = [pid for pid in dict.fromkeys(str(pid) for pid in paper_ids if pid)]
-        pending = [pid for pid in unique if pid not in self._ref_cache]
-        for start in range(0, len(pending), self.batch_size):
-            batch = pending[start:start + self.batch_size]
+    async def _fetch_chunk_with_subdivision(
+        self,
+        chunk: list[str],
+        fields_str: str,
+    ) -> list[Optional[dict]]:
+        """Fetch a chunk of paper IDs (<= 500), recursively subdividing on 413, >10MB, or timeout."""
+        if not chunk:
+            return []
+        formatted_chunk = [format_id_for_s2(pid) for pid in chunk]
+        try:
             data = await self._request(
                 "POST",
                 "/paper/batch",
-                params={"fields": config.S2_API_PAPER_FIELDS},
-                payload={"ids": batch},
+                params={"fields": fields_str},
+                payload={"ids": formatted_chunk},
             )
             if not isinstance(data, list):
                 raise S2ApiTransientError("unexpected batch response from Semantic Scholar API")
-            for item in data:
+            return data
+        except (S2ApiPayloadTooLarge, httpx.TimeoutException) as err:
+            if len(chunk) <= 1:
+                logger.warning(
+                    "Single paper batch %r failed with %s; returning empty result",
+                    chunk[0] if chunk else "", err,
+                )
+                return [None] * len(chunk)
+            mid = len(chunk) // 2
+            logger.warning(
+                "Batch of %d papers encountered %s; subdividing into %d and %d",
+                len(chunk), type(err).__name__, mid, len(chunk) - mid,
+            )
+            left = await self._fetch_chunk_with_subdivision(chunk[:mid], fields_str)
+            right = await self._fetch_chunk_with_subdivision(chunk[mid:], fields_str)
+            return left + right
+
+    async def fetch_papers_batch(
+        self,
+        paper_ids: list[str],
+        fields: Optional[str] = None,
+    ) -> list[S2Paper]:
+        """Fetch metadata for many paper IDs, supporting up to 500 per request,
+        flexible identifiers (ARXIV:, CorpusId:, SHA-40, etc.), adaptive subdivision
+        under 10MB, and in-memory caching.
+        """
+        unique = [pid for pid in dict.fromkeys(str(pid).strip() for pid in paper_ids if pid and str(pid).strip())]
+        fields_str = fields if fields is not None else config.S2_API_PAPER_FIELDS
+
+        if fields is None:
+            pending = [pid for pid in unique if pid not in self._ref_cache]
+        else:
+            pending = list(unique)
+
+        for start in range(0, len(pending), self.batch_size):
+            batch = pending[start:start + self.batch_size]
+            items = await self._fetch_chunk_with_subdivision(batch, fields_str)
+            for query_id, item in zip(batch, items):
                 if not isinstance(item, dict):
                     continue
                 paper = _paper_from_api(item)
                 if paper is not None:
-                    cached = self._ref_cache.get(paper.paper_id)
-                    self._ref_cache[paper.paper_id] = merge_paper(cached, paper)
+                    cached = self._ref_cache.get(paper.paper_id) if paper.paper_id else None
+                    merged = merge_paper(cached, paper) if cached else paper
+                    if merged is not None:
+                        # Cache under original query identifier
+                        self._ref_cache[query_id] = merged
+                        # Cache under S2 paperId
+                        if merged.paper_id:
+                            self._ref_cache[merged.paper_id] = merged
+                        # Cache under arXiv variations if available
+                        if merged.arxiv_id:
+                            self._ref_cache[f"ARXIV:{merged.arxiv_id}"] = merged
+                            self._ref_cache[f"arxiv:{merged.arxiv_id}"] = merged
+                            self._ref_cache[merged.arxiv_id] = merged
+
             logger.debug(
                 "Batch resolved %d/%d paper(s)",
                 sum(1 for pid in batch if pid in self._ref_cache), len(batch),
             )
-        return [self._ref_cache[pid] for pid in unique if pid in self._ref_cache]
 
-    async def get_papers_batch(self, paper_ids: list[str]) -> list[S2Paper]:
+        resolved: list[S2Paper] = []
+        seen_keys: set[str] = set()
+        for pid in unique:
+            p = self._ref_cache.get(pid)
+            if p is not None:
+                key = p.paper_id or p.arxiv_id or pid
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    resolved.append(p)
+        return resolved
+
+    async def fetch_papers_batch_raw(
+        self,
+        paper_ids: list[str],
+        fields: Optional[str] = None,
+    ) -> list[Optional[dict]]:
+        """Fetch raw metadata dictionaries matching input order 1-to-1."""
+        unique = [str(pid).strip() for pid in paper_ids if pid and str(pid).strip()]
+        fields_str = fields if fields is not None else config.S2_API_PAPER_FIELDS
+        results: list[Optional[dict]] = []
+        for start in range(0, len(unique), self.batch_size):
+            batch = unique[start:start + self.batch_size]
+            items = await self._fetch_chunk_with_subdivision(batch, fields_str)
+            results.extend(items)
+        return results
+
+    async def get_references_batch(
+        self,
+        arxiv_ids: list[str],
+        fields: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch references for multiple arXiv IDs in batch via POST /paper/batch.
+
+        Returns a list of dictionaries matching input arxiv_ids 1-to-1:
+            - "arxiv_id": str (original input ID)
+            - "status": "ok", "partial", or "not_found"
+            - "refs": list[S2Paper]
+            - "refs_unresolved": int
+            - "message": str
+            - "error_type": str
+        """
+        if not arxiv_ids:
+            return []
+
+        clean_ids = [self._clean_id(cid) for cid in arxiv_ids]
+        formatted_ids = [f"ARXIV:{cid}" for cid in clean_ids]
+        fields_str = fields if fields is not None else getattr(
+            config,
+            "S2_API_BATCH_REF_FIELDS",
+            "paperId,title,references.paperId,references.title,references.authors,references.year,references.publicationDate,references.externalIds",
+        )
+
+        raw_items = await self.fetch_papers_batch_raw(formatted_ids, fields=fields_str)
+        results: list[dict[str, Any]] = []
+
+        for cid, clean_id, item in zip(arxiv_ids, clean_ids, raw_items):
+            if item is None:
+                results.append({
+                    "arxiv_id": cid,
+                    "status": "not_found",
+                    "refs": [],
+                    "refs_unresolved": 0,
+                    "message": f"paper arXiv:{clean_id} not indexed by Semantic Scholar",
+                    "error_type": "not_found",
+                })
+                continue
+
+            raw_refs = item.get("references")
+            if not isinstance(raw_refs, list):
+                raw_refs = []
+
+            refs: list[S2Paper] = []
+            refs_unresolved = 0
+            seen_keys: set[str] = set()
+
+            for ref_dict in raw_refs:
+                if not isinstance(ref_dict, dict):
+                    refs_unresolved += 1
+                    continue
+                paper = _paper_from_api(ref_dict)
+                if paper is not None:
+                    key = paper.paper_id or (f"arxiv:{paper.arxiv_id}" if paper.arxiv_id else None)
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        refs.append(paper)
+                        if paper.paper_id:
+                            self._ref_cache[paper.paper_id] = paper
+                        if paper.arxiv_id:
+                            self._ref_cache[f"ARXIV:{paper.arxiv_id}"] = paper
+                            self._ref_cache[paper.arxiv_id] = paper
+                else:
+                    refs_unresolved += 1
+
+            status = "partial" if refs_unresolved > 0 else "ok"
+            results.append({
+                "arxiv_id": cid,
+                "status": status,
+                "refs": refs,
+                "refs_unresolved": refs_unresolved,
+                "message": "",
+                "error_type": "",
+            })
+
+        return results
+
+    async def get_papers_batch(
+        self,
+        paper_ids: list[str],
+        fields: Optional[str] = None,
+    ) -> list[S2Paper]:
         """Public alias for :meth:`fetch_papers_batch`."""
-        return await self.fetch_papers_batch(paper_ids)
+        return await self.fetch_papers_batch(paper_ids, fields=fields)
 
     async def get_paper_by_arxiv(self, arxiv_id: str) -> Optional[S2Paper]:
         """Fetch one paper's metadata; return ``None`` when S2 lacks it."""

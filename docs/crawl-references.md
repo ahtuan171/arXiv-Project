@@ -95,7 +95,7 @@ sang browser, giữ nguyên tiến độ và ghi `client_type = "api->browser"` 
 thống kê.
 
 - 404: paper chưa được S2 index — ghi `not_found`, không retry.
-- 429: retry theo header `Retry-After` (hỗ trợ cả giây và HTTP-date) và tạm chặn
+- 429: retry theo exponential backoff kết hợp jitter và thời gian trần (do S2 API không trả header `Retry-After`), đồng thời tạm chặn
   mọi worker qua rate limiter.
 - 5xx / lỗi mạng: retry với exponential backoff + jitter.
 - 401/403: không retry; kích hoạt fallback ở chế độ `--client api`.
@@ -227,7 +227,7 @@ chờ, còn `already_done` trong báo cáo chỉ đếm kết quả đã hoàn t
   chỉ gọi Semantic Scholar.
 - Client Graph API (`src/crawl_references_module/s2_api_client.py`) dùng `httpx`, header `x-api-key`,
   endpoint `/paper/arXiv:<id>`, `/paper/<id>/references` và `/paper/batch`;
-  retry 429 (theo `Retry-After`) và 5xx, không retry 401/403/404.
+  retry 429 và 5xx với exponential backoff, jitter và thời gian trần (không phụ thuộc `Retry-After`), không retry 401/403/404.
 - Client browser (`src/crawl_references_module/s2_client.py`) vẫn giữ làm fallback/dự phòng: một
   Chromium, 3 tab tái sử dụng, chung một `AsyncRateLimiter`, nghỉ 30 giây sau
   WAF challenge. Tab chỉ đóng sau khi toàn bộ hàng đợi xong (hoặc khi Ctrl-C / lỗi).

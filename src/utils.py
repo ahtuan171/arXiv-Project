@@ -344,7 +344,8 @@ def peak_rss_mb() -> float:
 
 def dir_size_mb(path: Path) -> float:
     """Total size of all files under ``path`` in MB."""
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / (1024 * 1024)
+    from src.benchmark import calculate_storage_mb
+    return calculate_storage_mb([path])
 
 
 @contextmanager

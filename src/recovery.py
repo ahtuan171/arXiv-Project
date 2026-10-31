@@ -33,6 +33,11 @@ def durable_append(path: Path, row: dict) -> None:
     utils.append_jsonl(path, row, fsync=True)
 
 
+def durable_append_many(path: Path, rows: Iterable[dict]) -> int:
+    """Append a batch of records durably with a single fsync."""
+    return utils.append_jsonl_many(path, rows, fsync=True)
+
+
 def latest_rows(path: Path, key: Callable[[str], str] = utils.clean_arxiv_id) -> dict[str, dict]:
     """Load latest valid object per normalized ID, including legacy files."""
     result: dict[str, dict] = {}
@@ -108,11 +113,35 @@ class RecoveryLedger:
     def get(self, arxiv_id: str) -> Optional[dict]:
         return self.rows.get(self.key(arxiv_id))
 
-    def record(self, arxiv_id: str, status: str, **extra) -> dict:
+    def record(self, arxiv_id: str, status: str, *, fsync: bool = True, **extra) -> dict:
         row = progress_entry(self.key(arxiv_id), status, self.get(arxiv_id), **extra)
-        durable_append(self.path, row)
+        if fsync:
+            durable_append(self.path, row)
+        else:
+            utils.append_jsonl(self.path, row, fsync=False)
         self.rows[self.key(arxiv_id)] = row
         return row
+
+    def record_many(self, entries: Iterable[dict | tuple]) -> list[dict]:
+        """Record a batch of progress entries with a single fsync."""
+        records = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                d = dict(entry)
+                aid = d.pop("arxiv_id")
+                st = d.pop("status")
+                row = progress_entry(self.key(aid), st, self.get(aid), **d)
+            elif len(entry) == 2:
+                aid, st = entry
+                row = progress_entry(self.key(aid), st, self.get(aid))
+            else:
+                aid, st, extra = entry
+                row = progress_entry(self.key(aid), st, self.get(aid), **(extra or {}))
+            self.rows[self.key(aid)] = row
+            records.append(row)
+        if records:
+            durable_append_many(self.path, records)
+        return records
 
 
 def atomic_write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -143,14 +172,30 @@ class RecordStore:
         self.rows = latest_rows(path)
         self.rows.update(latest_rows(self.journal))
 
-    def put(self, row: dict) -> None:
+    def put(self, row: dict, *, fsync: bool = True) -> None:
         key = utils.clean_arxiv_id(row['arxiv_id'])
         previous = self.rows.get(key)
         # A forced refresh that fails must not destroy usable metadata.
         if previous and not previous.get('error') and row.get('error'):
             return
-        durable_append(self.journal, row)
+        if fsync:
+            durable_append(self.journal, row)
+        else:
+            utils.append_jsonl(self.journal, row, fsync=False)
         self.rows[key] = row
+
+    def put_many(self, rows: Iterable[dict]) -> None:
+        """Add multiple metadata records to journal with a single fsync."""
+        valid_rows = []
+        for row in rows:
+            key = utils.clean_arxiv_id(row['arxiv_id'])
+            previous = self.rows.get(key)
+            if previous and not previous.get('error') and row.get('error'):
+                continue
+            self.rows[key] = row
+            valid_rows.append(row)
+        if valid_rows:
+            durable_append_many(self.journal, valid_rows)
 
     def compact(self) -> None:
         atomic_write_jsonl(self.path, self.rows.values())

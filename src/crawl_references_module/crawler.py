@@ -845,6 +845,7 @@ def crawl_references_range(
     csv_path: Optional[Union[Path, str]] = None,
     client: Optional[Any] = None,
     limit: int = 0,
+    batch_size: Optional[int] = None,
     resume: bool = True,
     dry_run: bool = False,
     log: Optional[logging.Logger] = None,
@@ -906,49 +907,119 @@ def crawl_references_range(
         try:
             if hasattr(active, "start") and not getattr(active, "started", False):
                 await maybe_await(active.start(1))
-            for cid in pending:
-                key = canonical_arxiv_id(cid)
-                t0 = time.perf_counter()
-                status, message, error_type = "ok", "", ""
-                refs = []
-                try:
-                    page = active.pages[0] if getattr(active, "pages", None) else None
-                    refs = await maybe_await(active.get_references(page, cid))
-                except S2NotFound as exc:
-                    status, message, error_type = "not_found", str(exc), "not_found"
-                except (S2AuthError, S2PermanentError) as exc:
-                    logger_inst.error("S2 auth or permanent error for %s: %s. Aborting crawl.", cid, exc)
-                    raise
-                except S2Error as exc:
-                    status, message, error_type = "error", str(exc), "transient"
-                if isinstance(refs, ReferenceResult) and refs.refs_unresolved > 0:
-                    status = "partial"
-                # A replay after a crash writes only missing edges. Existing
-                # good edges are preserved even if a forced refresh fails.
-                edges = []
-                current = set()
-                for ref in refs:
-                    row = build_reference_record(cid, ref)
-                    if row is None:
-                        continue
-                    pair = (row["arxiv_id"], row["ref_arxiv_id"])
-                    current.add(pair)
-                    if pair not in pairs:
-                        edges.append(row)
-                        pairs.add(pair)
-                append_jsonl_many(out_p, edges, fsync=True)
-                counts[key] = counts.get(key, 0) + len(edges)
-                stat = {"arxiv_id": cid,
-                        "ref_status": "success" if status in {"ok", "partial"} else "not_found" if status == "not_found" else "failed",
-                        "num_crawled_refs": len(refs), "num_arxiv_refs": len(current),
-                        "ref_time_sec": round(time.perf_counter() - t0, 4)}
-                recovery.durable_append(jsonl_stats_p, stat)
-                records[key] = stat
-                ledger.record(cid, status, error=message, error_type=error_type,
-                    refs_unique_total=counts.get(key, 0),
-                    refs_unresolved=getattr(refs, "refs_unresolved", 0))
-                if status in {"error", "blocked"}:
-                    logger_inst.warning("S2 query failed for %s: %s", cid, message)
+            if hasattr(active, "get_references_batch"):
+                eff_batch_size = (
+                    max(1, min(int(batch_size), 500))
+                    if batch_size is not None
+                    else getattr(active, "batch_size", 100) or 100
+                )
+                if hasattr(active, "batch_size"):
+                    active.batch_size = eff_batch_size
+                for b_start in range(0, len(pending), eff_batch_size):
+                    batch_cids = pending[b_start : b_start + eff_batch_size]
+                    t0 = time.perf_counter()
+                    batch_results = await maybe_await(active.get_references_batch(batch_cids))
+                    batch_elapsed = max(0.0, time.perf_counter() - t0)
+                    per_item_time = round(batch_elapsed / max(1, len(batch_cids)), 4)
+
+                    batch_edges: list[dict] = []
+                    batch_stats: list[dict] = []
+                    batch_ledger: list[tuple[str, str, dict]] = []
+
+                    for item in batch_results:
+                        cid = item["arxiv_id"]
+                        status = item["status"]
+                        refs = item["refs"]
+                        message = item.get("message", "")
+                        error_type = item.get("error_type", "")
+                        refs_unresolved = item.get("refs_unresolved", 0)
+
+                        key = canonical_arxiv_id(cid)
+                        edges = []
+                        current = set()
+                        for ref in refs:
+                            row = build_reference_record(cid, ref)
+                            if row is None:
+                                continue
+                            pair = (row["arxiv_id"], row["ref_arxiv_id"])
+                            current.add(pair)
+                            if pair not in pairs:
+                                edges.append(row)
+                                pairs.add(pair)
+                        batch_edges.extend(edges)
+                        counts[key] = counts.get(key, 0) + len(edges)
+                        stat = {
+                            "arxiv_id": cid,
+                            "ref_status": "success" if status in {"ok", "partial"} else "not_found" if status == "not_found" else "failed",
+                            "num_crawled_refs": len(refs),
+                            "num_arxiv_refs": len(current),
+                            "ref_time_sec": per_item_time,
+                        }
+                        records[key] = stat
+                        batch_stats.append(stat)
+                        batch_ledger.append((
+                            cid,
+                            status,
+                            {
+                                "error": message,
+                                "error_type": error_type,
+                                "refs_unique_total": counts.get(key, 0),
+                                "refs_unresolved": refs_unresolved,
+                            },
+                        ))
+                        if status in {"error", "blocked"}:
+                            logger_inst.warning("S2 query failed for %s: %s", cid, message)
+
+                    if batch_edges:
+                        append_jsonl_many(out_p, batch_edges, fsync=True)
+                    if batch_stats:
+                        recovery.durable_append_many(jsonl_stats_p, batch_stats)
+                    if batch_ledger:
+                        ledger.record_many(batch_ledger)
+            else:
+                for cid in pending:
+                    key = canonical_arxiv_id(cid)
+                    t0 = time.perf_counter()
+                    status, message, error_type = "ok", "", ""
+                    refs = []
+                    try:
+                        page = active.pages[0] if getattr(active, "pages", None) else None
+                        refs = await maybe_await(active.get_references(page, cid))
+                    except S2NotFound as exc:
+                        status, message, error_type = "not_found", str(exc), "not_found"
+                    except (S2AuthError, S2PermanentError) as exc:
+                        logger_inst.error("S2 auth or permanent error for %s: %s. Aborting crawl.", cid, exc)
+                        raise
+                    except S2Error as exc:
+                        status, message, error_type = "error", str(exc), "transient"
+                    if isinstance(refs, ReferenceResult) and refs.refs_unresolved > 0:
+                        status = "partial"
+                    # A replay after a crash writes only missing edges. Existing
+                    # good edges are preserved even if a forced refresh fails.
+                    edges = []
+                    current = set()
+                    for ref in refs:
+                        row = build_reference_record(cid, ref)
+                        if row is None:
+                            continue
+                        pair = (row["arxiv_id"], row["ref_arxiv_id"])
+                        current.add(pair)
+                        if pair not in pairs:
+                            edges.append(row)
+                            pairs.add(pair)
+                    append_jsonl_many(out_p, edges, fsync=True)
+                    counts[key] = counts.get(key, 0) + len(edges)
+                    stat = {"arxiv_id": cid,
+                            "ref_status": "success" if status in {"ok", "partial"} else "not_found" if status == "not_found" else "failed",
+                            "num_crawled_refs": len(refs), "num_arxiv_refs": len(current),
+                            "ref_time_sec": round(time.perf_counter() - t0, 4)}
+                    recovery.durable_append(jsonl_stats_p, stat)
+                    records[key] = stat
+                    ledger.record(cid, status, error=message, error_type=error_type,
+                        refs_unique_total=counts.get(key, 0),
+                        refs_unresolved=getattr(refs, "refs_unresolved", 0))
+                    if status in {"error", "blocked"}:
+                        logger_inst.warning("S2 query failed for %s: %s", cid, message)
         finally:
             if client is None and hasattr(active, "close"):
                 await maybe_await(active.close())

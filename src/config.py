@@ -19,7 +19,8 @@ import yaml
 # --- Paths -----------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
-DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
+DEFAULT_DATA_DIR = Path(os.environ.get("ARXIV_DATA_DIR", ROOT_DIR / "data"))
+DATA_DIR = DEFAULT_DATA_DIR
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 LOG_DIR = ROOT_DIR / "logs"
@@ -58,6 +59,10 @@ load_env_file()
 # --- Network politeness ----------------------------------------------------
 # arXiv requires at least 3 seconds between requests.
 ARXIV_MIN_INTERVAL = 3.2
+try:
+    ARXIV_BATCH_SIZE = max(1, min(int(os.environ.get("ARXIV_BATCH_SIZE", "100")), 200))
+except ValueError:
+    ARXIV_BATCH_SIZE = 100
 # The website JSON endpoints tolerate a few requests/second, but be polite
 # enough to avoid WAF challenges. All tabs share one limiter.
 try:
@@ -83,17 +88,27 @@ try:
     S2_API_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_API_MIN_INTERVAL", "1.2")))
 except ValueError:
     S2_API_MIN_INTERVAL = 1.2
+S2_API_ANONYMOUS_MIN_INTERVAL = 3.0  # Safe interval when unauthenticated (shared public quota)
 S2_API_MAX_RETRIES = 5
 S2_API_TIMEOUT = 30
 try:
     S2_API_PAGE_SIZE = max(1, min(int(os.environ.get("S2_API_PAGE_SIZE", "500")), 1000))
 except ValueError:
     S2_API_PAGE_SIZE = 500
-S2_API_BATCH_SIZE = 100
+S2_API_MAX_BATCH_SIZE = 500  # Official Semantic Scholar limit for /paper/batch
+try:
+    S2_API_BATCH_SIZE = max(1, min(int(os.environ.get("S2_API_BATCH_SIZE", "500")), S2_API_MAX_BATCH_SIZE))
+except ValueError:
+    S2_API_BATCH_SIZE = 500
+S2_API_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024  # 10MB payload size limit
 S2_API_PAPER_FIELDS = "paperId,externalIds,title,authors,year,publicationDate"
 S2_API_REF_FIELDS = os.environ.get(
     "S2_API_REF_FIELDS",
     ",".join(f"citedPaper.{f}" for f in S2_API_PAPER_FIELDS.split(",")),
+)
+S2_API_BATCH_REF_FIELDS = os.environ.get(
+    "S2_API_BATCH_REF_FIELDS",
+    "paperId,title,references.paperId,references.title,references.authors,references.year,references.publicationDate,references.externalIds",
 )
 
 MAX_RETRIES = 5
