@@ -1,0 +1,36 @@
+"""Notebook retains main-branch Vietnamese layout with seven code cells."""
+import ast
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_colab_form_and_original_section_flow():
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    markdown = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "markdown")
+    cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
+    assert len(cells) == 7
+    for title in (
+        "## 1. Kết nối Google Drive", "## 2. Khai báo khoảng arXiv-ID",
+        "## 3. Kiểm tra dữ liệu", "## 4. Thực thi Pipeline",
+        "## 5. Kiểm tra và Trích xuất", "### Chạy lại và phục hồi",
+    ):
+        assert title in markdown
+    assert "#@title Cấu hình tham số Pipeline" in cells[1]
+    assert "#@param" in cells[1]
+    for i, code in enumerate(cells, 1):
+        ast.parse(code, filename=f"main-pipeline-cell-{i}")
+        assert f"# {i}/7" in code
+
+
+def test_summary_displays_four_legacy_tables_separately():
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    final = "".join([c for c in nb["cells"] if c["cell_type"] == "code"][-1]["source"])
+    for file in (
+        "m1_discovery_stats.csv", "m1_download_stats.csv",
+        "m1_reference_stats.csv", "m1_system_benchmark.csv",
+        "m1_download_versions.csv",
+    ):
+        assert file in final
+    assert "legacy" in final

@@ -93,3 +93,8 @@ This document describes **new outputs**. It does not modify the existing dataset
 - Legacy comparison and old four CSV inspection move to notebooks/m1_legacy_debug.ipynb within the same repo, read-only.
 - New optional version_report and metadata_report parameters on audit_m1_integrity reuse full-dataset reports. Cell 6 hashes each vN file once; rerun validation after any data changes. Summary in cell 7 uses current integrity result.
 - Historical references to notebook cell 2.1-2.9 are superseded by this seven-cell layout.
+
+## Presentation matched to main (Vietnamese)
+- Main pipeline remains **7 code cells** and uses the original notebook's Vietnamese presentation hierarchy: overview of Tables 1-4, Drive environment setup, S2 Secrets, Colab form parameters (`#@param`), preflight, execution, retry/recovery guide and summary table display.
+- Legacy CSVs appear for read-only comparison, explicitly labelled as legacy; source-vN CSV is separate and based on verified files.
+- The team uses one repository for code and Jupyter Book. Old separate-repository evidence requirements in previous draft copy are superseded; independently verify any course submission constraints.

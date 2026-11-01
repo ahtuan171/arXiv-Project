@@ -156,7 +156,7 @@ def build_m1_report(data_dir: str | Path, *, integrity_report: dict | None = Non
 
     snapshots = integrity.get("snapshots", {})
     source_sizes = None
-    source_stats_reason = "m1_download_versions.csv missing or stale; export validated cell 2.3 first"
+    source_stats_reason = "m1_download_versions.csv thiếu hoặc đã cũ; xuất lại bằng cell 6"
     if snapshots.get("download_versions_csv_current") is True:
         source_sizes = _verified_source_metrics(root / "csv" / "m1_download_versions.csv")
         source_stats_reason = None
@@ -179,7 +179,7 @@ def build_m1_report(data_dir: str | Path, *, integrity_report: dict | None = Non
         "CPU-only full-pipeline peak/mean process-tree RSS measurements",
         "CPU-only end-to-end peak scratch disk and final output storage",
         "Version-specific historical citation/metadata completeness assessment",
-        "Course-required Jupyter Book publication in a SEPARATE report repository",
+        "Chưa xác minh kết quả build/publish Jupyter Book trong cùng repository của nhóm",
     ])
     return {
         "schema_version": 1,
@@ -208,7 +208,7 @@ def build_m1_report(data_dir: str | Path, *, integrity_report: dict | None = Non
             f"{verified} / {expected} version sources were verified at audit time. "
             "No official end-to-end benchmark is derived from legacy logs. "
             "Milestone 1 report readiness requires live CPU-only measurements, "
-            "provenance and a separately published Jupyter Book."
+            "provenance and a Jupyter Book published from the same project repository."
         ),
     }
 
