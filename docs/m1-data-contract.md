@@ -1,4 +1,4 @@
-# Milestone 1 data contract (proposal, Issue #6)
+# Milestone 1 data contract (incremental, append-only proposal)
 
 This document describes **new outputs**. It does not modify the existing dataset.
 
@@ -22,16 +22,14 @@ This document describes **new outputs**. It does not modify the existing dataset
 1. Preserve the original `data/raw/<id>/` until a verified migration or source version is independently identified.
 2. Network arXiv IDs use `2501.12345v2`, while filesystem publication IDs use `2501_12345`; keep the version separately.
 3. Recovery is keyed by `(publication ID, version)` for sources and by citation identity for raw references; repeat runs must be idempotent.
-4. Never commit live `data/` or credentials to Git. Backups and audit manifests are stored outside the repo.
-5. No writes to production Drive until a full raw-source backup and restore validation are confirmed.
+4. Never commit live `data/` or credentials to Git. Store all new crawl outputs separately until verified.
+5. Do not overwrite the existing source directories, published JSONL or Drive data while integrating the incremental pipeline. Validate on an isolated small dataset first.
 6. Current baseline (2026-11-01): 5,000 valid metadata records; 8,587 expected versions; 2,309 multi-version publications; 84,061 published arXiv edges; 3,235 out-of-scope not-found discovery records preserved in history.
 
-## Snapshot status
-Drive backup folder: https://drive.google.com/drive/folders/1qwcLlRKf7Tuqhoqf3uH9DGHfN7Jkj-dt
-
-Verified by Drive listing: `papers.jsonl`, `references.jsonl` and the ten files in `csv/` were copied with matching byte sizes.
-
-**Incomplete:** `data/raw/` is NOT yet backed up. Do not describe this folder as a complete production backup. The existing `data/recovery_backup` is separate and predates the latest metadata recovery.
+## Incremental-first migration
+- Full raw-data backups are optional and are not a prerequisite for read-only audits or new-version downloads.
+- Preserve old files; write version-aware outputs to new paths and publish only after consistency checks.
+- Drive Fast Scratch synchronization must be audited before any production writes to prevent overwriting newer persistent data.
 
 ## Minimum audit invariants
 - Canonical publication IDs are unique in latest snapshots.
