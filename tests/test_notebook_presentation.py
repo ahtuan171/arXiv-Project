@@ -33,3 +33,15 @@ def test_summary_displays_four_legacy_tables_separately():
     ):
         assert file in final
     assert "legacy" in final
+
+
+def test_colab_form_shows_only_everyday_controls():
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    form = "".join([c for c in nb["cells"] if c["cell_type"] == "code"][3]["source"])
+    visible = [line.split("=")[0].strip() for line in form.splitlines() if "#@param" in line]
+    assert visible == [
+        "start_id", "end_id", "LIMIT", "DOWNLOAD_VERSIONS",
+        "VERSION_LIMIT", "FETCH_RAW_REFERENCES", "RAW_REF_LIMIT",
+    ]
+    assert "METADATA_RETRY_ERRORS = False" in form
+    assert "EXPORT_M1_REPORT = False" in form
