@@ -101,3 +101,66 @@ def test_network_failure_does_not_create_version_folder(tmp_path):
     assert result["summary"]["not_found"] == 1
     assert not (data / "raw" / "2501_00001" / "v1").exists()
     assert (data / "versions_manifest.jsonl").is_file()
+
+
+def test_progress_callback_tracks_actual_attempts(tmp_path):
+    data = fixture_data(tmp_path)
+    progress = []
+    def fetch(url):
+        if url.endswith("v1"):
+            return "ok", b"%PDF-1.4", "application/pdf", ""
+        return "not_found", b"", "", "404"
+
+    report = run_version_downloads(
+        data, ids=["2501.00001"], dry_run=False, max_downloads=2,
+        scratch_parent=tmp_path, fetch=fetch,
+        progress_callback=lambda completed, total, event: progress.append(
+            (completed, total, event["version"], event["status"])
+        ),
+    )
+    assert progress == [
+        (1, 2, "v1", "pdf_only"),
+        (2, 2, "v2", "not_found"),
+    ]
+    assert report["summary"]["network_attempts"] == 2
+    assert report["summary"]["pdf_only"] == 1
+    assert report["summary"]["not_found"] == 1
+
+
+def test_dry_run_never_invokes_progress_callback(tmp_path):
+    data = fixture_data(tmp_path)
+    progress = []
+    run_version_downloads(
+        data, ids=["2501.00001"], dry_run=True, max_downloads=2,
+        progress_callback=lambda *_: progress.append("called"),
+    )
+    assert progress == []
+    assert not (data / "versions_manifest.jsonl").exists()
+
+
+def test_progress_callback_failure_does_not_lose_download(tmp_path):
+    data = fixture_data(tmp_path)
+    def broken_callback(*args):
+        raise RuntimeError("display error")
+
+    report = run_version_downloads(
+        data, ids=["2501.00001"], dry_run=False, max_downloads=1,
+        scratch_parent=tmp_path,
+        fetch=lambda _: ("ok", b"%PDF-1.4", "application/pdf", ""),
+        progress_callback=broken_callback,
+    )
+    assert report["summary"]["network_attempts"] == 1
+    assert (data / "raw" / "2501_00001" / "v1" / ".version-status.json").exists()
+    assert (data / "versions_manifest.jsonl").is_file()
+
+
+def test_callback_total_respects_available_candidates(tmp_path):
+    data = fixture_data(tmp_path)
+    progress = []
+    run_version_downloads(
+        data, ids=["2501.00001"], dry_run=False, max_downloads=3,
+        scratch_parent=tmp_path,
+        fetch=lambda _: ("not_found", b"", "", "404"),
+        progress_callback=lambda i, n, _: progress.append((i, n)),
+    )
+    assert progress == [(1, 2), (2, 2)]

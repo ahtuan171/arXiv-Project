@@ -38,6 +38,7 @@ _VERSION = re.compile(r"^v[1-9]\d*$")
 _MARKER = ".version-status.json"
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 FetchFn = Callable[[str], tuple[str, bytes, str, str]]
+ProgressFn = Callable[[int, int, dict], None]
 
 
 def _sha256(path: Path) -> str:
@@ -296,11 +297,15 @@ def run_version_downloads(
     scratch_parent: str | Path | None = None,
     fetch: FetchFn | None = None,
     min_interval: float = config.ARXIV_MIN_INTERVAL,
+    progress_callback: ProgressFn | None = None,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
     max_downloads counts network attempts, not existing verified/skipped entries.
     Set max_downloads=0 for no artificial cap (use only after small tests).
+    progress_callback(attempts_completed, target_attempts, event) runs only
+    after each actual network attempt is durably recorded, never on dry-run.
+    The callback reports attempt progress, not success rate or overall coverage.
     """
     if max_downloads < 0:
         raise ValueError("max_downloads must be >= 0")
@@ -320,6 +325,8 @@ def run_version_downloads(
     events = []
     counts = Counter()
     attempts = 0
+    total_candidates = plan["summary"].get("to_download", 0)
+    progress_total = min(max_downloads, total_candidates) if max_downloads else total_candidates
     for task in plan["worklist"]:
         paper_id, version = task["arxiv_id"], task["version"]
         if task["action"] == "conflict":
@@ -372,6 +379,12 @@ def run_version_downloads(
         counts[event["status"]] += 1
         print(f"[Versions] {paper_id}/{version}: {event['status']} "
               f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
+        if progress_callback is not None:
+            try:
+                progress_callback(attempts, progress_total, event)
+            except Exception as exc:
+                # Progress UI is best-effort; never turn a recorded download into a failure.
+                print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
     return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
