@@ -46,3 +46,10 @@ This document describes **new outputs**. It does not modify the existing dataset
 - `export_version_csv(report)` atomically writes **only** `csv/m1_download_versions.csv`; it never truncates the table to the last monthly `id_list` because the report intentionally has no ID-range filter.
 - `verified_success + verified_pdf_only + not_found + failed + pending + conflicts + missing_files == expected_versions`. Nonzero `conflicts`, `missing_files`, invalid version metadata or orphan manifest keys must be reviewed before declaring completion.
 - No automatic export is triggered by each downloader batch: after a run, rerun notebook cell 2.3 (or the CLI) to refresh the CSV.
+
+## Step 3: read-only legacy source comparison (no automatic deduplication)
+- Run notebook cell 2.4 or `python -m src.scripts.audit_legacy_matches --data-dir /path/to/data --max-papers 20`. This hashes only explicitly selected legacy directories and verified `vN` files. The default 20-paper cap avoids accidental whole-Drive scans.
+- Matching requires the identical **complete list of relative .tex/.bib paths, sizes and SHA-256 hashes**. Only vN directories already trusted by `.version-status.json` are compared. The legacy status marker is ignored as content; unexpected legacy files and symlinks fail closed.
+- `exact_match` proves byte-equivalent extracted source, **not** that the legacy unversioned request fetched that historical revision. `ambiguous_match` means identical content across multiple revisions; `no_verified_version` means there is no trusted comparison.
+- Legacy files never count toward `verified_existing`, are never moved/rewritten, and this audit does not suppress or prefill version download attempts. Avoiding a first versioned request needs independent version provenance; an unversioned historical URL cannot supply it.
+- No migration or deletion is performed at this stage. Phase 4 will address per-version metadata and citations.
