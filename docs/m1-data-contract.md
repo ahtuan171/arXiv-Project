@@ -1,4 +1,4 @@
-# Milestone 1 data contract (incremental, append-only proposal)
+# Milestone 1 data contract (incremental, append-only outputs)
 
 This document describes **new outputs**. It does not modify the existing dataset.
 
@@ -7,10 +7,12 @@ This document describes **new outputs**. It does not modify the existing dataset
 - `data/references.jsonl`: deduplicated arXiv-to-arXiv edges with existing published schema.
 - `data/csv/m1_download_stats.csv`: existing per-publication statistics; preserve compatibility.
 
-## New version-aware outputs (planned for Issue #2)
-- `data/versions_manifest.jsonl`: one current record per `(arxiv_id, version)`. Required keys: `arxiv_id` (canonical e.g. `2501_12345`), `version` (e.g. `v2`), `status` (one of `pending`, `success`, `pdf_only`, `not_found`, `failed`), `source_url`, `raw_path`, `raw_size_bytes`, `cleaned_size_bytes`, `num_tex_files`, `error`, `fetched_at`.
-- `data/raw/<canonical_id>/vN/`: the extracted nonempty `.tex` and `.bib` source for the version; `.source-status.json` for PDF-only.
-- `data/csv/m1_download_versions.csv`: one row per `(arxiv_id, version)` with status, raw and cleaned sizes, number of TeX files, elapsed time.
+## Version-aware source outputs (incrementally implemented)
+- `data/versions_manifest.jsonl`: append-only **attempt history**; the last event per `(arxiv_id, version)` is used when reconciling. It is not a current-state snapshot. Required keys: `arxiv_id` (canonical e.g. `2501_12345`), `version` (e.g. `v2`), `status` (one of `pending`, `success`, `pdf_only`, `not_found`, `failed`), `source_url`, `raw_path`, `raw_size_bytes`, `cleaned_size_bytes`, `num_tex_files`, `error`, `fetched_at`.
+- `data/raw/<canonical_id>/vN/`: the extracted nonempty `.tex` and `.bib` source for the version; `.version-status.json` contains hashes and source metadata. A PDF-only version has an empty file list with the same marker.
+- `data/csv/m1_download_versions.csv`: generated **only by an explicit full-dataset export** in notebook cell 2.3 / `python -m src.scripts.audit_version_downloads --data-dir ... --export`. One row per expected `(arxiv_id, version)`, containing status, verification, marker/manifest status, sizes, TeX count, and attempt timing. Read-only by default; CSV is a snapshot and must be refreshed after later downloads.
+- Audit-only states `conflict` (existing untrusted vN) and `missing_files` (manifest says success but files absent) are separate from download attempt states `pending`, `success`, `pdf_only`, `not_found`, `failed`. An old unversioned source does not count as verified for any `vN`.
+- The version audit hashes only the expected `vN` paths and never modifies the legacy raw files, the published JSONLs, or the original CSVs. On large Drive datasets, full hash verification is slower than a lightweight metadata-only audit.
 - A paper's version count is **expected work**, not evidence that all source versions downloaded successfully.
 
 ## New reference-retention output (planned for Issue #3)
@@ -38,3 +40,9 @@ This document describes **new outputs**. It does not modify the existing dataset
 - The sum of version counts over successful metadata equals the declared expected worklist.
 - Published edges contain two valid IDs and no duplicate pairs.
 - Download stats can be reconciled with source directories; full recursive raw verification must be performed after a trusted tree export or on mounted Drive.
+
+## Source-version reconciliation (step 2)
+- `audit_version_downloads(data_dir)` produces a **read-only** full-dataset report, one row per expected version from valid metadata. The verified filesystem marker and SHA-256 hashes override stale manifest entries.
+- `export_version_csv(report)` atomically writes **only** `csv/m1_download_versions.csv`; it never truncates the table to the last monthly `id_list` because the report intentionally has no ID-range filter.
+- `verified_success + verified_pdf_only + not_found + failed + pending + conflicts + missing_files == expected_versions`. Nonzero `conflicts`, `missing_files`, invalid version metadata or orphan manifest keys must be reviewed before declaring completion.
+- No automatic export is triggered by each downloader batch: after a run, rerun notebook cell 2.3 (or the CLI) to refresh the CSV.
