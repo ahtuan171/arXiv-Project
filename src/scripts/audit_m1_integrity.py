@@ -19,7 +19,7 @@ from typing import Callable
 
 from src import utils
 from src.crawl_references_module.raw_reference_collector import _done, _load_state, _read_records
-from src.scripts.audit_version_downloads import audit_version_downloads
+from src.scripts.audit_version_downloads import COLUMNS as VERSION_COLUMNS, audit_version_downloads
 from src.scripts.build_version_metadata import build_version_metadata
 
 ProgressFn = Callable[[int, int, dict], None]
@@ -51,27 +51,33 @@ def _published(path: Path) -> tuple[dict, set[tuple[str, str]], list[str]]:
     }, pairs, problems
 
 
-def _metadata_snapshot_keys(path: Path) -> set[tuple[str, str]]:
-    found = set()
+def _metadata_snapshot_rows(path: Path) -> dict[tuple[str, str], dict]:
+    found = {}
     for item in _read_records(path):
         key = (item.get("arxiv_id"), item.get("version"))
         if not all(isinstance(x, str) and x for x in key) or key in found:
             raise ValueError(f"Invalid or duplicate metadata_versions key: {key}")
-        found.add(key)
+        found[key] = item
     return found
 
 
-def _csv_statuses(path: Path) -> dict[tuple[str, str], str]:
+def _csv_row(row: dict) -> dict[str, str]:
+    """Use the same text conversion as csv.DictWriter for all fields."""
+    return {field: "" if row.get(field) is None else str(row.get(field, ""))
+            for field in VERSION_COLUMNS}
+
+
+def _csv_snapshot(path: Path) -> dict[tuple[str, str], dict[str, str]]:
     found = {}
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
-        if not {"arxiv_id", "version", "status"}.issubset(reader.fieldnames or []):
+        if not set(VERSION_COLUMNS).issubset(reader.fieldnames or []):
             raise ValueError("Version CSV lacks required columns")
         for item in reader:
             key = (item["arxiv_id"], item["version"])
             if not all(key) or key in found:
                 raise ValueError(f"Invalid or duplicate version CSV key: {key}")
-            found[key] = item["status"]
+            found[key] = _csv_row(item)
     return found
 
 
@@ -195,11 +201,12 @@ def audit_m1_integrity(
     snapshots["metadata_versions_exists"] = meta_path.is_file()
     if meta_path.is_file():
         try:
-            snapshots["metadata_versions_matches_keys"] = (
-                _metadata_snapshot_keys(meta_path) == source_keys
-            )
-            if not snapshots["metadata_versions_matches_keys"]:
-                warnings.append("metadata_versions.jsonl is stale; rerun cell 2.5 export")
+            saved = _metadata_snapshot_rows(meta_path)
+            current = {(r["arxiv_id"], r["version"]): r for r in metadata["rows"]}
+            snapshots["metadata_versions_matches_keys"] = set(saved) == source_keys
+            snapshots["metadata_versions_current"] = saved == current
+            if not snapshots["metadata_versions_current"]:
+                warnings.append("metadata_versions.jsonl is stale (content or keys); rerun cell 2.5 export")
         except (ValueError, OSError, TypeError) as exc:
             blockers.append(f"Invalid metadata_versions.jsonl: {exc}")
     else:
@@ -209,11 +216,11 @@ def audit_m1_integrity(
     snapshots["download_versions_csv_exists"] = csvfile.is_file()
     if csvfile.is_file():
         try:
-            snapshot = _csv_statuses(csvfile)
-            current = {(r["arxiv_id"], r["version"]): r["status"] for r in source_rows}
+            snapshot = _csv_snapshot(csvfile)
+            current = {(r["arxiv_id"], r["version"]): _csv_row(r) for r in source_rows}
             snapshots["download_versions_csv_current"] = snapshot == current
             if snapshot != current:
-                warnings.append("m1_download_versions.csv is stale; rerun cell 2.3 export")
+                warnings.append("m1_download_versions.csv is stale (content or keys); rerun cell 2.3 export")
         except (ValueError, OSError, TypeError, csv.Error) as exc:
             blockers.append(f"Invalid m1_download_versions.csv: {exc}")
     else:

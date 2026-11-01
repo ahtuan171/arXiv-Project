@@ -164,3 +164,35 @@ def test_report_write_is_opt_in_and_preserves_published_files(tmp_path):
     assert json.loads(output.read_text())["status"] == "in_progress"
     for name, content in previous.items():
         assert (root / name).read_bytes() == content
+
+
+def test_csv_detects_changed_size_with_same_status(tmp_path):
+    import csv
+    root = fixture(tmp_path)
+    verified_versions(root, tmp_path)
+    path = export_version_csv(audit_version_downloads(root))
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fields, rows = reader.fieldnames, list(reader)
+    assert fields is not None
+    assert rows[0]["status"] == "success"
+    rows[0]["cleaned_size_bytes"] = "99999999"
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    result = audit_m1_integrity(root)
+    assert result["snapshots"]["download_versions_csv_current"] is False
+    assert any("m1_download_versions.csv is stale" in w for w in result["warnings"])
+
+
+def test_metadata_detects_changed_date_with_same_keys(tmp_path):
+    root = fixture(tmp_path)
+    path = export_version_metadata(build_version_metadata(root))
+    rows = [json.loads(x) for x in path.read_text().splitlines()]
+    rows[0]["version_date"] = "2000-01-01"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    result = audit_m1_integrity(root)
+    assert result["snapshots"]["metadata_versions_matches_keys"] is True
+    assert result["snapshots"]["metadata_versions_current"] is False
+    assert any("metadata_versions.jsonl is stale" in w for w in result["warnings"])
