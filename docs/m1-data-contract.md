@@ -73,3 +73,9 @@ This document describes **new outputs**. It does not modify the existing dataset
 - Checks paper ID uniqueness, metadata-version keys, source markers and hashes, published citation edge validity/uniqueness, optional exported version snapshot freshness, raw-reference provenance and ledger count/SHA-256 consistency. Raw/published citation overlap is informational, NOT an equality requirement.
 - Status `needs_fix` indicates conflicting or untrusted data. `in_progress` indicates expected missing work including unverified raw references or missing snapshot exports. `structurally_consistent` only confirms checked structure; it cannot assert complete historical revision dates or version-level citations.
 - The optional `--export` / `EXPORT_M1_INTEGRITY_REPORT=True` atomically writes ONLY `data/reports/m1_integrity_report.json`; all published and raw data remain unchanged. A full audit is I/O intensive on Drive; run it without parallel writers.
+
+## Step 7: offline integration and Colab smoke check
+- The branch includes `.github/workflows/m1-offline-tests.yml` (commit fb0c740), running isolated pytest modules on GitHub Actions at each push/PR. These tests use local temporary fixtures, not real Drive data or external network.
+- Colab cell **2.8** runs exactly the scoped offline regression suite with `subprocess.run(check=True)` so failures are visible; pytest plugin autoload and cache are disabled to reduce incidental effects. This does NOT replace real Colab execution of 2.2–2.7.
+- Recommended flow: run environment/config, keep downloader and raw references in dry-run, execute 2.1–2.7, execute 2.8, then (only after reviewing logs) enable bounded 10-version and 3-paper network tests. Compare integrity before and after; never delete or overwrite older Drive data.
+- Missing/failed CI execution cannot be reported as passed. Do not declare M1 accepted until the workflow and Colab smoke run results have actually been inspected.
