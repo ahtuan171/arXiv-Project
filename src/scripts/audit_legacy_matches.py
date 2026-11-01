@@ -17,7 +17,7 @@ import os
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from src.download_module.version_downloader import _paper_id, _status_record
 from src.scripts.audit_missing_versions import _latest_jsonl, _valid_meta, _versions
@@ -86,12 +86,16 @@ def _legacy_fingerprint(folder: Path) -> tuple[str, tuple, str]:
     return "has_source", tuple(sorted(records)), ""
 
 
+ProgressFn = Callable[[int, int, dict], None]
+
+
 def audit_legacy_matches(
     data_dir: str | Path,
     *,
     ids: Iterable[str] | None = None,
     max_papers: int = 20,
     sample_size: int = 10,
+    progress_callback: ProgressFn | None = None,
 ) -> dict:
     """Compare legacy source sets with ONLY verified vN directories.
 
@@ -115,14 +119,28 @@ def audit_legacy_matches(
         requested = requested[:max_papers]
     result_rows = []
     stats = Counter()
-    for paper_id in requested:
+    progress_total = len(requested)
+    warned_progress = False
+
+    def notify(index: int, record: dict) -> None:
+        nonlocal warned_progress
+        if progress_callback is not None and not warned_progress:
+            try:
+                progress_callback(index, progress_total, record)
+            except Exception as exc:
+                print(f"[Legacy audit] Progress display warning: {exc}", flush=True)
+                warned_progress = True
+
+    for index, paper_id in enumerate(requested, 1):
         paper = papers.get(paper_id)
         if not _valid_meta(paper):
             stats["no_metadata"] += 1
+            notify(index, {"arxiv_id": paper_id, "status": "no_metadata"})
             continue
         versions, issue = _versions(paper, None)
         if not versions:
             stats["invalid_version_metadata"] += 1
+            notify(index, {"arxiv_id": paper_id, "status": "invalid_version_metadata"})
             continue
         status, fingerprint, error = _legacy_fingerprint(root / "raw" / paper_id)
         matches = []
@@ -143,14 +161,16 @@ def audit_legacy_matches(
                       "ambiguous_match" if len(matches) > 1 else
                       "different" if compared else "no_verified_version")
         stats[status] += 1
-        result_rows.append({
+        row = {
             "arxiv_id": paper_id,
             "status": status,
             "matched_versions": matches,
             "verified_versions_compared": compared,
             "legacy_source_files": len(fingerprint),
             "reason": error,
-        })
+        }
+        result_rows.append(row)
+        notify(index, row)
     summary = {
         "requested_papers": requested_total,
         "examined_papers": len(requested),

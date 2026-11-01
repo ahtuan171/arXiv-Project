@@ -21,7 +21,7 @@ import os
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.download_module.version_downloader import (
     SOURCE_BASE_URL,
@@ -38,7 +38,13 @@ COLUMNS = [
 ]
 
 
-def audit_version_downloads(data_dir: str | Path, *, sample_size: int = 10) -> dict[str, Any]:
+ProgressFn = Callable[[int, int, dict], None]
+
+
+def audit_version_downloads(
+    data_dir: str | Path, *, sample_size: int = 10,
+    progress_callback: ProgressFn | None = None,
+) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
     This is read-only and intentionally checks hashes; on a large Drive folder,
@@ -61,6 +67,14 @@ def audit_version_downloads(data_dir: str | Path, *, sample_size: int = 10) -> d
     expected: set[tuple[str, str]] = set()
     counters = Counter()
     issues: list[str] = []
+    # Calculate total without opening/hash-checking any raw source files.
+    progress_total = 0
+    for paper in papers.values():
+        if _valid_meta(paper):
+            labels, _ = _versions(paper, None)
+            progress_total += len(labels)
+    progress_done = 0
+    warned_progress = False
 
     for paper_id in sorted(papers):
         paper = papers[paper_id]
@@ -122,6 +136,14 @@ def audit_version_downloads(data_dir: str | Path, *, sample_size: int = 10) -> d
             # Leave never-attempted versions as pending, including legacy-only source.
             counters[record["status"]] += 1
             rows.append(record)
+            progress_done += 1
+            if progress_callback is not None and not warned_progress:
+                try:
+                    progress_callback(progress_done, progress_total, record)
+                except Exception as exc:
+                    # A failing progress UI must never invalidate the audit.
+                    print(f"[Version audit] Progress display warning: {exc}", flush=True)
+                    warned_progress = True
 
     orphan_keys = set(history).difference(expected)
     counters["orphan_manifest_keys"] = len(orphan_keys)

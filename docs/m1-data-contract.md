@@ -53,3 +53,10 @@ This document describes **new outputs**. It does not modify the existing dataset
 - `exact_match` proves byte-equivalent extracted source, **not** that the legacy unversioned request fetched that historical revision. `ambiguous_match` means identical content across multiple revisions; `no_verified_version` means there is no trusted comparison.
 - Legacy files never count toward `verified_existing`, are never moved/rewritten, and this audit does not suppress or prefill version download attempts. Avoiding a first versioned request needs independent version provenance; an unversioned historical URL cannot supply it.
 - No migration or deletion is performed at this stage. Phase 4 will address per-version metadata and citations.
+
+## Step 4a: version-level metadata index (no fabricated revision dates)
+- Cell 2.5 / `python -m src.scripts.build_version_metadata --data-dir ...` builds an in-memory index for **all** expected versions across both months. `--export` creates or atomically refreshes only `data/metadata_versions.jsonl`.
+- Source is existing `papers.jsonl` plus any journal; the file contains `(arxiv_id, version)`, publication metadata reference, paper-level submission date, optional version date, and explicit date provenance.
+- The present crawler captures only the most recent revised date for most multi-version papers. Assign that single date **only to the last version**; leave dates of intermediate revisions blank. A complete `n-1` ordered revised date list may be mapped positionally.
+- **Do not copy the latest paper title, abstract, or author list to earlier historical revisions** as if they were verified. This index is not a substitute for fetching version-specific metadata and is not a claim that all revision history is complete.
+- Notebook progress bars in 2.3/2.4 report audit work processed, not source download success or legacy-match rate. Git operations in cell 1 use local `/content/arxiv-code`; persistent dataset remains on Drive.
