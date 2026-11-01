@@ -84,8 +84,10 @@ def _csv_snapshot(path: Path) -> dict[tuple[str, str], dict[str, str]]:
 def audit_m1_integrity(
     data_dir: str | Path, *, sample_size: int = 10,
     progress_callback: ProgressFn | None = None,
+    version_report: dict | None = None,
+    metadata_report: dict | None = None,
 ) -> dict:
-    """Audit all months. Do not scope to the current notebook ID list."""
+    """Audit all months; accept fresh audit results for a single hash pass."""
     if sample_size < 0:
         raise ValueError("sample_size must be nonnegative")
     root = Path(data_dir)
@@ -106,9 +108,16 @@ def audit_m1_integrity(
     if duplicates:
         blockers.append(f"Duplicate paper snapshot IDs: {duplicates}")
 
-    sources = audit_version_downloads(root, sample_size=sample_size,
-                                      progress_callback=progress_callback)
-    metadata = build_version_metadata(root, sample_size=sample_size)
+    if version_report is not None and Path(version_report.get("data_dir", "")).resolve() != root.resolve():
+        raise ValueError("Version audit report belongs to another dataset")
+    if metadata_report is not None and Path(metadata_report.get("data_dir", "")).resolve() != root.resolve():
+        raise ValueError("Version metadata report belongs to another dataset")
+    sources = version_report if version_report is not None else audit_version_downloads(
+        root, sample_size=sample_size, progress_callback=progress_callback
+    )
+    metadata = metadata_report if metadata_report is not None else build_version_metadata(
+        root, sample_size=sample_size
+    )
     vs, ms = sources["summary"], metadata["summary"]
     source_rows = sources["rows"]
     source_keys = {(r["arxiv_id"], r["version"]) for r in source_rows}

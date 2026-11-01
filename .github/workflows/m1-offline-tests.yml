@@ -37,7 +37,8 @@ jobs:
             tests/test_raw_reference_collector.py \
             tests/test_audit_m1_integrity.py \
             tests/test_m1_offline_end_to_end.py \
-            tests/test_build_m1_report.py
+            tests/test_build_m1_report.py \
+            tests/test_notebook_layout.py
       - name: Validate notebook JSON
         run: |
-          python -c "import json; from pathlib import Path; n=json.loads(Path('src/milestone1_pipeline.ipynb').read_text()); assert n['nbformat']==4; print('cells:',len(n['cells']))"
+          python -c "import json; from pathlib import Path; n=json.loads(Path('src/milestone1_pipeline.ipynb').read_text()); assert n['nbformat']==4; assert sum(c['cell_type']=='code' for c in n['cells'])==7; print('code cells: 7')"

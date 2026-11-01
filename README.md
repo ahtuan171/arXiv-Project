@@ -6,6 +6,8 @@ trích dẫn (reference matching) cho các bài báo arXiv.
 - **Báo cáo (Jupyter Book):** https://ahtuan171.github.io/arXiv-Project/
 - **Đề bài:** https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/
 
+**Quyết định của nhóm:** notebook Colab, code và Jupyter Book đều ở một repository duy nhất. Xem [hướng dẫn notebook 7 cell](src/README.md).
+
 ## Cấu trúc repo
 
 ```
