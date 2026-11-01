@@ -32,11 +32,12 @@ import requests
 
 from src import config, recovery, utils
 from src.download_module.downloader import extract_source_archive
-from src.scripts.audit_missing_versions import _latest_jsonl, _valid_meta, _versions
+from src.scripts.audit_missing_versions import _jsonl_rows, _latest_jsonl, _valid_meta, _versions
 
 _VERSION = re.compile(r"^v[1-9]\d*$")
 _MARKER = ".version-status.json"
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+SOURCE_BASE_URL = "https://export.arxiv.org/src"
 FetchFn = Callable[[str], tuple[str, bytes, str, str]]
 ProgressFn = Callable[[int, int, dict], None]
 
@@ -235,23 +236,65 @@ def _request_source(
 
 
 def _event(paper_id: str, version: str, status: str, *, marker: dict | None = None,
-           error: str = "", elapsed: float = 0) -> dict:
+           error: str = "", elapsed: float = 0,
+           previous_attempts: int = 0) -> dict:
     network = _network_id(paper_id)
+    # Match the legacy recovery policy: retry transient failures with bounded
+    # exponential cooldown; permanent HTTP errors require an explicit retry.
+    try:
+        prior = max(0, int(previous_attempts))
+    except (ValueError, TypeError):
+        prior = 0
+    attempts = prior + 1 if status == "failed" else 0
+    blocked = error.startswith(("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 410",
+                                "Source archive exceeded"))
+    error_type = ("blocked" if blocked else "transient") if status == "failed" else (
+        "not_found" if status == "not_found" else ""
+    )
+    delay = min(config.RECOVERY_COOLDOWN * (2 ** min(max(0, attempts - 1), 16)),
+                config.RECOVERY_MAX_COOLDOWN)
+    next_retry_at = time.time() + delay if status == "failed" and not blocked else None
     result = {
         "arxiv_id": paper_id, "version": version,
-        "status": status, "source_url": f"https://arxiv.org/src/{network}{version}",
+        "status": status, "source_url": f"{SOURCE_BASE_URL}/{network}{version}",
         "raw_path": f"raw/{paper_id}/{version}" if status in {"success", "pdf_only"} else "",
         "raw_size_bytes": (marker or {}).get("raw_size_bytes", 0),
         "cleaned_size_bytes": (marker or {}).get("cleaned_size_bytes", 0),
         "num_tex_files": (marker or {}).get("num_tex_files", 0),
         "download_time_sec": round(elapsed, 3), "error": error,
+        "error_type": error_type, "attempts": attempts, "next_retry_at": next_retry_at,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
     return result
 
 
-def plan_version_downloads(data_dir: str | Path, ids: Iterable[str] | None = None) -> dict:
-    """Read metadata, inspect only specifically requested vN destinations (no raw scan)."""
+def _latest_version_events(path: Path) -> dict[tuple[str, str], dict]:
+    """Read the latest append-only event for each (paper, version) pair."""
+    latest: dict[tuple[str, str], dict] = {}
+    for row in _jsonl_rows(path):
+        paper_id, version = row.get("arxiv_id"), row.get("version")
+        if not isinstance(paper_id, str) or not isinstance(version, str) or not _VERSION.fullmatch(version):
+            continue
+        try:
+            key = (_paper_id(paper_id), version)
+        except ValueError:
+            continue
+        latest[key] = row
+    return latest
+
+
+def plan_version_downloads(
+    data_dir: str | Path,
+    ids: Iterable[str] | None = None,
+    *,
+    retry_errors: bool = False,
+    retry_not_found: bool = False,
+) -> dict:
+    """Plan attempts using verified vN directories and the last manifest event.
+
+    Verified files always win over the journal. A recorded 404 is skipped unless
+    explicitly retried. Failed requests obey a persisted recovery cooldown.
+    """
     data = Path(data_dir)
     papers_path = data / "papers.jsonl"
     if not papers_path.is_file():
@@ -261,6 +304,8 @@ def plan_version_downloads(data_dir: str | Path, ids: Iterable[str] | None = Non
         if _valid_meta(row) or not _valid_meta(papers.get(key)):
             papers[key] = row
     requested = sorted({_paper_id(x) for x in ids}) if ids is not None else sorted(papers)
+    history = _latest_version_events(data / "versions_manifest.jsonl")
+    now = time.time()
     work = []
     counts: Counter = Counter()
     for paper_id in requested:
@@ -282,8 +327,29 @@ def plan_version_downloads(data_dir: str | Path, ids: Iterable[str] | None = Non
                 work.append({"arxiv_id": paper_id, "version": version, "action": "conflict",
                              "reason": current["error"]})
             else:
+                previous = history.get((paper_id, version), {})
+                previous_status = previous.get("status")
+                if previous_status == "not_found" and not retry_not_found:
+                    counts["known_not_found"] += 1
+                    continue
+                if previous_status == "failed" and not retry_errors:
+                    if previous.get("error_type") == "blocked":
+                        counts["blocked_errors"] += 1
+                        continue
+                    try:
+                        next_retry_at = float(previous.get("next_retry_at") or 0)
+                    except (TypeError, ValueError):
+                        next_retry_at = 0
+                    if next_retry_at > now:
+                        counts["deferred_retry"] += 1
+                        continue
                 counts["to_download"] += 1
-                work.append({"arxiv_id": paper_id, "version": version, "action": "download"})
+                work.append({
+                    "arxiv_id": paper_id,
+                    "version": version,
+                    "action": "download",
+                    "previous_attempts": previous.get("attempts", 0),
+                })
     return {"data_dir": str(data), "requested_papers": len(requested),
             "summary": dict(counts), "worklist": work}
 
@@ -298,6 +364,8 @@ def run_version_downloads(
     fetch: FetchFn | None = None,
     min_interval: float = config.ARXIV_MIN_INTERVAL,
     progress_callback: ProgressFn | None = None,
+    retry_errors: bool = False,
+    retry_not_found: bool = False,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -306,11 +374,15 @@ def run_version_downloads(
     progress_callback(attempts_completed, target_attempts, event) runs only
     after each actual network attempt is durably recorded, never on dry-run.
     The callback reports attempt progress, not success rate or overall coverage.
+    retry_errors overrides the failure cooldown (including permanent HTTP errors).
+    retry_not_found explicitly retries previous HTTP 404 responses.
     """
     if max_downloads < 0:
         raise ValueError("max_downloads must be >= 0")
     data = Path(data_dir)
-    plan = plan_version_downloads(data, ids=ids)
+    plan = plan_version_downloads(
+        data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found
+    )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
         print("[Versions] DRY RUN: no download and no Drive changes.", flush=True)
@@ -338,9 +410,9 @@ def run_version_downloads(
         # Recheck immediately before each network request (resume, crash safety).
         current = _status_record(raw, paper_id, version)
         if current is not None:
-            counts["already_present"] += 1
+            counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
             continue
-        url = f"https://arxiv.org/src/{_network_id(paper_id)}{version}"
+        url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
         attempts += 1
         start = time.monotonic()
         print(f"[Versions] {attempts}/{max_downloads or 'all'} GET {url}", flush=True)
@@ -367,12 +439,14 @@ def run_version_downloads(
                                elapsed=time.monotonic() - start)
             else:
                 event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
-                               error=error or state, elapsed=time.monotonic() - start)
+                               error=error or state, elapsed=time.monotonic() - start,
+                               previous_attempts=task.get("previous_attempts", 0))
         except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
             # An existing final directory or an unverified stage must not be
             # replaced or deleted. Record failure, then continue.
             event = _event(paper_id, version, "failed",
-                           error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start)
+                           error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
+                           previous_attempts=task.get("previous_attempts", 0))
         # Append event only after publication; a later run can recover from the marker.
         recovery.durable_append(data / "versions_manifest.jsonl", event)
         events.append(event)

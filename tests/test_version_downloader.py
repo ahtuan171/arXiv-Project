@@ -45,7 +45,7 @@ def test_publishes_two_versions_then_skips_without_overwriting(tmp_path):
     first = run_version_downloads(data, ids=["2501.00001"], dry_run=False, max_downloads=2,
                                   scratch_parent=tmp_path, fetch=fetch)
     assert len(calls) == 2
-    assert calls == ["https://arxiv.org/src/2501.00001v1", "https://arxiv.org/src/2501.00001v2"]
+    assert calls == ["https://export.arxiv.org/src/2501.00001v1", "https://export.arxiv.org/src/2501.00001v2"]
     assert first["summary"]["success"] == 2
     assert (data / "raw" / "2501_00001" / "legacy.tex").read_text() == "DO NOT CHANGE"
     assert (data / "references.jsonl").read_text() == '{"reference":"old"}\n'
@@ -164,3 +164,95 @@ def test_callback_total_respects_available_candidates(tmp_path):
         progress_callback=lambda i, n, _: progress.append((i, n)),
     )
     assert progress == [(1, 2), (2, 2)]
+
+
+def test_known_404_is_skipped_on_restart_and_can_be_forced(tmp_path):
+    data = fixture_data(tmp_path)
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        return "not_found", b"", "", "HTTP 404"
+
+    run_version_downloads(data, ids=["2501.00001"], max_downloads=1,
+                          dry_run=False, scratch_parent=tmp_path, fetch=fetch)
+    plan = plan_version_downloads(data, ids=["2501.00001"])
+    assert plan["summary"]["known_not_found"] == 1
+    assert plan["summary"]["to_download"] == 1
+    run_version_downloads(data, ids=["2501.00001"], max_downloads=2,
+                          dry_run=False, scratch_parent=tmp_path, fetch=fetch)
+    assert calls == [
+        "https://export.arxiv.org/src/2501.00001v1",
+        "https://export.arxiv.org/src/2501.00001v2",
+    ]
+    forced = plan_version_downloads(data, ids=["2501.00001"], retry_not_found=True)
+    assert forced["summary"]["to_download"] == 2
+    assert forced["summary"].get("known_not_found", 0) == 0
+    assert not (data / "raw" / "2501_00001" / "v1").exists()
+
+
+def test_transient_failures_defer_until_cooldown_or_explicit_retry(tmp_path):
+    import time
+
+    data = fixture_data(tmp_path)
+    result = run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=1,
+        dry_run=False, scratch_parent=tmp_path,
+        fetch=lambda _: ("failed", b"", "", "HTTP 503"),
+    )
+    assert result["summary"]["failed"] == 1
+    event = json.loads((data / "versions_manifest.jsonl").read_text().splitlines()[-1])
+    assert event["error_type"] == "transient"
+    assert event["attempts"] == 1
+    assert event["next_retry_at"] > time.time()
+    plan = plan_version_downloads(data, ids=["2501.00001"])
+    assert plan["summary"]["deferred_retry"] == 1
+    assert plan["summary"]["to_download"] == 1
+    assert plan_version_downloads(data, ids=["2501.00001"], retry_errors=True)["summary"]["to_download"] == 2
+
+
+def test_permanent_403_is_not_retried_by_default(tmp_path):
+    data = fixture_data(tmp_path)
+    result = run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=1,
+        dry_run=False, scratch_parent=tmp_path,
+        fetch=lambda _: ("failed", b"", "", "HTTP 403"),
+    )
+    assert result["summary"]["failed"] == 1
+    event = json.loads((data / "versions_manifest.jsonl").read_text().splitlines()[-1])
+    assert event["error_type"] == "blocked"
+    assert event["next_retry_at"] is None
+    assert event["source_url"] == "https://export.arxiv.org/src/2501.00001v1"
+    plan = plan_version_downloads(data, ids=["2501.00001"])
+    assert plan["summary"]["blocked_errors"] == 1
+    assert plan["summary"]["to_download"] == 1
+    assert plan_version_downloads(data, ids=["2501.00001"], retry_errors=True)["summary"]["to_download"] == 2
+
+
+def test_resume_retries_after_cooldown_has_elapsed(tmp_path):
+    data = fixture_data(tmp_path)
+    data.joinpath("versions_manifest.jsonl").write_text(json.dumps({
+        "arxiv_id": "2501_00001", "version": "v1", "status": "failed",
+        "error": "HTTP 503", "error_type": "transient",
+        "attempts": 2, "next_retry_at": 1,
+    }) + "\n")
+    result = run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=1,
+        dry_run=False, scratch_parent=tmp_path,
+        fetch=lambda _: ("failed", b"", "", "HTTP 503"),
+    )
+    assert result["summary"]["network_attempts"] == 1
+    event = json.loads((data / "versions_manifest.jsonl").read_text().splitlines()[-1])
+    assert event["attempts"] == 3
+
+
+def test_dry_run_respects_skip_flags_without_writing(tmp_path):
+    data = fixture_data(tmp_path)
+    manifest = data / "versions_manifest.jsonl"
+    manifest.write_text(json.dumps({
+        "arxiv_id": "2501_00001", "version": "v1", "status": "not_found",
+    }) + "\n")
+    before = manifest.read_bytes()
+    result = run_version_downloads(data, ids=["2501.00001"], dry_run=True)
+    assert result["plan"]["summary"]["known_not_found"] == 1
+    assert result["plan"]["summary"]["to_download"] == 1
+    assert manifest.read_bytes() == before
