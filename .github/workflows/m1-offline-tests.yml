@@ -40,6 +40,7 @@ jobs:
             tests/test_build_m1_report.py \
             tests/test_notebook_layout.py \
             tests/test_notebook_flow.py \
+            tests/test_notebook_progress_logs.py \
             tests/test_notebook_presentation.py
       - name: Validate notebook JSON
         run: |

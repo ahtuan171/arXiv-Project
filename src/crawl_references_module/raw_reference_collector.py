@@ -253,6 +253,7 @@ def collect_raw_references(
         try:
             for number, paper_id in enumerate(plan[:total], 1):
                 aid = utils.canonical_arxiv_id(paper_id)
+                print(f"[Raw references] Đang xử lý {number}/{total}: {aid}", flush=True)
                 previous = ledger.get(aid, {})
                 now = datetime.now(timezone.utc).isoformat()
                 try:
