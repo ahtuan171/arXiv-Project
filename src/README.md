@@ -1,32 +1,24 @@
-# Milestone 1 — One repository, seven code cells
+# Milestone 1 — Colab notebook theo luồng xử lý
 
-Nhóm giữ **một repository duy nhất**: code trong src/, notebooks/ debug, Jupyter Book trong book/ và CI trong .github/. Dữ liệu lớn lưu trên Google Drive, không commit.
+Notebook chính: `src/milestone1_pipeline.ipynb`. Code ở `/content/arxiv-code`; dữ liệu ở Google Drive. Notebook debug legacy nằm tại `notebooks/m1_legacy_debug.ipynb`.
 
-- Main pipeline: src/milestone1_pipeline.ipynb
-- Read-only legacy/debug: notebooks/m1_legacy_debug.ipynb
-- Jupyter Book: book/ trong cùng repo
-- Full data contract: docs/m1-data-contract.md
-
-## Thứ tự chạy trên Google Colab
-
-| Cell code | Công việc | Ghi dữ liệu |
+| Cell | Bước | Ghi dữ liệu |
 |---|---|---|
-| 1 Setup | Mount Drive; clone/pull code vào /content; pip install | Không thay đổi dataset |
-| 2 Config | ID range, Secrets, tất cả cờ ghi/tải | Không |
-| 3 Preflight/Test | Metadata-only audit và pytest offline | Không |
-| 4 Source Versions | Cào từng vN, retry và resume | Chỉ khi DOWNLOAD_VERSIONS=True |
-| 5 Raw References | S2 raw citations (kể cả non-arXiv) | Chỉ khi FETCH_RAW_REFERENCES=True |
-| 6 Validation | Một lượt hash SHA-256 + metadata + integrity | Chỉ khi bật export flags |
-| 7 Summary | Coverage, citations và thiếu bằng chứng benchmark | Chỉ khi EXPORT_M1_REPORT=True |
+| 1 | Kết nối Drive, lấy code | Không |
+| 2 | Cài requirements | Chỉ môi trường Colab |
+| 3 | Đọc S2 API key từ Secrets | Không |
+| 4 | Chọn dải ID và tùy chọn | Không |
+| 5 | Bắt đầu benchmark tùy chọn | Không |
+| 6 | Crawl metadata | `papers.jsonl`, Bảng 1; mặc định bật |
+| 7 | Kiểm tra metadata, test offline tùy chọn | Không |
+| 8 | Tải source từng vN | Chỉ khi `DOWNLOAD_VERSIONS=True` |
+| 9 | Thu raw references | Chỉ khi `FETCH_RAW_REFERENCES=True` |
+| 10 | Kiểm định toàn dataset | Chỉ xuất khi bật cờ export |
+| 11 | Kết thúc benchmark | CSV mới khi `RUN_BENCHMARK=True` |
+| 12 | Tổng kết và hiển thị bảng | Chỉ xuất khi `EXPORT_M1_REPORT=True` |
 
-Mặc định các cờ network/export bằng False. Chạy code cells 1 đến 7 để test an toàn. Để thử tải ít dữ liệu, bật cờ trong cell 2, giữ VERSION_LIMIT=3 và RAW_REF_LIMIT=3, rồi chạy các cell 4 đến 7. Sau mọi lần tải tiếp, **chạy lại cell 6 rồi cell 7**. Không chạy hai notebook ghi vào cùng thư mục Drive đồng thời.
+Lần chạy đầu hãy chọn dải nhỏ bằng `LIMIT`. Metadata mặc định được crawl với resume; source và references mặc định chỉ lập kế hoạch. Khi chạy lại sau lỗi, thực thi cell thu thập tương ứng rồi chạy lại cell 10 và 12. Không chạy hai notebook cùng ghi vào một thư mục Drive.
 
-Không chạy lại cell clone Git cũ trên Drive. Legacy crawler cũ không còn trong notebook chính nhưng code và lịch sử Git vẫn được giữ. Notebook debug chỉ đọc dữ liệu cũ, không tự di chuyển hoặc gán lịch sử phiên bản.
+Benchmark mới lưu tại `csv/m1_version_pipeline_benchmark.csv`, tách khỏi Bảng 4 legacy. Chỉ báo cáo số liệu chính thức sau lượt chạy đủ phạm vi trên Colab CPU-only; các lần chạy thử chỉ là số liệu của lượt thử.
 
-## Benchmark
-
-CSV benchmark legacy không được coi là kết quả đo mới. Benchmark cuối cùng của pipeline vN phải được đo trên Colab CPU-only với thông tin phạm vi, wall time, peak/mean RAM, disk và storage. Jupyter Book nằm tại book/ trong cùng repo; nhóm tự đối chiếu điều kiện nộp bài với giảng viên.
-
-## Test
-
-Workflow Milestone 1 offline regression chạy pytest bằng dữ liệu giả. Nó không truy cập Drive; thành công trên CI không đảm bảo dataset thực tế đã tải xong.
+Bộ test offline không truy cập Drive hay API. Kết quả test không chứng minh dataset thật đã hoàn thành.

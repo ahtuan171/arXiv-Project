@@ -1,4 +1,4 @@
-"""The primary Colab M1 notebook has exactly seven safe, parseable code cells."""
+"""The primary Colab M1 notebook has twelve safe, parseable code cells."""
 import ast
 import json
 from pathlib import Path
@@ -18,18 +18,17 @@ def cells():
     return ["".join(c["source"]) for c in n["cells"] if c["cell_type"] == "code"]
 
 
-def test_seven_python_cells_no_legacy_execution():
+def test_twelve_python_cells_no_legacy_execution():
     items = cells()
-    assert len(items) == 7
+    assert len(items) == 12
     for index, item in enumerate(items, 1):
-        assert f"# {index}/7" in item
         ast.parse(item, filename=f"notebook-cell-{index}")
         assert "ENABLE_LEGACY_CRAWL" not in item
         assert "download_papers_range" not in item
 
 
 def test_safe_default_network_and_export_flags():
-    config = cells()[1]
+    config = cells()[3]
     for flag in (
         "DOWNLOAD_VERSIONS", "FETCH_RAW_REFERENCES", "EXPORT_VERSION_CSV",
         "EXPORT_VERSION_METADATA", "EXPORT_M1_INTEGRITY_REPORT", "EXPORT_M1_REPORT"

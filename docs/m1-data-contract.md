@@ -98,3 +98,9 @@ This document describes **new outputs**. It does not modify the existing dataset
 - Main pipeline remains **7 code cells** and uses the original notebook's Vietnamese presentation hierarchy: overview of Tables 1-4, Drive environment setup, S2 Secrets, Colab form parameters (`#@param`), preflight, execution, retry/recovery guide and summary table display.
 - Legacy CSVs appear for read-only comparison, explicitly labelled as legacy; source-vN CSV is separate and based on verified files.
 - The team uses one repository for code and Jupyter Book. Old separate-repository evidence requirements in previous draft copy are superseded; independently verify any course submission constraints.
+
+## Pipeline notebook update (2026-11-01)
+- The earlier seven-cell layout and historical cell 2.1–2.9 references above describe previous revisions. The primary notebook now has 12 code cells and starts from a selected arXiv ID range.
+- Setup is separated into Drive/code checkout, requirements installation and optional S2 Secret retrieval. It no longer requires `papers.jsonl` before discovery.
+- Cell 6 crawls metadata with resume and creates `papers.jsonl`; cell 7 audits the discovered versions; cells 8–10 download, collect references and validate; cell 11 ends an optional run-scoped benchmark; cell 12 reports.
+- Metadata crawling is enabled by default for the selected range. Source downloads, S2 collection and exports remain disabled by default. Benchmark output is separate from legacy `m1_system_benchmark.csv`.
