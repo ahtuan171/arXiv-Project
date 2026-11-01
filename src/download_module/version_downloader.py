@@ -166,8 +166,7 @@ def _publish_version(stage: Path, raw_dir: Path, paper_id: str, version: str) ->
     try:
         shutil.copytree(stage, staging, symlinks=False)
         # Check every staged file before publishing; marker hashes source content.
-        checked = _status_record(staging.parent.parent, paper_id, staging.name)
-        # _status_record expects a canonical version, so verify staged bytes explicitly.
+        # Verify staged bytes before publishing.
         for file in stage.rglob("*"):
             if file.is_file():
                 rel = file.relative_to(stage)
@@ -315,7 +314,7 @@ def run_version_downloads(
     if raw.is_symlink() or (raw.exists() and not raw.is_dir()):
         raise ValueError("Unsafe raw directory")
     parent = Path(scratch_parent or ("/content" if Path("/content").is_dir() else tempfile.gettempdir()))
-    if not parent.is_dir() or str(parent.resolve()).startswith("/content/drive/"):
+    if not parent.is_dir() or parent.resolve() == data.resolve() or data.resolve() in parent.resolve().parents or str(parent.resolve()).startswith("/content/drive/"):
         raise ValueError("Scratch must be a real local directory, not Drive")
     limiter = utils.RateLimiter(max(config.ARXIV_MIN_INTERVAL, min_interval))
     events = []
@@ -367,7 +366,7 @@ def run_version_downloads(
             # replaced or deleted. Record failure, then continue.
             event = _event(paper_id, version, "failed",
                            error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start)
-        # Appending the journal is the only write outside a newly published vN.
+        # Append event only after publication; a later run can recover from the marker.
         recovery.durable_append(data / "versions_manifest.jsonl", event)
         events.append(event)
         counts[event["status"]] += 1
