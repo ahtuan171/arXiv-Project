@@ -15,8 +15,8 @@ This document describes **new outputs**. It does not modify the existing dataset
 - The version audit hashes only the expected `vN` paths and never modifies the legacy raw files, the published JSONLs, or the original CSVs. On large Drive datasets, full hash verification is slower than a lightweight metadata-only audit.
 - A paper's version count is **expected work**, not evidence that all source versions downloaded successfully.
 
-## New reference-retention output (planned for Issue #3)
-- `data/references_raw.jsonl`: all Semantic Scholar reference entries with `arxiv_id` (citing publication), `ref_index` (stable citation position if available), `ref_s2_id`, `ref_arxiv_id` (empty when unavailable), `ref_title`, `ref_authors`, `ref_submission_date`, `external_ids`, `retrieved_at`, `source_endpoint`, and `raw_cited_paper` when available. Preserve missing-identifier entries; do not silently discard.
+## Raw reference-retention output (new opt-in collector)
+- `data/references_raw.jsonl`: append-only, one entry for each original API reference position, with `arxiv_id` (citing publication), `ref_index` (stable citation position if available), `ref_s2_id`, `ref_arxiv_id` (empty when unavailable), `ref_title`, `ref_authors`, `ref_submission_date`, `external_ids`, `retrieved_at`, `source_endpoint`, and `raw_cited_paper` when available. Preserve missing-identifier entries; do not silently discard.
 - Only references with valid `ref_arxiv_id` go into the published `references.jsonl` schema.
 - Distinguish API transport success, missing metadata, unresolved references, and pagination completeness. A successful batch response is not proof that pagination is complete.
 
@@ -60,3 +60,10 @@ This document describes **new outputs**. It does not modify the existing dataset
 - The present crawler captures only the most recent revised date for most multi-version papers. Assign that single date **only to the last version**; leave dates of intermediate revisions blank. A complete `n-1` ordered revised date list may be mapped positionally.
 - **Do not copy the latest paper title, abstract, or author list to earlier historical revisions** as if they were verified. This index is not a substitute for fetching version-specific metadata and is not a claim that all revision history is complete.
 - Notebook progress bars in 2.3/2.4 report audit work processed, not source download success or legacy-match rate. Git operations in cell 1 use local `/content/arxiv-code`; persistent dataset remains on Drive.
+
+## Step 4b: raw references collector (opt-in, not a migration)
+- Notebook cell 2.6 runs `collect_raw_references(..., dry_run=True, max_papers=3)` by default. The new API collector follows **paginated GET /paper/arXiv:{id}/references**, retains original reference entries (including unresolved/null citedPaper), never filters out non-arXiv references, and uses the existing S2 rate-limit/retry transport.
+- New append-only outputs `data/references_raw.jsonl` (original entry and normalized convenience fields, with zero-based `ref_index`) and `data/references_raw_ledger.jsonl` (per-publication success/error/not-found, raw count, SHA-256, completeness). The raw file is not written until all pages are fetched. A crash between raw append and the ledger is recovered by comparing existing (paper,index) payloads and appending only missing positions; conflicting/duplicate raw keys fail closed. One writer per Drive dataset.
+- Legacy `data/references.jsonl` remains the published arXiv-to-arXiv edge file; this raw collector **does not** rebuild or change it. Existing discarded non-arXiv citations must be re-fetched, they cannot be reconstructed from published edges.
+- S2's paper-level reference response cannot establish which historical arXiv revision contained a citation. `version=null` and `version_attribution=unknown_s2_publication_level` are deliberate; never claim version-specific citations from this output.
+- Incomplete/ambiguous pagination yields an error and does **not** publish partial raw references. A short final page without API `total` is reported as `inferred_short_page`, not verified full count. Test 1–3 papers before increasing the limit; this is independent of the disabled legacy crawler.
