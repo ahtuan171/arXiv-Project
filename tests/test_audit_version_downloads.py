@@ -3,7 +3,7 @@ import csv
 import json
 
 from src.download_module.version_downloader import run_version_downloads
-from src.scripts.audit_version_downloads import audit_version_downloads, export_version_csv
+from src.scripts.audit_version_downloads import audit_version_downloads, export_version_csv, export_download_stats_csv
 
 
 def fixture_data(tmp_path):
@@ -113,3 +113,20 @@ def test_latest_manifest_event_is_used_and_orphans_reported(tmp_path):
     assert report["summary"]["not_found"] == 1
     assert report["summary"]["orphan_manifest_keys"] == 1
     assert report["rows"][1]["status"] == "not_found"
+
+def test_export_download_stats_csv_creates_table2(tmp_path):
+    data = fixture_data(tmp_path)
+    (data / 'csv' / 'm1_download_stats.csv').unlink()
+    report = audit_version_downloads(data)
+    csv_path = export_download_stats_csv(report)
+    assert csv_path == data / 'csv' / 'm1_download_stats.csv'
+    assert csv_path.is_file()
+    with csv_path.open(encoding='utf-8', newline='') as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert [r['arxiv_id'] for r in rows] == ['2501.00001', '2502.00002']
+    assert set(rows[0].keys()) == {
+        'arxiv_id', 'download_status', 'has_tex',
+        'raw_size_bytes', 'cleaned_size_bytes', 'num_tex_files', 'download_time_sec'
+    }
+

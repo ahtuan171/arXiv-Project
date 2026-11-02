@@ -4,7 +4,7 @@ import pytest
 
 import csv
 from src.crawl_references_module.raw_reference_collector import (
-    _fetch_all_pages, collect_raw_references, export_raw_reference_stats,
+    _fetch_all_pages, collect_raw_references, export_raw_reference_stats, publish_references,
 )
 
 
@@ -206,4 +206,19 @@ def test_collect_raw_references_auto_exports_csv(tmp_path):
     assert rows[0]["ref_status"] == "success"
     assert rows[0]["num_crawled_refs"] == "1"
     assert rows[0]["num_arxiv_refs"] == "1"
+
+def test_publish_references_extracts_valid_pairs(tmp_path):
+    root = tmp_path / 'data'
+    root.mkdir()
+    (root / 'references_raw.jsonl').write_text(
+        json.dumps({'arxiv_id': '2501_00001', 'ref_arxiv_id': '2401_00002', 'ref_title': 'Paper A', 'ref_authors': ['Auth']}) + '\n' +
+        json.dumps({'arxiv_id': '2501_00001', 'ref_arxiv_id': '', 'ref_title': 'Non-arxiv', 'ref_authors': []}) + '\n'
+    )
+    p = publish_references(root)
+    assert p == root / 'references.jsonl'
+    rows = [json.loads(x) for x in p.read_text(encoding='utf-8').splitlines()]
+    assert len(rows) == 1
+    assert rows[0]['arxiv_id'] == '2501_00001'
+    assert rows[0]['ref_arxiv_id'] == '2401_00002'
+    assert rows[0]['ref_title'] == 'Paper A'
 

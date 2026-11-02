@@ -413,3 +413,63 @@ def export_raw_reference_stats(
     finally:
         Path(tmp).unlink(missing_ok=True)
     return target_csv
+
+
+def publish_references(
+    data_dir: str | Path,
+    *,
+    out_path: str | Path | None = None,
+) -> Path:
+    """Publish unique verified reference edges from raw references into references.jsonl."""
+    root = Path(data_dir)
+    target = Path(out_path) if out_path is not None else root / "references.jsonl"
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise ValueError(f"Unsafe destination: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_path = root / "references_raw.jsonl"
+    existing_pairs = set()
+    rows = []
+    if target.is_file():
+        for rec in _read_records(target):
+            src, dst = rec.get("arxiv_id"), rec.get("ref_arxiv_id")
+            if src and dst and utils.is_valid_arxiv_id(src) and utils.is_valid_arxiv_id(dst):
+                pair = (utils.canonical_arxiv_id(src), utils.canonical_arxiv_id(dst))
+                if pair not in existing_pairs:
+                    existing_pairs.add(pair)
+                    rows.append(rec)
+
+    if raw_path.is_file():
+        for item in _read_records(raw_path):
+            ref_id = item.get("ref_arxiv_id")
+            citing_id = item.get("arxiv_id")
+            if not ref_id or not citing_id:
+                continue
+            if not utils.is_valid_arxiv_id(citing_id) or not utils.is_valid_arxiv_id(ref_id):
+                continue
+            canon_citing = utils.canonical_arxiv_id(citing_id)
+            canon_ref = utils.canonical_arxiv_id(ref_id)
+            pair = (canon_citing, canon_ref)
+            if pair not in existing_pairs:
+                existing_pairs.add(pair)
+                rows.append({
+                    "arxiv_id": canon_citing,
+                    "ref_arxiv_id": canon_ref,
+                    "ref_title": str(item.get("ref_title") or ""),
+                    "ref_authors": list(item.get("ref_authors") or []),
+                    "ref_submission_date": str(item.get("ref_submission_date") or ""),
+                    "ref_s2_id": str(item.get("ref_s2_id") or ""),
+                })
+
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            for r in rows:
+                stream.write(json.dumps(r, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, target)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return target
+

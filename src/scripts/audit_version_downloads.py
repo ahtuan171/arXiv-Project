@@ -192,6 +192,68 @@ def export_version_csv(report: dict[str, Any]) -> Path:
     return dest
 
 
+
+
+DOWNLOAD_STATS_COLUMNS = [
+    "arxiv_id", "download_status", "has_tex",
+    "raw_size_bytes", "cleaned_size_bytes", "num_tex_files", "download_time_sec",
+]
+
+
+def export_download_stats_csv(report: dict[str, Any], *, csv_path: str | Path | None = None) -> Path:
+    """Aggregate per-version audit rows into paper-level Table 2 (m1_download_stats.csv)."""
+    root = Path(report["data_dir"])
+    dest = Path(csv_path) if csv_path is not None else root / "csv" / "m1_download_stats.csv"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    grouped: dict[str, list[dict]] = {}
+    for r in report["rows"]:
+        grouped.setdefault(r["arxiv_id"], []).append(r)
+
+    rows = []
+    for aid, versions in sorted(grouped.items()):
+        statuses = [v.get("status") for v in versions]
+        if any(s == "success" for s in statuses):
+            status = "success"
+        elif any(s == "pdf_only" for s in statuses):
+            status = "pdf_only"
+        elif any(s == "not_found" for s in statuses):
+            status = "failed"
+        elif any(s == "failed" for s in statuses):
+            status = "failed"
+        else:
+            status = "failed"
+
+        raw_sum = sum(int(v.get("raw_size_bytes") or 0) for v in versions if v.get("raw_size_bytes"))
+        clean_sum = sum(int(v.get("cleaned_size_bytes") or 0) for v in versions if v.get("cleaned_size_bytes"))
+        tex_files = sum(int(v.get("num_tex_files") or 0) for v in versions if v.get("num_tex_files"))
+        time_sum = sum(float(v.get("download_time_sec") or 0.0) for v in versions if v.get("download_time_sec"))
+        has_tex = tex_files > 0 and status == "success"
+
+        rows.append({
+            "arxiv_id": _network_id(aid),
+            "download_status": status,
+            "has_tex": has_tex,
+            "raw_size_bytes": raw_sum,
+            "cleaned_size_bytes": clean_sum,
+            "num_tex_files": tex_files,
+            "download_time_sec": round(time_sum, 4),
+        })
+
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", dir=dest.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=DOWNLOAD_STATS_COLUMNS, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, dest)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return dest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
