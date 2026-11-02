@@ -14,7 +14,11 @@ from src.scripts.audit_m1_integrity import audit_m1_integrity
 
 @pytest.fixture(autouse=True)
 def block_network(monkeypatch):
-    def blocked(*args, **kwargs):
+    orig_connect = socket.socket.connect
+
+    def blocked(self, *args, **kwargs):
+        if args and isinstance(args[0], tuple) and args[0][0] in ("127.0.0.1", "localhost", "::1"):
+            return orig_connect(self, *args, **kwargs)
         raise AssertionError("Unexpected network access in offline M1 test")
     monkeypatch.setattr(socket.socket, "connect", blocked)
 

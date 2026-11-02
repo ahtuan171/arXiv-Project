@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -211,7 +212,10 @@ class S2ApiClient:
         base_url: str = config.S2_API_BASE,
         http_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
-        self.api_key = (api_key if api_key is not None else config.S2_API_KEY).strip()
+        if api_key is not None:
+            self.api_key = api_key.strip()
+        else:
+            self.api_key = (os.environ.get("S2_API_KEY") or getattr(config, "S2_API_KEY", "") or "").strip()
         if min_interval is None:
             min_interval = config.S2_API_MIN_INTERVAL if self.api_key else config.S2_API_ANONYMOUS_MIN_INTERVAL
         self.rate_limiter = AsyncRateLimiter(max(0.0, float(min_interval)))

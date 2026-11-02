@@ -82,6 +82,11 @@ S2_HEADLESS = os.environ.get("S2_HEADLESS", "1").strip().lower() not in ("0", "f
 
 # --- Semantic Scholar official Graph API -----------------------------------
 S2_API_KEY = os.environ.get("S2_API_KEY", "").strip()
+
+
+def get_s2_api_key() -> str:
+    """Return the active Semantic Scholar API key from environment or module attribute."""
+    return (os.environ.get("S2_API_KEY") or S2_API_KEY).strip()
 S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 # The keyed allowance is 100 requests / 5 minutes. Stay at 1 req/s by default.
 try:

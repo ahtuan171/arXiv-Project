@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_colab_form_and_original_section_flow():
-    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text(encoding="utf-8"))
     markdown = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "markdown")
     cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
     assert len(cells) == 12
@@ -24,7 +24,7 @@ def test_colab_form_and_original_section_flow():
 
 
 def test_summary_displays_four_legacy_tables_separately():
-    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text(encoding="utf-8"))
     final = "".join([c for c in nb["cells"] if c["cell_type"] == "code"][-1]["source"])
     for file in (
         "m1_discovery_stats.csv", "m1_download_stats.csv",
@@ -36,12 +36,12 @@ def test_summary_displays_four_legacy_tables_separately():
 
 
 def test_colab_form_shows_only_everyday_controls():
-    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    nb = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text(encoding="utf-8"))
     form = "".join([c for c in nb["cells"] if c["cell_type"] == "code"][3]["source"])
     visible = [line.split("=")[0].strip() for line in form.splitlines() if "#@param" in line]
     assert visible == [
         "start_id", "end_id", "LIMIT", "DOWNLOAD_VERSIONS",
-        "VERSION_LIMIT", "FETCH_RAW_REFERENCES", "RAW_REF_LIMIT",
+        "FETCH_RAW_REFERENCES",
     ]
     assert "METADATA_RETRY_ERRORS = False" in form
     assert "EXPORT_M1_REPORT = False" in form

@@ -16,8 +16,11 @@ Conflicting historical rows are NEVER overwritten automatically.
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
+import os
+import tempfile
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -210,6 +213,7 @@ def collect_raw_references(
     retry_not_found: bool = False,
     client: Any = None,
     progress_callback: ProgressFn | None = None,
+    export_csv: bool = True,
 ) -> dict:
     """Opt-in bounded collection; retry/resume keys are publication IDs.
 
@@ -241,7 +245,14 @@ def collect_raw_references(
     if dry_run:
         return {"dry_run": True, "summary": summary, "processed": []}
     if total == 0:
-        return {"dry_run": False, "summary": {**summary, "network_attempts": 0}, "processed": []}
+        csv_file = None
+        if export_csv:
+            try:
+                csv_file = export_raw_reference_stats(root)
+            except Exception as exc:
+                print(f"[Raw references] Export CSV warning: {exc}", flush=True)
+        return {"dry_run": False, "summary": {**summary, "network_attempts": 0}, "processed": [],
+                "csv_path": str(csv_file) if csv_file else None}
     if (root / "references_raw.jsonl").is_symlink() or (root / "references_raw_ledger.jsonl").is_symlink():
         raise ValueError("Refusing to write through a symlink")
 
@@ -256,24 +267,30 @@ def collect_raw_references(
                 print(f"[Raw references] Đang xử lý {number}/{total}: {aid}", flush=True)
                 previous = ledger.get(aid, {})
                 now = datetime.now(timezone.utc).isoformat()
+                t0 = time.perf_counter()
                 try:
                     entries, completeness = await _fetch_all_pages(active, paper_id)
                 except S2ApiNotFound:
+                    duration = round(time.perf_counter() - t0, 4)
                     event = {"arxiv_id": aid, "status": "not_found", "raw_refs_total": 0,
+                             "refs_with_arxiv_id": 0, "ref_time_sec": duration,
                              "fetched_at": now, "error": "HTTP 404"}
                 except S2ApiAuthError:
                     # Authentication is a global problem. Do not mark this paper
                     # "not found" or continue sending requests with bad credentials.
                     raise
                 except (S2ApiError, ValueError, OSError) as exc:
+                    duration = round(time.perf_counter() - t0, 4)
                     blocked = isinstance(exc, S2ApiPermanentError)
                     state = "blocked" if blocked else "error"
                     detail = recovery.progress_entry(aid, state, previous, error=str(exc))
                     event = {"arxiv_id": aid, "status": state, "raw_refs_total": 0,
+                             "refs_with_arxiv_id": 0, "ref_time_sec": duration,
                              "fetched_at": now, "error": str(exc),
                              "attempts": detail["attempts"],
                              "next_retry_at": detail["next_retry_at"]}
                 else:
+                    duration = round(time.perf_counter() - t0, 4)
                     rows = [_raw_record(paper_id, i, item, now) for i, item in enumerate(entries)]
                     existing = raw.setdefault(aid, {})
                     if any(i >= len(rows) for i in existing):
@@ -282,9 +299,11 @@ def collect_raw_references(
                            for i in existing):
                         raise ValueError(f"Raw reference content changed for {aid}; manual reconciliation required")
                     missing = [row for row in rows if row["ref_index"] not in existing]
+                    refs_with_arxiv = sum(bool(row["ref_arxiv_id"]) for row in rows)
                     event = {"arxiv_id": aid, "status": "ok",
                              "raw_refs_total": len(rows),
-                             "refs_with_arxiv_id": sum(bool(row["ref_arxiv_id"]) for row in rows),
+                             "refs_with_arxiv_id": refs_with_arxiv,
+                             "ref_time_sec": duration,
                              "payload_sha256": _digest(rows),
                              "completeness": completeness, "fetched_at": now, "error": ""}
                     # Append only after ALL pages verified; event comes last.
@@ -321,6 +340,76 @@ def collect_raw_references(
         with ThreadPoolExecutor(max_workers=1) as pool:
             processed = pool.submit(lambda: asyncio.run(_execute())).result()
     counts = Counter(event["status"] for event in processed)
+    csv_file = None
+    if export_csv:
+        try:
+            csv_file = export_raw_reference_stats(root)
+        except Exception as exc:
+            print(f"[Raw references] Export CSV warning: {exc}", flush=True)
     return {"dry_run": False,
             "summary": {**summary, **dict(counts), "network_attempts": len(processed)},
-            "processed": processed}
+            "processed": processed,
+            "csv_path": str(csv_file) if csv_file else None}
+
+
+def export_raw_reference_stats(
+    data_dir: str | Path,
+    *,
+    csv_path: str | Path | None = None,
+    ids: Iterable[str] | None = None,
+) -> Path:
+    """Atomically write Table 3 (m1_reference_stats.csv) snapshot matching project specs."""
+    root = Path(data_dir)
+    target_csv = Path(csv_path) if csv_path is not None else root / "csv" / "m1_reference_stats.csv"
+    if target_csv.is_symlink() or (target_csv.exists() and not target_csv.is_file()):
+        raise ValueError(f"Unsafe destination: {target_csv}")
+    target_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    raw, ledger = _load_state(root)
+    if ids is not None:
+        target_aids = {utils.canonical_arxiv_id(str(x)) for x in ids if utils.canonical_arxiv_id(str(x)) in ledger}
+    else:
+        target_aids = set(ledger.keys())
+
+    rows = []
+    for aid in sorted(target_aids):
+        event = ledger.get(aid, {})
+        status = event.get("status", "pending")
+        if status == "ok":
+            ref_status = "success"
+        elif status == "not_found":
+            ref_status = "not_found"
+        elif status in {"error", "blocked"}:
+            ref_status = "failed"
+        else:
+            ref_status = "failed"
+
+        crawled = int(event.get("raw_refs_total") if event.get("raw_refs_total") is not None else len(raw.get(aid, {})))
+        if "refs_with_arxiv_id" in event:
+            arxiv_refs = int(event["refs_with_arxiv_id"])
+        else:
+            arxiv_refs = sum(bool(r.get("ref_arxiv_id")) for r in raw.get(aid, {}).values())
+
+        duration = round(float(event.get("ref_time_sec") or 0.0), 4)
+
+        rows.append({
+            "arxiv_id": _network_id(aid),
+            "ref_status": ref_status,
+            "num_crawled_refs": crawled,
+            "num_arxiv_refs": arxiv_refs,
+            "ref_time_sec": duration,
+        })
+
+    fieldnames = ["arxiv_id", "ref_status", "num_crawled_refs", "num_arxiv_refs", "ref_time_sec"]
+    fd, tmp = tempfile.mkstemp(prefix=f".{target_csv.name}.", dir=target_csv.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, target_csv)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return target_csv

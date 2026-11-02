@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def cells():
-    n = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text())
+    n = json.loads((ROOT / "src/milestone1_pipeline.ipynb").read_text(encoding="utf-8"))
     return ["".join(c["source"]) for c in n["cells"] if c["cell_type"] == "code"]
 
 

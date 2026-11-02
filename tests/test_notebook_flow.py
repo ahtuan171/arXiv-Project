@@ -7,7 +7,7 @@ NOTEBOOK = Path(__file__).resolve().parents[1] / 'src/milestone1_pipeline.ipynb'
 
 
 def test_setup_and_collection_steps_are_separate_and_ordered():
-    notebook = json.loads(NOTEBOOK.read_text())
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     codes = [''.join(cell['source']) for cell in notebook['cells'] if cell['cell_type'] == 'code']
     assert len(codes) == 12
     anchors = [

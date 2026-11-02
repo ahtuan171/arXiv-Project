@@ -1,3 +1,4 @@
+import pytest
 """Offline tests for read-only legacy source comparison."""
 import io
 import json
@@ -115,8 +116,11 @@ def test_symlink_or_extra_file_cannot_prove_match(tmp_path):
     (legacy / "unexpected.zip").write_bytes(b"bad")
     assert audit_legacy_matches(data, ids=["2501.00001"])["summary"]["untrusted"] == 1
     (legacy / "unexpected.zip").unlink()
-    (legacy / "linked.tex").symlink_to(legacy / "main.tex")
-    assert audit_legacy_matches(data, ids=["2501.00001"])["summary"]["untrusted"] == 1
+    try:
+        (legacy / "linked.tex").symlink_to(legacy / "main.tex")
+        assert audit_legacy_matches(data, ids=["2501.00001"])["summary"]["untrusted"] == 1
+    except OSError:
+        pytest.skip("Symlink creation not permitted on this system")
 
 
 def test_unverified_version_does_not_prove_match(tmp_path):

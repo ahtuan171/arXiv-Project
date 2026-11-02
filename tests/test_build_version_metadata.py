@@ -99,9 +99,12 @@ def test_export_rejects_symlink(tmp_path):
     root = fixture_data(tmp_path, [
         {"arxiv_id": "2501_00001", "title": "One", "versions": ["v1"]},
     ])
-    (root / "metadata_versions.jsonl").symlink_to(root / "papers.jsonl")
-    with pytest.raises(ValueError):
-        export_version_metadata(build_version_metadata(root))
+    try:
+        (root / "metadata_versions.jsonl").symlink_to(root / "papers.jsonl")
+        with pytest.raises(ValueError):
+            export_version_metadata(build_version_metadata(root))
+    except OSError:
+        pytest.skip("Symlink creation not permitted on this system")
     assert json.loads((root / "papers.jsonl").read_text().splitlines()[0])["title"] == "One"
 
 

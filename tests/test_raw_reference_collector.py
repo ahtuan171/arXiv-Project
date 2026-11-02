@@ -2,8 +2,9 @@
 import json
 import pytest
 
+import csv
 from src.crawl_references_module.raw_reference_collector import (
-    _fetch_all_pages, collect_raw_references,
+    _fetch_all_pages, collect_raw_references, export_raw_reference_stats,
 )
 
 
@@ -167,3 +168,42 @@ def test_corrupted_jsonl_refuses_writes(tmp_path):
     (root / "references_raw.jsonl").write_text('{"arxiv_id":')
     with pytest.raises(ValueError, match="Invalid JSONL"):
         collect_raw_references(root, ids=["2501.00001"], dry_run=False, client=Pages({}))
+
+def test_export_raw_reference_stats_creates_table3_csv(tmp_path):
+    root = data(tmp_path)
+    (root / "references_raw_ledger.jsonl").write_text(
+        json.dumps({"arxiv_id": "2501_00001", "status": "ok", "raw_refs_total": 5, "refs_with_arxiv_id": 3, "ref_time_sec": 0.1234}) + "\n" +
+        json.dumps({"arxiv_id": "2501_00002", "status": "not_found", "raw_refs_total": 0, "refs_with_arxiv_id": 0, "ref_time_sec": 0.05}) + "\n" +
+        json.dumps({"arxiv_id": "2501_00003", "status": "error", "raw_refs_total": 0, "refs_with_arxiv_id": 0, "ref_time_sec": 0.01}) + "\n"
+    )
+    csv_p = export_raw_reference_stats(root)
+    assert csv_p == root / "csv" / "m1_reference_stats.csv"
+    assert csv_p.is_file()
+
+    with open(csv_p, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 3
+    assert [r["arxiv_id"] for r in rows] == ["2501.00001", "2501.00002", "2501.00003"]
+    assert [r["ref_status"] for r in rows] == ["success", "not_found", "failed"]
+    assert [r["num_crawled_refs"] for r in rows] == ["5", "0", "0"]
+    assert [r["num_arxiv_refs"] for r in rows] == ["3", "0", "0"]
+    assert [r["ref_time_sec"] for r in rows] == ["0.1234", "0.05", "0.01"]
+
+
+def test_collect_raw_references_auto_exports_csv(tmp_path):
+    root = data(tmp_path)
+    client = Pages({
+        ("2501.00001", 0): {"data": [{"citedPaper": {"paperId": "p1", "externalIds": {"ArXiv": "2401.00001"}}}], "total": 1, "next": None}
+    })
+    result = collect_raw_references(root, ids=["2501.00001"], dry_run=False, client=client)
+    assert result["csv_path"] == str(root / "csv" / "m1_reference_stats.csv")
+    csv_p = root / "csv" / "m1_reference_stats.csv"
+    assert csv_p.is_file()
+    with open(csv_p, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["arxiv_id"] == "2501.00001"
+    assert rows[0]["ref_status"] == "success"
+    assert rows[0]["num_crawled_refs"] == "1"
+    assert rows[0]["num_arxiv_refs"] == "1"
+

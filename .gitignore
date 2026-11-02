@@ -28,3 +28,6 @@ book/_build/
 .DS_Store
 
 Project_description/
+
+# Agent plans & scratch
+docs/superpowers/

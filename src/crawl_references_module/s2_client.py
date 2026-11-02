@@ -67,8 +67,8 @@ class S2Paper:
     arxiv_id: Optional[str]
     title: str
     authors: list[str]
-    year: Optional[int]
-    publication_date: Optional[str]
+    year: Optional[int] = None
+    publication_date: Optional[str] = None
 
 
 _PAPER_PATH_RE = re.compile(r"/paper/([0-9a-f]{40})")
