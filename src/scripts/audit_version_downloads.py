@@ -29,6 +29,7 @@ from src.download_module.version_downloader import (
     _latest_version_events,
     _network_id,
     _status_record,
+    _save_audit_cache,
 )
 from src.scripts.audit_missing_versions import _latest_jsonl, _valid_meta, _versions
 
@@ -43,11 +44,15 @@ ProgressFn = Callable[[int, int, dict], None]
 
 
 def _audit_single_version(
-    args: tuple[str, str, dict, str, Path],
+    args: tuple,
 ) -> tuple[dict, str | None, str | None, str | None]:
-    paper_id, version, event, url, raw_dir = args
+    if len(args) == 6:
+        paper_id, version, event, url, raw_dir, fast = args
+    else:
+        paper_id, version, event, url, raw_dir = args
+        fast = False
     manifest_status = str(event.get("status") or "")
-    state = _status_record(raw_dir, paper_id, version)
+    state = _status_record(raw_dir, paper_id, version, fast=fast)
     record = {
         "arxiv_id": paper_id, "version": version,
         "status": "pending", "verification": "not_applicable",
@@ -94,6 +99,7 @@ def audit_version_downloads(
     progress_callback: ProgressFn | None = None,
     max_workers: int | None = None,
     ids: Iterable[str] | None = None,
+    fast: bool = False,
 ) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
@@ -131,7 +137,7 @@ def audit_version_downloads(
     progress_done = 0
     warned_progress = False
 
-    items_to_audit: list[tuple[str, str, dict, str, Path]] = []
+    items_to_audit: list[tuple[str, str, dict, str, Path, bool]] = []
     for paper_id in paper_keys:
         paper = papers[paper_id]
         if not _valid_meta(paper):
@@ -149,9 +155,9 @@ def audit_version_downloads(
             expected.add(key)
             event = history.get(key, {})
             url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
-            items_to_audit.append((paper_id, version, event, url, root / "raw"))
+            items_to_audit.append((paper_id, version, event, url, root / "raw", fast))
 
-    workers = max_workers if max_workers is not None else min(16, max(4, (os.cpu_count() or 4) * 2))
+    workers = max_workers if max_workers is not None else min(8, max(2, (os.cpu_count() or 2)))
     if len(items_to_audit) <= 1 or workers <= 1:
         iterator = map(_audit_single_version, items_to_audit)
         executor = None
@@ -184,6 +190,7 @@ def audit_version_downloads(
     finally:
         if executor is not None:
             executor.shutdown(wait=False)
+        _save_audit_cache()
 
     orphan_keys = set(history).difference(expected)
     counters["orphan_manifest_keys"] = len(orphan_keys)

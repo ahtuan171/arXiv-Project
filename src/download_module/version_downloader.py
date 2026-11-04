@@ -72,12 +72,45 @@ def _save_marker_cache() -> None:
 
 
 _load_marker_cache()
+
+_AUDIT_CACHE_FILE = (
+    Path("/content/.m1_audit_cache.json")
+    if Path("/content").is_dir()
+    else Path(tempfile.gettempdir()) / ".m1_audit_cache.json"
+)
+_AUDIT_HASH_CACHE: dict[str, dict] = {}
+
+
+def _load_audit_cache() -> None:
+    if not _AUDIT_CACHE_FILE.is_file():
+        return
+    try:
+        data = json.loads(_AUDIT_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _AUDIT_HASH_CACHE.update(data)
+    except Exception:
+        pass
+
+
+def _save_audit_cache() -> None:
+    try:
+        if len(_AUDIT_HASH_CACHE) > 10000:
+            keys = list(_AUDIT_HASH_CACHE.keys())[-10000:]
+            data = {k: _AUDIT_HASH_CACHE[k] for k in keys}
+        else:
+            data = _AUDIT_HASH_CACHE
+        _AUDIT_CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_load_audit_cache()
 FetchFn = Callable[[str], tuple[str, bytes, str, str]]
 ProgressFn = Callable[[int, int, dict], None]
 
 
 def _sha256(path: Path) -> str:
-    with path.open("rb") as src:
+    with path.open("rb", buffering=256 * 1024) as src:
         if hasattr(hashlib, "file_digest"):
             return hashlib.file_digest(src, "sha256").hexdigest()
         result = hashlib.sha256()
@@ -181,6 +214,69 @@ def _status_record(
         return {"status": "conflict", "error": "destination is not a regular directory"}
     if not marker.is_file() or marker.is_symlink():
         return {"status": "conflict", "error": "existing version has no trusted verification marker"}
+
+    # Single-pass directory scan for fast structure check and cache validation
+    try:
+        with os.scandir(target) as it:
+            dir_map = {e.name: e for e in it}
+    except OSError as exc:
+        return {"status": "conflict", "error": f"destination unreadable: {exc}"}
+
+    marker_entry = dir_map.get(_MARKER)
+    if marker_entry is None or not marker_entry.is_file() or marker_entry.is_symlink():
+        return {"status": "conflict", "error": "existing version has no trusted verification marker"}
+
+    target_key = str(target.resolve())
+    try:
+        mst = marker_entry.stat()
+    except OSError as exc:
+        return {"status": "conflict", "error": f"marker unreadable: {exc}"}
+
+    # Check if previously verified by full hash audit and files are strictly unmodified
+    cached = _AUDIT_HASH_CACHE.get(target_key)
+    if (
+        cached
+        and cached.get("marker_mtime_ns") == mst.st_mtime_ns
+        and cached.get("marker_size") == mst.st_size
+    ):
+        cached_files = cached.get("files", {})
+        valid_cache = True
+        for rel, (c_mtime, c_size) in cached_files.items():
+            if "/" not in rel and "\\" not in rel:
+                fe = dir_map.get(rel)
+                if fe is None or fe.is_symlink() or not fe.is_file():
+                    valid_cache = False
+                    break
+                try:
+                    fst = fe.stat()
+                    if fst.st_size != c_size or fst.st_mtime_ns != c_mtime:
+                        valid_cache = False
+                        break
+                except OSError:
+                    valid_cache = False
+                    break
+            else:
+                item = target / rel
+                if item.is_symlink() or not item.is_file():
+                    valid_cache = False
+                    break
+                try:
+                    fst = item.stat()
+                    if fst.st_size != c_size or fst.st_mtime_ns != c_mtime:
+                        valid_cache = False
+                        break
+                except OSError:
+                    valid_cache = False
+                    break
+        if valid_cache:
+            # Check unexpected flat files
+            flat_cached = {k for k in cached_files if "/" not in k and "\\" not in k}
+            flat_actual = {k for k in dir_map if k != _MARKER}
+            if flat_cached == flat_actual:
+                res = cached.get("result")
+                if res and res.get("status") in {"success", "pdf_only"}:
+                    return res
+
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
         if payload.get("arxiv_id") != paper_id or payload.get("version") != version:
@@ -193,6 +289,7 @@ def _status_record(
             raise ValueError("marker files missing")
         seen = set()
         tex_count = 0
+        files_state = {}
         for record in records:
             rel = record["path"]
             if not isinstance(rel, str) or not rel or rel.startswith("/") or "\\" in rel:
@@ -206,9 +303,11 @@ def _status_record(
             item = target / rel
             if item.is_symlink() or not item.is_file():
                 raise ValueError("missing/untrusted source file")
-            if item.stat().st_size != record["bytes"] or _sha256(item) != record["sha256"]:
+            st = item.stat()
+            if st.st_size != record["bytes"] or _sha256(item) != record["sha256"]:
                 raise ValueError("source checksum mismatch")
-            tex_count += int(rel.lower().endswith(".tex") and item.stat().st_size > 0)
+            files_state[rel] = (st.st_mtime_ns, st.st_size)
+            tex_count += int(rel.lower().endswith(".tex") and st.st_size > 0)
         if status == "success" and tex_count < 1:
             raise ValueError("success marker without nonempty TeX")
         if status == "pdf_only" and records:
@@ -228,7 +327,14 @@ def _status_record(
                     raise ValueError("symlink present")
         if actual_files != seen:
             raise ValueError("unexpected or missing files")
-        return {"status": status, "marker": payload}
+        result = {"status": status, "marker": payload}
+        _AUDIT_HASH_CACHE[target_key] = {
+            "marker_mtime_ns": mst.st_mtime_ns,
+            "marker_size": mst.st_size,
+            "files": files_state,
+            "result": result,
+        }
+        return result
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         return {"status": "conflict", "error": f"unverified existing version: {exc}"}
 
