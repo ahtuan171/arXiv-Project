@@ -29,7 +29,7 @@ from src.download_module.version_downloader import (
     _network_id,
     _status_record,
 )
-from src.scripts.audit_missing_versions import _id, _latest_jsonl, _valid_meta, _versions
+from src.scripts.audit_missing_versions import _latest_jsonl, _valid_meta, _versions
 
 COLUMNS = [
     "arxiv_id", "version", "status", "verification", "manifest_status",
@@ -44,14 +44,11 @@ ProgressFn = Callable[[int, int, dict], None]
 def audit_version_downloads(
     data_dir: str | Path, *, sample_size: int = 10,
     progress_callback: ProgressFn | None = None,
-    verify_hashes: bool = True,
-    ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
-    This is read-only. When verify_hashes is True, it checks file hashes (can
-    take time on Drive FUSE). When verify_hashes is False, it verifies marker
-    and file size.
+    This is read-only and intentionally checks hashes; on a large Drive folder,
+    it can take time. No API requests, no legacy source enumeration or writes.
     """
     if sample_size < 0:
         raise ValueError("sample_size must be >= 0")
@@ -64,9 +61,6 @@ def audit_version_downloads(
     for paper_id, row in _latest_jsonl(root / "papers.jsonl.journal").items():
         if _valid_meta(row) or not _valid_meta(papers.get(paper_id)):
             papers[paper_id] = row
-    if ids is not None:
-        target_ids = {_id(x) for x in ids}
-        papers = {k: v for k, v in papers.items() if _id(k) in target_ids}
     history = _latest_version_events(root / "versions_manifest.jsonl")
 
     rows: list[dict] = []
@@ -99,7 +93,7 @@ def audit_version_downloads(
             expected.add(key)
             event = history.get(key, {})
             manifest_status = str(event.get("status") or "")
-            state = _status_record(root / "raw", paper_id, version, verify_hashes=verify_hashes)
+            state = _status_record(root / "raw", paper_id, version)
             url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
             record = {
                 "arxiv_id": paper_id, "version": version,
@@ -265,11 +259,8 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--export", action="store_true", help="Atomically refresh new version CSV")
     parser.add_argument("--sample-size", type=int, default=10)
-    parser.add_argument("--fast", action="store_true", help="Skip SHA-256 recalculation (marker + size only)")
     args = parser.parse_args()
-    report = audit_version_downloads(
-        args.data_dir, sample_size=args.sample_size, verify_hashes=not args.fast
-    )
+    report = audit_version_downloads(args.data_dir, sample_size=args.sample_size)
     print(json.dumps({"summary": report["summary"], "issues": report["sample_issues"]},
                      ensure_ascii=False, indent=2))
     if args.export:

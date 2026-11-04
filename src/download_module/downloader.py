@@ -18,7 +18,6 @@ import io
 import logging
 import os
 import random
-import re
 import shutil
 import tarfile
 import time
@@ -34,7 +33,7 @@ from src.utils import RateLimiter, parse_arxiv_range
 
 logger = logging.getLogger(__name__)
 
-ARXIV_SRC_URL = "https://export.arxiv.org/src/{arxiv_id}"
+ARXIV_SRC_URL = "https://arxiv.org/src/{arxiv_id}"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) arXiv-Project/1.0 (academic research)"
 
 # Default rate limiter enforcing the mandatory 3-second delay
@@ -236,7 +235,6 @@ def download_single_paper(
     jitter: float = config.JITTER,
     staging_dir: Optional[Path] = None,
     lock: bool = True,
-    target_dir: Optional[Path] = None,
 ) -> DownloadStats:
     """Download, extract, and clean the source files of a single arXiv paper.
 
@@ -283,16 +281,7 @@ def download_single_paper(
     lock_ctx = utils.file_lock(raw_dir / f".{clean_arxiv_id(arxiv_id)}.download.lock") if lock else contextlib.nullcontext()
     with lock_ctx:
         t0 = time.perf_counter()
-        if target_dir is not None:
-            paper_dir = target_dir
-        elif re.search(r"v[1-9]\d*$", arxiv_id):
-            match = re.match(r"^(.*?)(v[1-9]\d*)$", arxiv_id)
-            base_part, version_part = match.group(1), match.group(2)
-            paper_dir = raw_dir / clean_arxiv_id(base_part) / version_part
-        else:
-            paper_dir = raw_dir / clean_arxiv_id(arxiv_id)
-
-        paper_dir.parent.mkdir(parents=True, exist_ok=True)
+        paper_dir = raw_dir / clean_arxiv_id(arxiv_id)
         _recover_source(paper_dir, cleanup_staging=True)
 
         def failed(error_type: str, message: str, size: int = 0) -> DownloadStats:
@@ -383,7 +372,7 @@ def download_single_paper(
             if retry_after is not None:
                 delay = min(max(config.ARXIV_MIN_INTERVAL, float(retry_after)), config.MAX_RETRY_AFTER)
             elif is_429:
-                delay = min(max(30.0, 30.0 * (2 ** (attempt - 1))), max_backoff)
+                delay = min(max(6.0, 6.0 * (2 ** (attempt - 1))), max_backoff)
             else:
                 delay = min(max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt), max_backoff)
             if jitter > 0:
@@ -434,8 +423,6 @@ def download_papers_range(
     staging_dir: Optional[Path] = None,
     lock: bool = False,
     alt_raw_dir: Optional[Union[Path, str]] = None,
-    metadata_path: Optional[Union[Path, str]] = None,
-    download_all_versions: bool = True,
 ) -> pd.DataFrame:
     """Download, extract, and clean a range of arXiv papers, recording Table 2 statistics.
 
@@ -485,32 +472,6 @@ def download_papers_range(
     else:
         raise ValueError("Must provide either id_list or both start_id and end_id")
 
-    # Tải danh sách version từ metadata nếu được bật
-    metadata_file = Path(metadata_path) if metadata_path is not None else (config.DATA_DIR / "papers.jsonl")
-    paper_versions: dict[str, list[str]] = {}
-    if download_all_versions and metadata_file.is_file():
-        try:
-            for row in utils.read_jsonl(metadata_file):
-                aid = row.get("arxiv_id")
-                vers = row.get("versions")
-                if aid and isinstance(vers, list) and vers:
-                    paper_versions[utils.canonical_arxiv_id(aid)] = [str(v) for v in vers]
-        except Exception as e:
-            logger.warning("Không thể đọc metadata phiên bản từ %s: %s", metadata_file, e)
-
-    expanded_target_ids: list[str] = []
-    for arxiv_id in target_ids:
-        canon_id = utils.canonical_arxiv_id(arxiv_id)
-        if download_all_versions and canon_id in paper_versions:
-            vers = paper_versions[canon_id]
-            norm_base = utils.normalize_arxiv_id(arxiv_id) or arxiv_id
-            base_clean = re.sub(r"v[1-9]\d*$", "", norm_base)
-            for v in vers:
-                expanded_target_ids.append(f"{base_clean}{v}")
-        else:
-            expanded_target_ids.append(arxiv_id)
-    target_ids = expanded_target_ids
-
     records = recovery.load_stats(jsonl_file, csv_file)
     ledger = recovery.RecoveryLedger(csv_file.with_suffix(".ledger.jsonl"))
     existing_alt_ids: set[str] = set()
@@ -524,36 +485,18 @@ def download_papers_range(
     pending = []
     for arxiv_id in dict.fromkeys(target_ids):
         key = clean_arxiv_id(arxiv_id)
-        if re.search(r"v[1-9]\d*$", arxiv_id):
-            match = re.match(r"^(.*?)(v[1-9]\d*)$", arxiv_id)
-            base_part, version_part = match.group(1), match.group(2)
-            clean_base = clean_arxiv_id(base_part)
-            paper_dir = raw_dir / clean_base / version_part
-            alt_paper_dir = (Path(alt_raw_dir) / clean_base / version_part) if alt_raw_dir else None
-            legacy_dir = raw_dir / clean_base
-            alt_legacy_dir = (Path(alt_raw_dir) / clean_base) if alt_raw_dir else None
-        else:
-            paper_dir = raw_dir / key
-            alt_paper_dir = (Path(alt_raw_dir) / key) if alt_raw_dir else None
-            legacy_dir = None
-            alt_legacy_dir = None
-
+        paper_dir = raw_dir / key
         previous = ledger.get(arxiv_id)
         old = records.get(key, {})
         if previous is None:
             status = {"success": "ok", "pdf_only": "pdf_only"}.get(old.get("download_status"), "error")
             previous = {"status": status}
-        paper_exists = (
-            paper_dir.exists()
-            or (alt_paper_dir is not None and alt_paper_dir.exists())
-            or (legacy_dir is not None and legacy_dir.exists() and (legacy_dir / "main.tex").exists() and arxiv_id.endswith("v1"))
-            or (alt_legacy_dir is not None and alt_legacy_dir.exists() and (alt_legacy_dir / "main.tex").exists() and arxiv_id.endswith("v1"))
-        )
+        paper_exists = paper_dir.exists() or (key in existing_alt_ids)
         if previous.get("status") in {"ok", "pdf_only"} and not paper_exists:
             previous = None
         if not resume or not recovery.should_skip(previous, retry_errors=retry_errors,
                 retry_not_found=retry_not_found, retry_partial=retry_partial):
-            if paper_dir.with_name(f".{paper_dir.name}.backup").exists():
+            if paper_dir.with_name(f".{key}.backup").exists():
                 lock_ctx = utils.file_lock(raw_dir / f".{key}.download.lock") if lock else contextlib.nullcontext()
                 with lock_ctx:
                     _recover_source(paper_dir)
