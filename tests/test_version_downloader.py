@@ -344,4 +344,59 @@ def test_plan_and_run_alt_raw_dir_lookup(tmp_path):
     assert (scratch_data / "versions_manifest.jsonl").is_file()
 
 
+def test_request_source_429_backoff_cooldown(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.download_module.version_downloader import _request_source
+
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    resp_429 = MagicMock()
+    resp_429.status_code = 429
+    resp_429.headers = {}
+    resp_429.close = MagicMock()
+
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.headers = {"Content-Type": "application/pdf", "Content-Length": "10"}
+    resp_200.iter_content = lambda chunk_size=1024: [b"%PDF-1.4 test"]
+    resp_200.close = MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [resp_429, resp_200]
+
+    rate_limit_notified = []
+    status, body, ctype, err = _request_source(
+        "https://export.arxiv.org/src/2501.00001v1",
+        session=mock_session, attempts=2,
+        on_rate_limit=lambda: rate_limit_notified.append(True),
+    )
+    assert status == "ok"
+    assert len(rate_limit_notified) == 1
+    assert len(sleeps) == 1
+    assert sleeps[0] >= 35.0
+
+
+def test_run_version_downloads_429_outer_cooldown(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    data = fixture_data(tmp_path)
+    # Both v1 and v2 need download. Fetch v1 returns 429, v2 returns ok
+    def fetch_mock(url):
+        if url.endswith("v1"):
+            return "failed", b"", "", "HTTP 429"
+        return "ok", b"%PDF-1.4", "application/pdf", ""
+
+    report = run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=2, dry_run=False,
+        scratch_parent=tmp_path, fetch=fetch_mock,
+    )
+    assert report["summary"]["failed"] == 1
+    assert report["summary"]["pdf_only"] == 1
+    # Check that outer loop triggered a cooldown sleep for 429 before starting v2
+    assert any(s >= 30.0 for s in sleeps)
+
+
+
 

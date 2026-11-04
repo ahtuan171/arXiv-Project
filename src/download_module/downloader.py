@@ -383,7 +383,7 @@ def download_single_paper(
             if retry_after is not None:
                 delay = min(max(config.ARXIV_MIN_INTERVAL, float(retry_after)), config.MAX_RETRY_AFTER)
             elif is_429:
-                delay = min(max(6.0, 6.0 * (2 ** (attempt - 1))), max_backoff)
+                delay = min(max(30.0, 30.0 * (2 ** (attempt - 1))), max_backoff)
             else:
                 delay = min(max(config.ARXIV_MIN_INTERVAL, backoff_base ** attempt), max_backoff)
             if jitter > 0:
