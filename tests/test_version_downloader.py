@@ -256,3 +256,22 @@ def test_dry_run_respects_skip_flags_without_writing(tmp_path):
     assert result["plan"]["summary"]["known_not_found"] == 1
     assert result["plan"]["summary"]["to_download"] == 1
     assert manifest.read_bytes() == before
+
+
+def test_status_record_fast_mode_skips_full_hashing(tmp_path):
+    from src.download_module.version_downloader import _status_record
+    data = fixture_data(tmp_path)
+    run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=1,
+        dry_run=False, scratch_parent=tmp_path,
+        fetch=lambda _: ("ok", tex_archive(), "application/x-eprint-tar", ""),
+    )
+    # fast=True validates structure and files without full sha256 loop
+    fast_check = _status_record(data / "raw", "2501_00001", "v1", fast=True)
+    assert fast_check is not None
+    assert fast_check["status"] == "success"
+    # full verification also passes
+    full_check = _status_record(data / "raw", "2501_00001", "v1", fast=False)
+    assert full_check is not None
+    assert full_check["status"] == "success"
+

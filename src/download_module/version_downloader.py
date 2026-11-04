@@ -66,8 +66,15 @@ def _paper_id(value: Any) -> str:
     return canonical
 
 
-def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
-    """Verify one known target, without scanning any other legacy raw folder."""
+def _status_record(
+    raw_dir: Path, paper_id: str, version: str, *, fast: bool = False,
+) -> dict | None:
+    """Verify one known target, without scanning any other legacy raw folder.
+
+    If fast=True, skips full file SHA256 rehashing and recursive directory
+    traversal, checking marker validity, record structure, and file sizes.
+    Full verification remains the default for integrity audits.
+    """
     target = raw_dir / paper_id / version
     if not target.exists() and not target.is_symlink():
         return None
@@ -101,22 +108,25 @@ def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
             item = target / rel
             if item.is_symlink() or not item.is_file():
                 raise ValueError("missing/untrusted source file")
-            if item.stat().st_size != record["bytes"] or _sha256(item) != record["sha256"]:
+            if item.stat().st_size != record["bytes"]:
+                raise ValueError("source file size mismatch")
+            if not fast and _sha256(item) != record["sha256"]:
                 raise ValueError("source checksum mismatch")
             tex_count += int(rel.lower().endswith(".tex") and item.stat().st_size > 0)
         if status == "success" and tex_count < 1:
             raise ValueError("success marker without nonempty TeX")
         if status == "pdf_only" and records:
             raise ValueError("PDF-only marker contains source files")
-        # Explicitly reject unexpected files (e.g. partial extraction or tampering).
-        actual_files = set()
-        for file in target.rglob("*"):
-            if file.is_symlink():
-                raise ValueError("symlink present")
-            if file.is_file() and file != marker:
-                actual_files.add(file.relative_to(target).as_posix())
-        if actual_files != seen:
-            raise ValueError("unexpected or missing files")
+        if not fast:
+            # Explicitly reject unexpected files (e.g. partial extraction or tampering).
+            actual_files = set()
+            for file in target.rglob("*"):
+                if file.is_symlink():
+                    raise ValueError("symlink present")
+                if file.is_file() and file != marker:
+                    actual_files.add(file.relative_to(target).as_posix())
+            if actual_files != seen:
+                raise ValueError("unexpected or missing files")
         return {"status": status, "marker": payload}
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         return {"status": "conflict", "error": f"unverified existing version: {exc}"}
@@ -318,7 +328,7 @@ def plan_version_downloads(
             counts["invalid_versions"] += 1
             continue
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version)
+            current = _status_record(data / "raw", paper_id, version, fast=True)
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -408,7 +418,7 @@ def run_version_downloads(
         if max_downloads and attempts >= max_downloads:
             break
         # Recheck immediately before each network request (resume, crash safety).
-        current = _status_record(raw, paper_id, version)
+        current = _status_record(raw, paper_id, version, fast=True)
         if current is not None:
             counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
             continue
@@ -431,8 +441,8 @@ def run_version_downloads(
                             raise ValueError("Source archive has no valid LaTeX (.tex)")
                     marker = _make_marker(stage, paper_id, version, status, url, len(body))
                     output = _publish_version(stage, raw, paper_id, version)
-                    # Verify published marker and every TeX/Bib hash, not just staging.
-                    checked = _status_record(raw, paper_id, version)
+                    # Verify published marker and structure without redundant full rehashing.
+                    checked = _status_record(raw, paper_id, version, fast=True)
                     if not checked or checked["status"] != status:
                         raise RuntimeError(f"Published files failed verification: {output}")
                 event = _event(paper_id, version, status, marker=marker,

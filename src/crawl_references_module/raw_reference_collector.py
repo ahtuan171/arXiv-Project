@@ -416,6 +416,10 @@ def collect_raw_references(
                     batch_elapsed = max(0.0, time.perf_counter() - t0)
                     per_item_time = round(batch_elapsed / max(1, len(batch_papers)), 4)
 
+                    batch_records: list[dict] = []
+                    batch_events: list[dict] = []
+                    callbacks_to_fire: list[tuple[int, int, dict]] = []
+
                     for offset, (paper_id, entries) in enumerate(batch_out):
                         number = b_start + offset + 1
                         aid = utils.canonical_arxiv_id(paper_id)
@@ -430,14 +434,10 @@ def collect_raw_references(
                                 "fetched_at": now,
                                 "error": "HTTP 404",
                             }
-                            recovery.durable_append(root / "references_raw_ledger.jsonl", event)
+                            batch_events.append(event)
                             ledger[aid] = event
                             results.append(event)
-                            if progress_callback is not None:
-                                try:
-                                    progress_callback(number, total, event)
-                                except Exception as exc:
-                                    print(f"[Raw references] progress callback warning: {exc}", flush=True)
+                            callbacks_to_fire.append((number, total, event))
                         else:
                             rows = [_raw_record(paper_id, i, item, now) for i, item in enumerate(entries)]
                             existing = raw.setdefault(aid, {})
@@ -458,15 +458,25 @@ def collect_raw_references(
                                 "fetched_at": now,
                                 "error": "",
                             }
-                            _append(root, missing, event)
+                            batch_records.extend(missing)
+                            batch_events.append(event)
                             existing.update({r["ref_index"]: r for r in missing})
                             ledger[aid] = event
                             results.append(event)
-                            if progress_callback is not None:
-                                try:
-                                    progress_callback(number, total, event)
-                                except Exception as exc:
-                                    print(f"[Raw references] progress callback warning: {exc}", flush=True)
+                            callbacks_to_fire.append((number, total, event))
+
+                    # Batch flush to Drive: 1 fsync per file per batch instead of 2 per paper.
+                    if batch_records:
+                        recovery.durable_append_many(root / "references_raw.jsonl", batch_records)
+                    if batch_events:
+                        recovery.durable_append_many(root / "references_raw_ledger.jsonl", batch_events)
+
+                    if progress_callback is not None:
+                        for num, tot, ev in callbacks_to_fire:
+                            try:
+                                progress_callback(num, tot, ev)
+                            except Exception as exc:
+                                print(f"[Raw references] progress callback warning: {exc}", flush=True)
             else:
                 for number, paper_id in enumerate(to_process, 1):
                     await _fetch_and_record_single(paper_id, number)
