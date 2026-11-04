@@ -73,16 +73,51 @@ def _status_record(
 ) -> dict | None:
     """Verify one known target, without scanning any other legacy raw folder.
 
-    If fast=True, skips full file SHA256 rehashing and recursive directory
-    traversal, checking marker validity, record structure, and file sizes.
-    Full verification remains the default for integrity audits.
+    If fast=True, performs an ultra-fast single-stat marker check without
+    iterating through source files or checking SHA256. Full verification remains
+    the default for integrity audits.
     """
     target = raw_dir / paper_id / version
+    marker = target / _MARKER
+    if fast:
+        try:
+            raw_text = marker.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if target.is_dir():
+                return {"status": "conflict", "error": "existing version has no trusted verification marker"}
+            return None
+        except OSError as exc:
+            return {"status": "conflict", "error": f"marker unreadable: {exc}"}
+        try:
+            payload = json.loads(raw_text)
+            if payload.get("arxiv_id") != paper_id or payload.get("version") != version:
+                return {"status": "conflict", "error": "marker identity mismatch"}
+            status = payload.get("status")
+            if status not in {"success", "pdf_only"}:
+                return {"status": "conflict", "error": "marker status invalid"}
+            records = payload.get("files")
+            if not isinstance(records, list):
+                return {"status": "conflict", "error": "marker files missing"}
+            if status == "success" and not records:
+                return {"status": "conflict", "error": "success marker without files"}
+            for record in records:
+                rel = record.get("path")
+                if not isinstance(rel, str) or not rel:
+                    return {"status": "conflict", "error": "unsafe manifest path"}
+                item = target / rel
+                try:
+                    if item.stat().st_size != record.get("bytes"):
+                        return {"status": "conflict", "error": "source file size mismatch"}
+                except OSError:
+                    return {"status": "conflict", "error": "missing source file"}
+            return {"status": status, "marker": payload}
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return {"status": "conflict", "error": f"unverified existing version: {exc}"}
+
     if not target.exists() and not target.is_symlink():
         return None
     if target.is_symlink() or not target.is_dir():
         return {"status": "conflict", "error": "destination is not a regular directory"}
-    marker = target / _MARKER
     if not marker.is_file() or marker.is_symlink():
         return {"status": "conflict", "error": "existing version has no trusted verification marker"}
     try:
@@ -110,31 +145,28 @@ def _status_record(
             item = target / rel
             if item.is_symlink() or not item.is_file():
                 raise ValueError("missing/untrusted source file")
-            if item.stat().st_size != record["bytes"]:
-                raise ValueError("source file size mismatch")
-            if not fast and _sha256(item) != record["sha256"]:
+            if item.stat().st_size != record["bytes"] or _sha256(item) != record["sha256"]:
                 raise ValueError("source checksum mismatch")
             tex_count += int(rel.lower().endswith(".tex") and item.stat().st_size > 0)
         if status == "success" and tex_count < 1:
             raise ValueError("success marker without nonempty TeX")
         if status == "pdf_only" and records:
             raise ValueError("PDF-only marker contains source files")
-        if not fast:
-            # Explicitly reject unexpected files (e.g. partial extraction or tampering).
-            actual_files = set()
-            for root_dir, dirs, files in os.walk(target, followlinks=False):
-                rpath = Path(root_dir)
-                for f in files:
-                    fpath = rpath / f
-                    if fpath.is_symlink():
-                        raise ValueError("symlink present")
-                    if f != _MARKER:
-                        actual_files.add(fpath.relative_to(target).as_posix())
-                for d in dirs:
-                    if (rpath / d).is_symlink():
-                        raise ValueError("symlink present")
-            if actual_files != seen:
-                raise ValueError("unexpected or missing files")
+        # Explicitly reject unexpected files (e.g. partial extraction or tampering).
+        actual_files = set()
+        for root_dir, dirs, files in os.walk(target, followlinks=False):
+            rpath = Path(root_dir)
+            for f in files:
+                fpath = rpath / f
+                if fpath.is_symlink():
+                    raise ValueError("symlink present")
+                if f != _MARKER:
+                    actual_files.add(fpath.relative_to(target).as_posix())
+            for d in dirs:
+                if (rpath / d).is_symlink():
+                    raise ValueError("symlink present")
+        if actual_files != seen:
+            raise ValueError("unexpected or missing files")
         return {"status": status, "marker": payload}
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         return {"status": "conflict", "error": f"unverified existing version: {exc}"}
@@ -342,6 +374,10 @@ def plan_version_downloads(
     now = time.time()
     work = []
     counts: Counter = Counter()
+
+    # Pre-collect all expected targets to check in parallel over Drive FUSE
+    targets: list[tuple[str, str]] = []
+    paper_versions: list[tuple[str, list[str]]] = []
     for paper_id in requested:
         paper = papers.get(paper_id)
         if not _valid_meta(paper):
@@ -351,8 +387,25 @@ def plan_version_downloads(
         if issue or not versions:
             counts["invalid_versions"] += 1
             continue
+        paper_versions.append((paper_id, versions))
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version, fast=True)
+            targets.append((paper_id, version))
+
+    # Parallelize fast status checks across Google Drive FUSE
+    raw_dir = data / "raw"
+    checked_status: dict[tuple[str, str], dict | None] = {}
+    if len(targets) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for (pid, ver), st in zip(targets, executor.map(lambda t: _status_record(raw_dir, t[0], t[1], fast=True), targets)):
+                checked_status[(pid, ver)] = st
+    elif targets:
+        checked_status[targets[0]] = _status_record(raw_dir, targets[0][0], targets[0][1], fast=True)
+
+    for paper_id, versions in paper_versions:
+        for version in versions:
+            current = checked_status.get((paper_id, version))
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -414,6 +467,7 @@ def run_version_downloads(
     if max_downloads < 0:
         raise ValueError("max_downloads must be >= 0")
     data = Path(data_dir)
+    print("[Versions] Đang lập kế hoạch tải source...", flush=True)
     plan = plan_version_downloads(
         data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found
     )

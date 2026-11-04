@@ -35,7 +35,7 @@ def _id(value: object) -> str:
 def _jsonl_rows(path: Path):
     if not path.is_file():
         return
-    with path.open(encoding="utf-8") as handle:
+    with path.open(encoding="utf-8", buffering=1024 * 1024) as handle:
         for line_num, line in enumerate(handle, 1):
             if not line.strip():
                 continue
