@@ -275,3 +275,50 @@ def test_status_record_fast_mode_skips_full_hashing(tmp_path):
     assert full_check is not None
     assert full_check["status"] == "success"
 
+
+def test_request_source_resumes_with_http_range():
+    import requests
+    from src.download_module.version_downloader import _request_source
+
+    class FakeBrokenResponse:
+        def __init__(self, part: bytes, is_broken: bool, status_code: int = 200):
+            self.status_code = status_code
+            self.headers = {"Content-Type": "application/gzip"}
+            self.part = part
+            self.is_broken = is_broken
+
+        def iter_content(self, chunk_size=1024):
+            yield self.part
+            if self.is_broken:
+                raise requests.exceptions.ChunkedEncodingError("IncompleteRead")
+
+        def close(self):
+            pass
+
+    call_records = []
+
+    class FakeSession:
+        def get(self, url, headers=None, timeout=None, stream=True):
+            call_records.append(dict(headers or {}))
+            if len(call_records) == 1:
+                # First attempt: stream breaks after 5 bytes
+                return FakeBrokenResponse(b"HELLO", is_broken=True, status_code=200)
+            elif len(call_records) == 2:
+                # Second attempt: check Range header and return remaining bytes
+                assert headers.get("Range") == "bytes=5-"
+                return FakeBrokenResponse(b"_WORLD", is_broken=False, status_code=206)
+            raise AssertionError("Unexpected third call")
+
+    session = FakeSession()
+    state, body, content_type, error = _request_source(
+        "https://export.arxiv.org/src/test",
+        session=session,
+        attempts=3,
+    )
+    assert state == "ok"
+    assert body == b"HELLO_WORLD"
+    assert "gzip" in content_type
+    assert error == ""
+    assert len(call_records) == 2
+
+

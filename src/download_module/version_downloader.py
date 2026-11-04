@@ -239,44 +239,64 @@ def _request_source(
     session: requests.Session | None = None,
     limiter: utils.RateLimiter | None = None,
     attempts: int = config.MAX_RETRIES,
-    timeout: int = 120,
+    timeout: tuple[float, float] | float = (15.0, 60.0),
 ) -> tuple[str, bytes, str, str]:
-    """Return status, body, content-type, and error; retry polite transient errors."""
+    """Return status, body, content-type, and error; retry polite transient errors with HTTP Range support."""
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
     getter = session.get if session is not None else requests.get
+    chunks: list[bytes] = []
+    downloaded_bytes = 0
+    content_type = ""
+
     for attempt in range(attempts):
         if limiter:
             limiter.wait()
         retry_after = None
         error = ""
+        headers = {"User-Agent": "arXiv-Project/1.0 (academic research)"}
+        if downloaded_bytes > 0:
+            headers["Range"] = f"bytes={downloaded_bytes}-"
+
         try:
-            response = getter(url, headers={"User-Agent": "arXiv-Project/1.0 (academic research)"},
-                              timeout=timeout, stream=True)
+            response = getter(url, headers=headers, timeout=timeout, stream=True)
             try:
                 code = response.status_code
                 if code == 404:
                     return "not_found", b"", "", "HTTP 404"
-                if code == 429 or code in {500, 502, 503, 504}:
+                if code == 416:
+                    chunks, downloaded_bytes = [], 0
+                    error = "HTTP 416 (Range reset)"
+                elif code == 429 or code in {500, 502, 503, 504}:
                     retry_after = recovery.parse_retry_after(response.headers.get("Retry-After"))
                     error = f"HTTP {code}"
-                elif code != 200:
+                elif code not in (200, 206):
                     return "failed", b"", "", f"HTTP {code}"
                 else:
-                    content_type = response.headers.get("Content-Type", "").lower()
-                    chunks, size = [], 0
+                    if code == 200 and downloaded_bytes > 0:
+                        chunks = []
+                        downloaded_bytes = 0
+
+                    if not content_type:
+                        content_type = response.headers.get("Content-Type", "").lower()
+
                     for block in response.iter_content(chunk_size=1024 * 1024):
                         if not block:
                             continue
-                        size += len(block)
-                        if size > MAX_ARCHIVE_BYTES:
+                        downloaded_bytes += len(block)
+                        if downloaded_bytes > MAX_ARCHIVE_BYTES:
                             return "failed", b"", "", "Source archive exceeded 128 MiB safety limit"
                         chunks.append(block)
                     return "ok", b"".join(chunks), content_type, ""
             finally:
                 response.close()
-        except requests.RequestException as exc:
+        except (requests.RequestException, Exception) as exc:
             error = f"Network failure: {exc}"
+            if downloaded_bytes > 0:
+                print(
+                    f"[Versions] Đứt kết nối ở {downloaded_bytes} bytes; chuẩn bị tiếp tục tải bằng HTTP Range...",
+                    flush=True,
+                )
         if attempt + 1 < attempts:
             delay = retry_after if retry_after is not None else min(2 ** (attempt + 1), 60)
             time.sleep(max(config.ARXIV_MIN_INTERVAL, delay) + random.uniform(0, 0.5))
