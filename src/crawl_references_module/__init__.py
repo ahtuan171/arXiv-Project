@@ -5,6 +5,7 @@ from src.crawl_references_module.raw_reference_collector import (
     collect_raw_references,
     export_raw_reference_stats,
     publish_references,
+    prune_unverified_references,
 )
 from src.crawl_references_module.read_ref import load_references
 from src.crawl_references_module.s2_api_client import S2ApiClient
@@ -19,6 +20,7 @@ __all__ = [
     "collect_raw_references",
     "export_raw_reference_stats",
     "publish_references",
+    "prune_unverified_references",
     "S2ApiClient",
     "S2BrowserClient",
     "CrawlStats",
