@@ -304,3 +304,44 @@ def test_plan_and_run_fast_verify_hashes(tmp_path):
     assert plan["summary"]["to_download"] == 1
 
 
+def test_plan_and_run_alt_raw_dir_lookup(tmp_path):
+    alt_data = fixture_data(tmp_path / "alt_drive")
+    # Download v1 to alt_drive
+    res_alt = run_version_downloads(
+        alt_data, ids=["2501.00001"], max_downloads=1, dry_run=False,
+        scratch_parent=tmp_path, fetch=lambda _: ("ok", tex_archive(), "", ""),
+        verify_hashes=False,
+    )
+    assert res_alt["summary"]["success"] == 1
+
+    # Now create fresh local scratch data dir without v1 in its local raw
+    scratch_data = tmp_path / "scratch_data"
+    scratch_data.mkdir()
+    (scratch_data / "papers.jsonl").write_text((alt_data / "papers.jsonl").read_text())
+
+    # Plan with alt_raw_dir pointing to alt_drive / raw
+    plan = plan_version_downloads(
+        scratch_data, ids=["2501.00001"],
+        alt_raw_dir=alt_data / "raw",
+        verify_hashes=False,
+    )
+    assert plan["summary"]["verified_existing"] == 1
+    assert plan["summary"]["to_download"] == 1
+
+    # Run should skip v1 because it exists in alt_raw_dir, and download v2 to scratch_data
+    fetched = []
+    run_res = run_version_downloads(
+        scratch_data, ids=["2501.00001"], max_downloads=2, dry_run=False,
+        scratch_parent=tmp_path,
+        fetch=lambda url: (fetched.append(url) or ("ok", tex_archive(), "", "")),
+        verify_hashes=False,
+        alt_raw_dir=alt_data / "raw",
+        batch_size=2,
+    )
+    assert len(fetched) == 1
+    assert fetched[0].endswith("v2")
+    assert run_res["summary"]["success"] == 1
+    assert (scratch_data / "versions_manifest.jsonl").is_file()
+
+
+

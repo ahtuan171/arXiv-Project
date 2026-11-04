@@ -133,3 +133,32 @@ def test_download_papers_range_skips_when_in_alt_raw_dir(tmp_path, monkeypatch):
     )
     # 2502.00001 should be skipped because it exists in alt_raw_dir!
     assert downloaded == ["2502.00002"]
+
+
+def test_download_papers_range_expands_all_versions_from_metadata(tmp_path, monkeypatch):
+    import json
+    raw_dir = tmp_path / "raw"
+    csv_dir = tmp_path / "csv"
+    meta_file = tmp_path / "papers.jsonl"
+    meta_file.write_text(
+        json.dumps({"arxiv_id": "2502_00001", "versions": ["v1", "v2"]}) + "\n" +
+        json.dumps({"arxiv_id": "2502_00002", "versions": ["v1"]}) + "\n"
+    )
+
+    downloaded = []
+    monkeypatch.setattr(
+        "src.download_module.downloader.download_single_paper",
+        lambda arxiv_id, **kw: downloaded.append(arxiv_id) or _fake_stats(arxiv_id),
+    )
+
+    download_papers_range(
+        raw_dir=raw_dir,
+        csv_dir=csv_dir,
+        id_list=["2502.00001", "2502.00002"],
+        metadata_path=meta_file,
+        download_all_versions=True,
+        resume=False,
+    )
+
+    assert downloaded == ["2502.00001v1", "2502.00001v2", "2502.00002v1"]
+

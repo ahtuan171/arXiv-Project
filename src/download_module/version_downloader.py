@@ -344,6 +344,7 @@ def plan_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     verify_hashes: bool = False,
+    alt_raw_dir: str | Path | None = None,
 ) -> dict:
     """Plan attempts using verified vN directories and the last manifest event.
 
@@ -370,6 +371,16 @@ def plan_version_downloads(
                         existing_paper_dirs.add(entry.name)
         except OSError:
             pass
+    alt_raw_path = Path(alt_raw_dir) if alt_raw_dir is not None else None
+    alt_existing_paper_dirs = set()
+    if alt_raw_path is not None and alt_raw_path.is_dir():
+        try:
+            with os.scandir(alt_raw_path) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        alt_existing_paper_dirs.add(entry.name)
+        except OSError:
+            pass
     print(f"[Versions] Đang lập kế hoạch tải cho {len(requested)} bài báo...", flush=True)
     now = time.time()
     work = []
@@ -384,12 +395,15 @@ def plan_version_downloads(
             counts["invalid_versions"] += 1
             continue
         paper_exists = paper_id in existing_paper_dirs
+        alt_paper_exists = paper_id in alt_existing_paper_dirs
         for version in versions:
             current = (
                 _status_record(raw_dir, paper_id, version, verify_hashes=verify_hashes)
                 if paper_exists
                 else None
             )
+            if current is None and alt_paper_exists and alt_raw_path is not None:
+                current = _status_record(alt_raw_path, paper_id, version, verify_hashes=verify_hashes)
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -438,6 +452,8 @@ def run_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     verify_hashes: bool = False,
+    alt_raw_dir: str | Path | None = None,
+    batch_size: int = 10,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -454,7 +470,7 @@ def run_version_downloads(
     data = Path(data_dir)
     plan = plan_version_downloads(
         data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found,
-        verify_hashes=verify_hashes,
+        verify_hashes=verify_hashes, alt_raw_dir=alt_raw_dir,
     )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
@@ -463,6 +479,7 @@ def run_version_downloads(
     raw = data / "raw"
     if raw.is_symlink() or (raw.exists() and not raw.is_dir()):
         raise ValueError("Unsafe raw directory")
+    alt_raw_path = Path(alt_raw_dir) if alt_raw_dir is not None else None
     parent = Path(scratch_parent or ("/content" if Path("/content").is_dir() else tempfile.gettempdir()))
     if not parent.is_dir() or parent.resolve() == data.resolve() or data.resolve() in parent.resolve().parents or str(parent.resolve()).startswith("/content/drive/"):
         raise ValueError("Scratch must be a real local directory, not Drive")
@@ -472,67 +489,88 @@ def run_version_downloads(
     attempts = 0
     total_candidates = plan["summary"].get("to_download", 0)
     progress_total = min(max_downloads, total_candidates) if max_downloads else total_candidates
+    manifest_path = data / "versions_manifest.jsonl"
+    event_buffer: list[dict] = []
+
+    def flush_events() -> None:
+        if event_buffer:
+            recovery.durable_append_many(manifest_path, event_buffer)
+            event_buffer.clear()
+
     with requests.Session() as session:
-        for task in plan["worklist"]:
-            paper_id, version = task["arxiv_id"], task["version"]
-            if task["action"] == "conflict":
-                counts["conflicts"] += 1
-                print(f"[Versions] CONFLICT {paper_id}/{version}: {task['reason']}", flush=True)
-                continue
-            if max_downloads and attempts >= max_downloads:
-                break
-            # Recheck immediately before each network request (resume, crash safety).
-            current = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
-            if current is not None:
-                counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
-                continue
-            url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
-            attempts += 1
-            start = time.monotonic()
-            print(f"[Versions] {attempts}/{max_downloads or 'all'} GET {url}", flush=True)
-            try:
-                if fetch is not None:
-                    state, body, content_type, error = fetch(url)
-                else:
-                    state, body, content_type, error = _request_source(url, session=session, limiter=limiter)
-                if state == "ok":
-                    status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
-                    with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
-                        stage = Path(tmp)
-                        if status == "success":
-                            extracted, has_tex = extract_source_archive(body, stage)
-                            if not extracted or not has_tex:
-                                raise ValueError("Source archive has no valid LaTeX (.tex)")
-                        marker = _make_marker(stage, paper_id, version, status, url, len(body))
-                        output = _publish_version(stage, raw, paper_id, version, verify_hashes=verify_hashes)
-                        # Verify published marker and every TeX/Bib hash, not just staging.
-                        checked = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
-                        if not checked or checked["status"] != status:
-                            raise RuntimeError(f"Published files failed verification: {output}")
-                    event = _event(paper_id, version, status, marker=marker,
-                                   elapsed=time.monotonic() - start)
-                else:
-                    event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
-                                   error=error or state, elapsed=time.monotonic() - start,
-                                   previous_attempts=task.get("previous_attempts", 0))
-            except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
-                # An existing final directory or an unverified stage must not be
-                # replaced or deleted. Record failure, then continue.
-                event = _event(paper_id, version, "failed",
-                               error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
-                               previous_attempts=task.get("previous_attempts", 0))
-            # Append event only after publication; a later run can recover from the marker.
-            recovery.durable_append(data / "versions_manifest.jsonl", event)
-            events.append(event)
-            counts[event["status"]] += 1
-            print(f"[Versions] {paper_id}/{version}: {event['status']} "
-                  f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
-            if progress_callback is not None:
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        try:
+            for task in plan["worklist"]:
+                paper_id, version = task["arxiv_id"], task["version"]
+                if task["action"] == "conflict":
+                    counts["conflicts"] += 1
+                    print(f"[Versions] CONFLICT {paper_id}/{version}: {task['reason']}", flush=True)
+                    continue
+                if max_downloads and attempts >= max_downloads:
+                    break
+                # Recheck immediately before each network request (resume, crash safety).
+                current = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
+                if current is None and alt_raw_path is not None:
+                    current = _status_record(alt_raw_path, paper_id, version, verify_hashes=verify_hashes)
+                if current is not None:
+                    counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
+                    continue
+                url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
+                attempts += 1
+                start = time.monotonic()
+                print(f"[Versions] {attempts}/{max_downloads or 'all'} GET {url}", flush=True)
                 try:
-                    progress_callback(attempts, progress_total, event)
-                except Exception as exc:
-                    # Progress UI is best-effort; never turn a recorded download into a failure.
-                    print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
+                    if fetch is not None:
+                        state, body, content_type, error = fetch(url)
+                    else:
+                        state, body, content_type, error = _request_source(url, session=session, limiter=limiter)
+                    if state == "ok":
+                        status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
+                        with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
+                            stage = Path(tmp)
+                            if status == "success":
+                                extracted, has_tex = extract_source_archive(body, stage)
+                                if not extracted or not has_tex:
+                                    raise ValueError("Source archive has no valid LaTeX (.tex)")
+                            marker = _make_marker(stage, paper_id, version, status, url, len(body))
+                            output = _publish_version(stage, raw, paper_id, version, verify_hashes=verify_hashes)
+                            # Verify published marker and every TeX/Bib hash, not just staging.
+                            checked = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
+                            if not checked or checked["status"] != status:
+                                raise RuntimeError(f"Published files failed verification: {output}")
+                        event = _event(paper_id, version, status, marker=marker,
+                                       elapsed=time.monotonic() - start)
+                    else:
+                        event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
+                                       error=error or state, elapsed=time.monotonic() - start,
+                                       previous_attempts=task.get("previous_attempts", 0))
+                except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
+                    # An existing final directory or an unverified stage must not be
+                    # replaced or deleted. Record failure, then continue.
+                    event = _event(paper_id, version, "failed",
+                                   error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
+                                   previous_attempts=task.get("previous_attempts", 0))
+                # Buffer event and flush in batches or on exit
+                event_buffer.append(event)
+                if len(event_buffer) >= max(1, batch_size):
+                    flush_events()
+                events.append(event)
+                counts[event["status"]] += 1
+                print(f"[Versions] {paper_id}/{version}: {event['status']} "
+                      f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(attempts, progress_total, event)
+                    except Exception as exc:
+                        # Progress UI is best-effort; never turn a recorded download into a failure.
+                        print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
+        finally:
+            flush_events()
+    counts["network_attempts"] = attempts
+    counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
+    return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
     return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
