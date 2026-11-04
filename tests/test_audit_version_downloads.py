@@ -130,3 +130,16 @@ def test_export_download_stats_csv_creates_table2(tmp_path):
         'raw_size_bytes', 'cleaned_size_bytes', 'num_tex_files', 'download_time_sec'
     }
 
+
+def test_audit_version_downloads_fast_mode_and_id_filtering(tmp_path, monkeypatch):
+    data = fixture_data(tmp_path)
+    # Fast mode should verify without hashing
+    fast_report = audit_version_downloads(data, verify_hashes=False)
+    assert fast_report["summary"]["expected_versions"] == 3
+
+    # Filtering by IDs
+    filtered_report = audit_version_downloads(data, ids=["2501.00001"])
+    assert filtered_report["summary"]["expected_versions"] == 2
+    assert [r["arxiv_id"] for r in filtered_report["rows"]] == ["2501_00001", "2501_00001"]
+
+

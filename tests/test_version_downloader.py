@@ -290,3 +290,17 @@ def test_request_source_resumes_incomplete_read_via_range():
     assert mock_session.get.call_count == 2
     assert mock_session.get.call_args_list[1][1]["headers"]["Range"] == "bytes=6-"
 
+
+def test_plan_and_run_fast_verify_hashes(tmp_path):
+    data = fixture_data(tmp_path)
+    res = run_version_downloads(
+        data, ids=["2501.00001"], max_downloads=1, dry_run=False,
+        scratch_parent=tmp_path, fetch=lambda _: ("ok", tex_archive(), "", ""),
+        verify_hashes=False,
+    )
+    assert res["summary"]["success"] == 1
+    plan = plan_version_downloads(data, ids=["2501.00001"], verify_hashes=False)
+    assert plan["summary"]["verified_existing"] == 1
+    assert plan["summary"]["to_download"] == 1
+
+

@@ -67,7 +67,9 @@ def _paper_id(value: Any) -> str:
     return canonical
 
 
-def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
+def _status_record(
+    raw_dir: Path, paper_id: str, version: str, *, verify_hashes: bool = True
+) -> dict | None:
     """Verify one known target, without scanning any other legacy raw folder."""
     target = raw_dir / paper_id / version
     if not target.exists() and not target.is_symlink():
@@ -102,22 +104,25 @@ def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
             item = target / rel
             if item.is_symlink() or not item.is_file():
                 raise ValueError("missing/untrusted source file")
-            if item.stat().st_size != record["bytes"] or _sha256(item) != record["sha256"]:
+            if item.stat().st_size != record["bytes"]:
+                raise ValueError("source checksum mismatch")
+            if verify_hashes and _sha256(item) != record["sha256"]:
                 raise ValueError("source checksum mismatch")
             tex_count += int(rel.lower().endswith(".tex") and item.stat().st_size > 0)
         if status == "success" and tex_count < 1:
             raise ValueError("success marker without nonempty TeX")
         if status == "pdf_only" and records:
             raise ValueError("PDF-only marker contains source files")
-        # Explicitly reject unexpected files (e.g. partial extraction or tampering).
-        actual_files = set()
-        for file in target.rglob("*"):
-            if file.is_symlink():
-                raise ValueError("symlink present")
-            if file.is_file() and file != marker:
-                actual_files.add(file.relative_to(target).as_posix())
-        if actual_files != seen:
-            raise ValueError("unexpected or missing files")
+        if verify_hashes:
+            # Explicitly reject unexpected files (e.g. partial extraction or tampering).
+            actual_files = set()
+            for file in target.rglob("*"):
+                if file.is_symlink():
+                    raise ValueError("symlink present")
+                if file.is_file() and file != marker:
+                    actual_files.add(file.relative_to(target).as_posix())
+            if actual_files != seen:
+                raise ValueError("unexpected or missing files")
         return {"status": status, "marker": payload}
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         return {"status": "conflict", "error": f"unverified existing version: {exc}"}
@@ -156,7 +161,9 @@ def _make_marker(
     return marker
 
 
-def _publish_version(stage: Path, raw_dir: Path, paper_id: str, version: str) -> Path:
+def _publish_version(
+    stage: Path, raw_dir: Path, paper_id: str, version: str, *, verify_hashes: bool = True
+) -> Path:
     """Stage on Drive then rename a NEW version directory; never replace one."""
     parent = raw_dir / paper_id
     if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
@@ -173,7 +180,12 @@ def _publish_version(stage: Path, raw_dir: Path, paper_id: str, version: str) ->
         for file in stage.rglob("*"):
             if file.is_file():
                 rel = file.relative_to(stage)
-                if not (staging / rel).is_file() or _sha256(file) != _sha256(staging / rel):
+                staged_file = staging / rel
+                if not staged_file.is_file():
+                    raise RuntimeError(f"Drive staging verification failed: missing {rel}")
+                if staged_file.stat().st_size != file.stat().st_size:
+                    raise RuntimeError(f"Drive staging verification failed: size mismatch {rel}")
+                if verify_hashes and _sha256(file) != _sha256(staged_file):
                     raise RuntimeError(f"Drive staging verification failed: {rel}")
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Destination appeared during staging: {destination}")
@@ -331,6 +343,7 @@ def plan_version_downloads(
     *,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    verify_hashes: bool = False,
 ) -> dict:
     """Plan attempts using verified vN directories and the last manifest event.
 
@@ -372,7 +385,11 @@ def plan_version_downloads(
             continue
         paper_exists = paper_id in existing_paper_dirs
         for version in versions:
-            current = _status_record(raw_dir, paper_id, version) if paper_exists else None
+            current = (
+                _status_record(raw_dir, paper_id, version, verify_hashes=verify_hashes)
+                if paper_exists
+                else None
+            )
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -420,6 +437,7 @@ def run_version_downloads(
     progress_callback: ProgressFn | None = None,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    verify_hashes: bool = False,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -435,7 +453,8 @@ def run_version_downloads(
         raise ValueError("max_downloads must be >= 0")
     data = Path(data_dir)
     plan = plan_version_downloads(
-        data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found
+        data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found,
+        verify_hashes=verify_hashes,
     )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
@@ -463,7 +482,7 @@ def run_version_downloads(
             if max_downloads and attempts >= max_downloads:
                 break
             # Recheck immediately before each network request (resume, crash safety).
-            current = _status_record(raw, paper_id, version)
+            current = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
             if current is not None:
                 counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
                 continue
@@ -485,9 +504,9 @@ def run_version_downloads(
                             if not extracted or not has_tex:
                                 raise ValueError("Source archive has no valid LaTeX (.tex)")
                         marker = _make_marker(stage, paper_id, version, status, url, len(body))
-                        output = _publish_version(stage, raw, paper_id, version)
+                        output = _publish_version(stage, raw, paper_id, version, verify_hashes=verify_hashes)
                         # Verify published marker and every TeX/Bib hash, not just staging.
-                        checked = _status_record(raw, paper_id, version)
+                        checked = _status_record(raw, paper_id, version, verify_hashes=verify_hashes)
                         if not checked or checked["status"] != status:
                             raise RuntimeError(f"Published files failed verification: {output}")
                     event = _event(paper_id, version, status, marker=marker,
