@@ -48,12 +48,28 @@ def _jsonl_rows(path: Path):
             yield row
 
 
+_LATEST_JSONL_CACHE: dict[Path, tuple[int, int, dict[str, dict]]] = {}
+
+
 def _latest_jsonl(path: Path) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    try:
+        st = path.stat()
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key and path in _LATEST_JSONL_CACHE and _LATEST_JSONL_CACHE[path][:2] == cache_key:
+        return dict(_LATEST_JSONL_CACHE[path][2])
+
     result = {}
     for row in _jsonl_rows(path):
         if row.get("arxiv_id"):
             result[_id(row["arxiv_id"])] = row
-    return result
+
+    if cache_key:
+        _LATEST_JSONL_CACHE[path] = (cache_key[0], cache_key[1], result)
+    return dict(result)
 
 
 def _csv_records(path: Path, *, required: bool = False) -> dict[str, dict]:

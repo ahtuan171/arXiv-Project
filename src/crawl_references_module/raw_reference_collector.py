@@ -46,10 +46,22 @@ def _network_id(value: str) -> str:
     return raw.replace("_", ".", 1) if raw[:4].isdigit() and "_" in raw else raw
 
 
+_RECORDS_CACHE: dict[Path, tuple[int, int, list[dict]]] = {}
+
+
 def _read_records(path: Path) -> list[dict]:
-    """Strict reads: bad/truncated JSONL blocks further writes (fail closed)."""
+    """Strict reads with mtime/size caching: bad/truncated JSONL blocks further writes."""
     if not path.is_file():
         return []
+    try:
+        st = path.stat()
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+
+    if cache_key and path in _RECORDS_CACHE and _RECORDS_CACHE[path][:2] == cache_key:
+        return list(_RECORDS_CACHE[path][2])
+
     rows: list[dict] = []
     with path.open("rb") as fh:
         for lineno, line in enumerate(fh, 1):
@@ -62,7 +74,10 @@ def _read_records(path: Path) -> list[dict]:
             if not isinstance(row, dict):
                 raise ValueError(f"Non-object row {path}:{lineno}")
             rows.append(row)
-    return rows
+
+    if cache_key:
+        _RECORDS_CACHE[path] = (cache_key[0], cache_key[1], rows)
+    return list(rows)
 
 
 def _digest(rows: list[dict]) -> str:

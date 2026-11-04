@@ -41,9 +41,57 @@ COLUMNS = [
 ProgressFn = Callable[[int, int, dict], None]
 
 
+def _audit_single_version(
+    args: tuple[str, str, dict, str, Path],
+) -> tuple[dict, str | None, str | None, str | None]:
+    paper_id, version, event, url, raw_dir = args
+    manifest_status = str(event.get("status") or "")
+    state = _status_record(raw_dir, paper_id, version)
+    record = {
+        "arxiv_id": paper_id, "version": version,
+        "status": "pending", "verification": "not_applicable",
+        "manifest_status": manifest_status,
+        "source_url": str(event.get("source_url") or url),
+        "raw_path": "", "raw_size_bytes": "", "cleaned_size_bytes": "",
+        "num_tex_files": "", "download_time_sec": event.get("download_time_sec", ""),
+        "attempts": event.get("attempts", ""),
+        "fetched_at": event.get("fetched_at", ""),
+        "error": "",
+    }
+    disagreement = None
+    conflict_err = None
+    missing_err = None
+
+    if state and state["status"] in {"success", "pdf_only"}:
+        marker = state["marker"]
+        record.update(
+            status=state["status"], verification="verified",
+            source_url=marker.get("source_url") or url,
+            raw_path=f"raw/{paper_id}/{version}",
+            raw_size_bytes=marker.get("raw_size_bytes", ""),
+            cleaned_size_bytes=marker.get("cleaned_size_bytes", ""),
+            num_tex_files=marker.get("num_tex_files", ""),
+            fetched_at=marker.get("fetched_at") or record["fetched_at"],
+        )
+        if manifest_status and manifest_status != state["status"]:
+            disagreement = f"{paper_id}/{version}: verified marker overrides manifest {manifest_status}"
+    elif state:
+        record.update(status="conflict", verification="conflict", error=state["error"])
+        conflict_err = f"{paper_id}/{version}: {state['error']}"
+    elif manifest_status in {"success", "pdf_only"}:
+        record.update(status="missing_files", verification="missing",
+                      error="manifest says complete, but version directory is absent")
+        missing_err = f"{paper_id}/{version}: missing files after {manifest_status}"
+    elif manifest_status in {"not_found", "failed"}:
+        record.update(status=manifest_status, error=str(event.get("error") or ""))
+
+    return (record, disagreement, conflict_err, missing_err)
+
+
 def audit_version_downloads(
     data_dir: str | Path, *, sample_size: int = 10,
     progress_callback: ProgressFn | None = None,
+    max_workers: int | None = None,
 ) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
@@ -76,6 +124,7 @@ def audit_version_downloads(
     progress_done = 0
     warned_progress = False
 
+    items_to_audit: list[tuple[str, str, dict, str, Path]] = []
     for paper_id in sorted(papers):
         paper = papers[paper_id]
         if not _valid_meta(paper):
@@ -92,48 +141,29 @@ def audit_version_downloads(
             key = (paper_id, version)
             expected.add(key)
             event = history.get(key, {})
-            manifest_status = str(event.get("status") or "")
-            state = _status_record(root / "raw", paper_id, version)
             url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
-            record = {
-                "arxiv_id": paper_id, "version": version,
-                "status": "pending", "verification": "not_applicable",
-                "manifest_status": manifest_status,
-                "source_url": str(event.get("source_url") or url),
-                "raw_path": "", "raw_size_bytes": "", "cleaned_size_bytes": "",
-                "num_tex_files": "", "download_time_sec": event.get("download_time_sec", ""),
-                "attempts": event.get("attempts", ""),
-                "fetched_at": event.get("fetched_at", ""),
-                "error": "",
-            }
-            if state and state["status"] in {"success", "pdf_only"}:
-                marker = state["marker"]
-                record.update(
-                    status=state["status"], verification="verified",
-                    source_url=marker.get("source_url") or url,
-                    raw_path=f"raw/{paper_id}/{version}",
-                    raw_size_bytes=marker.get("raw_size_bytes", ""),
-                    cleaned_size_bytes=marker.get("cleaned_size_bytes", ""),
-                    num_tex_files=marker.get("num_tex_files", ""),
-                    fetched_at=marker.get("fetched_at") or record["fetched_at"],
-                )
-                if manifest_status and manifest_status != state["status"]:
-                    # Trusted files win over stale or interrupted journal events.
-                    counters["marker_manifest_disagreement"] += 1
-                    if len(issues) < sample_size:
-                        issues.append(f"{paper_id}/{version}: verified marker overrides manifest {manifest_status}")
-            elif state:
-                record.update(status="conflict", verification="conflict", error=state["error"])
+            items_to_audit.append((paper_id, version, event, url, root / "raw"))
+
+    workers = max_workers if max_workers is not None else min(16, max(4, (os.cpu_count() or 4) * 2))
+    if len(items_to_audit) <= 1 or workers <= 1:
+        iterator = map(_audit_single_version, items_to_audit)
+        executor = None
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=workers)
+        iterator = executor.map(_audit_single_version, items_to_audit)
+
+    try:
+        for record, disagreement, conflict_err, missing_err in iterator:
+            if disagreement:
+                counters["marker_manifest_disagreement"] += 1
                 if len(issues) < sample_size:
-                    issues.append(f"{paper_id}/{version}: {state['error']}")
-            elif manifest_status in {"success", "pdf_only"}:
-                record.update(status="missing_files", verification="missing",
-                              error="manifest says complete, but version directory is absent")
-                if len(issues) < sample_size:
-                    issues.append(f"{paper_id}/{version}: missing files after {manifest_status}")
-            elif manifest_status in {"not_found", "failed"}:
-                record.update(status=manifest_status, error=str(event.get("error") or ""))
-            # Leave never-attempted versions as pending, including legacy-only source.
+                    issues.append(disagreement)
+            if conflict_err and len(issues) < sample_size:
+                issues.append(conflict_err)
+            if missing_err and len(issues) < sample_size:
+                issues.append(missing_err)
+
             counters[record["status"]] += 1
             rows.append(record)
             progress_done += 1
@@ -144,6 +174,9 @@ def audit_version_downloads(
                     # A failing progress UI must never invalidate the audit.
                     print(f"[Version audit] Progress display warning: {exc}", flush=True)
                     warned_progress = True
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     orphan_keys = set(history).difference(expected)
     counters["orphan_manifest_keys"] = len(orphan_keys)
