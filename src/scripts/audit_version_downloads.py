@@ -23,6 +23,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from src import utils
 from src.download_module.version_downloader import (
     SOURCE_BASE_URL,
     _latest_version_events,
@@ -92,11 +93,13 @@ def audit_version_downloads(
     data_dir: str | Path, *, sample_size: int = 10,
     progress_callback: ProgressFn | None = None,
     max_workers: int | None = None,
+    ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
     This is read-only and intentionally checks hashes; on a large Drive folder,
     it can take time. No API requests, no legacy source enumeration or writes.
+    If ids is provided, scopes the audit to the specified arXiv IDs.
     """
     if sample_size < 0:
         raise ValueError("sample_size must be >= 0")
@@ -111,13 +114,17 @@ def audit_version_downloads(
             papers[paper_id] = row
     history = _latest_version_events(root / "versions_manifest.jsonl")
 
+    target_ids = {utils.canonical_arxiv_id(str(x)) for x in ids} if ids is not None else None
+    paper_keys = sorted(papers) if target_ids is None else sorted(pid for pid in papers if pid in target_ids)
+
     rows: list[dict] = []
     expected: set[tuple[str, str]] = set()
     counters = Counter()
     issues: list[str] = []
     # Calculate total without opening/hash-checking any raw source files.
     progress_total = 0
-    for paper in papers.values():
+    for paper_id in paper_keys:
+        paper = papers[paper_id]
         if _valid_meta(paper):
             labels, _ = _versions(paper, None)
             progress_total += len(labels)
@@ -125,7 +132,7 @@ def audit_version_downloads(
     warned_progress = False
 
     items_to_audit: list[tuple[str, str, dict, str, Path]] = []
-    for paper_id in sorted(papers):
+    for paper_id in paper_keys:
         paper = papers[paper_id]
         if not _valid_meta(paper):
             continue

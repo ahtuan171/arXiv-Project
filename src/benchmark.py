@@ -110,6 +110,7 @@ class SystemBenchmarkTracker:
         storage_dirs: Optional[Iterable[Union[Path, str]]] = None,
         sample_interval_sec: float = 0.5,
         disk_sample_interval_sec: float = 10.0,
+        periodic_disk_scan: bool = False,
     ) -> None:
         if storage_dirs is None:
             self.storage_dirs = [config.DATA_DIR]
@@ -118,6 +119,7 @@ class SystemBenchmarkTracker:
 
         self.sample_interval_sec = max(0.01, float(sample_interval_sec))
         self.disk_sample_interval_sec = max(0.0, float(disk_sample_interval_sec))
+        self.periodic_disk_scan = bool(periodic_disk_scan)
         self._start_time: float = 0.0
         self._end_time: float = 0.0
         self._ram_samples: list[float] = []
@@ -162,7 +164,7 @@ class SystemBenchmarkTracker:
             if ram > 0:
                 self._ram_samples.append(ram)
             now = time.monotonic()
-            if self.disk_sample_interval_sec > 0 and (now - self._last_disk_time >= self.disk_sample_interval_sec):
+            if self.periodic_disk_scan and self.disk_sample_interval_sec > 0 and (now - self._last_disk_time >= self.disk_sample_interval_sec):
                 disk = calculate_storage_mb(self.storage_dirs)
                 if disk > self._peak_disk_mb:
                     self._peak_disk_mb = disk
