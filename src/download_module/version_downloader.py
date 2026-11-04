@@ -38,6 +38,40 @@ _VERSION = re.compile(r"^v[1-9]\d*$")
 _MARKER = ".version-status.json"
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 SOURCE_BASE_URL = "https://export.arxiv.org/src"
+
+_MARKER_CACHE_FILE = (
+    Path("/content/.m1_marker_cache.json")
+    if Path("/content").is_dir()
+    else Path(tempfile.gettempdir()) / ".m1_marker_cache.json"
+)
+_MARKER_JSON_CACHE: dict[tuple[str, int, int], dict] = {}
+
+
+def _load_marker_cache() -> None:
+    if not _MARKER_CACHE_FILE.is_file():
+        return
+    try:
+        data = json.loads(_MARKER_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            for item in data:
+                key = (item["path"], item["mtime_ns"], item["size"])
+                _MARKER_JSON_CACHE[key] = item["payload"]
+    except Exception:
+        pass
+
+
+def _save_marker_cache() -> None:
+    try:
+        data = [
+            {"path": k[0], "mtime_ns": k[1], "size": k[2], "payload": v}
+            for k, v in list(_MARKER_JSON_CACHE.items())[-5000:]
+        ]
+        _MARKER_CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_load_marker_cache()
 FetchFn = Callable[[str], tuple[str, bytes, str, str]]
 ProgressFn = Callable[[int, int, dict], None]
 
@@ -81,15 +115,32 @@ def _status_record(
     marker = target / _MARKER
     if fast:
         try:
-            raw_text = marker.read_text(encoding="utf-8")
+            with os.scandir(target) as it:
+                dir_map = {e.name: e for e in it}
         except FileNotFoundError:
-            if target.is_dir():
-                return {"status": "conflict", "error": "existing version has no trusted verification marker"}
             return None
+        except NotADirectoryError:
+            return {"status": "conflict", "error": "destination is not a regular directory"}
         except OSError as exc:
             return {"status": "conflict", "error": f"marker unreadable: {exc}"}
+
+        marker_entry = dir_map.get(_MARKER)
+        if marker_entry is None or not marker_entry.is_file():
+            return {"status": "conflict", "error": "existing version has no trusted verification marker"}
+
         try:
-            payload = json.loads(raw_text)
+            mst = marker_entry.stat()
+            mkey = (str(marker.resolve()), mst.st_mtime_ns, mst.st_size)
+            if mkey in _MARKER_JSON_CACHE:
+                payload = _MARKER_JSON_CACHE[mkey]
+            else:
+                raw_text = marker.read_text(encoding="utf-8")
+                payload = json.loads(raw_text)
+                _MARKER_JSON_CACHE[mkey] = payload
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return {"status": "conflict", "error": f"marker unreadable: {exc}"}
+
+        try:
             if payload.get("arxiv_id") != paper_id or payload.get("version") != version:
                 return {"status": "conflict", "error": "marker identity mismatch"}
             status = payload.get("status")
@@ -104,14 +155,24 @@ def _status_record(
                 rel = record.get("path")
                 if not isinstance(rel, str) or not rel:
                     return {"status": "conflict", "error": "unsafe manifest path"}
-                item = target / rel
-                try:
-                    if item.stat().st_size != record.get("bytes"):
-                        return {"status": "conflict", "error": "source file size mismatch"}
-                except OSError:
-                    return {"status": "conflict", "error": "missing source file"}
+                if "/" not in rel and "\\" not in rel:
+                    file_entry = dir_map.get(rel)
+                    if file_entry is None or not file_entry.is_file():
+                        return {"status": "conflict", "error": "missing source file"}
+                    try:
+                        if file_entry.stat().st_size != record.get("bytes"):
+                            return {"status": "conflict", "error": "source file size mismatch"}
+                    except OSError:
+                        return {"status": "conflict", "error": "missing source file"}
+                else:
+                    item = target / rel
+                    try:
+                        if item.stat().st_size != record.get("bytes"):
+                            return {"status": "conflict", "error": "source file size mismatch"}
+                    except OSError:
+                        return {"status": "conflict", "error": "missing source file"}
             return {"status": status, "marker": payload}
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             return {"status": "conflict", "error": f"unverified existing version: {exc}"}
 
     if not target.exists() and not target.is_symlink():
@@ -409,6 +470,20 @@ def plan_version_downloads(
             continue
         paper_versions.append((paper_id, versions))
         for version in versions:
+            # Skip filesystem check for known 404 or active cooldown failures unless retrying
+            prev = history.get((paper_id, version), {})
+            prev_status = prev.get("status")
+            if prev_status == "not_found" and not retry_not_found:
+                continue
+            if prev_status == "failed" and not retry_errors:
+                if prev.get("error_type") == "blocked":
+                    continue
+                try:
+                    next_retry_at = float(prev.get("next_retry_at") or 0)
+                except (TypeError, ValueError):
+                    next_retry_at = 0
+                if next_retry_at > now:
+                    continue
             targets.append((paper_id, version))
 
     # Parallelize fast status checks across Google Drive FUSE
@@ -416,12 +491,14 @@ def plan_version_downloads(
     checked_status: dict[tuple[str, str], dict | None] = {}
     if len(targets) > 1:
         from concurrent.futures import ThreadPoolExecutor
-        workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+        workers = min(8, max(2, (os.cpu_count() or 2)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for (pid, ver), st in zip(targets, executor.map(lambda t: _status_record(raw_dir, t[0], t[1], fast=True), targets)):
                 checked_status[(pid, ver)] = st
     elif targets:
         checked_status[targets[0]] = _status_record(raw_dir, targets[0][0], targets[0][1], fast=True)
+
+    _save_marker_cache()
 
     for paper_id, versions in paper_versions:
         for version in versions:
@@ -575,6 +652,7 @@ def run_version_downloads(
                     print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
     finally:
         session.close()
+        _save_marker_cache()
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
     return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
