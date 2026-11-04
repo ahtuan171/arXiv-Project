@@ -347,6 +347,17 @@ def plan_version_downloads(
             papers[key] = row
     requested = sorted({_paper_id(x) for x in ids}) if ids is not None else sorted(papers)
     history = _latest_version_events(data / "versions_manifest.jsonl")
+    raw_dir = data / "raw"
+    existing_paper_dirs = set()
+    if raw_dir.is_dir():
+        try:
+            with os.scandir(raw_dir) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        existing_paper_dirs.add(entry.name)
+        except OSError:
+            pass
+    print(f"[Versions] Đang lập kế hoạch tải cho {len(requested)} bài báo...", flush=True)
     now = time.time()
     work = []
     counts: Counter = Counter()
@@ -359,8 +370,9 @@ def plan_version_downloads(
         if issue or not versions:
             counts["invalid_versions"] += 1
             continue
+        paper_exists = paper_id in existing_paper_dirs
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version)
+            current = _status_record(raw_dir, paper_id, version) if paper_exists else None
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
