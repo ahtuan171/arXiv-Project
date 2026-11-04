@@ -256,3 +256,37 @@ def test_dry_run_respects_skip_flags_without_writing(tmp_path):
     assert result["plan"]["summary"]["known_not_found"] == 1
     assert result["plan"]["summary"]["to_download"] == 1
     assert manifest.read_bytes() == before
+
+
+def test_request_source_resumes_incomplete_read_via_range():
+    import http.client
+    from unittest.mock import MagicMock
+    from src.download_module.version_downloader import _request_source
+
+    class FakeResponse:
+        def __init__(self, status_code, headers, chunk_list):
+            self.status_code = status_code
+            self.headers = headers
+            self._chunk_list = chunk_list
+
+        def iter_content(self, chunk_size=256 * 1024):
+            for c in self._chunk_list:
+                if isinstance(c, Exception):
+                    raise c
+                yield c
+
+        def close(self):
+            pass
+
+    mock_session = MagicMock()
+    r1 = FakeResponse(200, {"Content-Length": "10", "Content-Type": "application/gzip"},
+                      [b"123456", http.client.IncompleteRead(b"", 4)])
+    r2 = FakeResponse(206, {"Content-Range": "bytes 6-9/10", "Content-Length": "4"}, [b"7890"])
+    mock_session.get.side_effect = [r1, r2]
+
+    status, body, ctype, err = _request_source("http://test", session=mock_session, attempts=2)
+    assert status == "ok"
+    assert body == b"1234567890"
+    assert mock_session.get.call_count == 2
+    assert mock_session.get.call_args_list[1][1]["headers"]["Range"] == "bytes=6-"
+

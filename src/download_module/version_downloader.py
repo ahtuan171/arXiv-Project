@@ -14,6 +14,7 @@ multi-object atomic transaction. Default API is dry-run.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -191,18 +192,30 @@ def _request_source(
     attempts: int = config.MAX_RETRIES,
     timeout: int = 120,
 ) -> tuple[str, bytes, str, str]:
-    """Return status, body, content-type, and error; retry polite transient errors."""
+    """Return status, body, content-type, and error; retry polite transient errors.
+
+    Resumes interrupted downloads via HTTP Range headers when IncompleteRead or
+    network drops occur during streaming.
+    """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
     getter = session.get if session is not None else requests.get
+    chunks: list[bytes] = []
+    downloaded_len = 0
+    final_content_type = ""
+    total_expected_len: int | None = None
+
     for attempt in range(attempts):
         if limiter:
             limiter.wait()
         retry_after = None
         error = ""
+        req_headers = {"User-Agent": "arXiv-Project/1.0 (academic research)"}
+        if downloaded_len > 0:
+            req_headers["Range"] = f"bytes={downloaded_len}-"
+
         try:
-            response = getter(url, headers={"User-Agent": "arXiv-Project/1.0 (academic research)"},
-                              timeout=timeout, stream=True)
+            response = getter(url, headers=req_headers, timeout=timeout, stream=True)
             try:
                 code = response.status_code
                 if code == 404:
@@ -210,25 +223,54 @@ def _request_source(
                 if code == 429 or code in {500, 502, 503, 504}:
                     retry_after = recovery.parse_retry_after(response.headers.get("Retry-After"))
                     error = f"HTTP {code}"
-                elif code != 200:
+                elif code == 416:
+                    # Requested Range Not Satisfiable: reset and restart from 0
+                    downloaded_len = 0
+                    chunks.clear()
+                    total_expected_len = None
+                    error = f"HTTP {code}"
+                elif code not in (200, 206):
                     return "failed", b"", "", f"HTTP {code}"
                 else:
-                    content_type = response.headers.get("Content-Type", "").lower()
-                    chunks, size = [], 0
-                    for block in response.iter_content(chunk_size=1024 * 1024):
+                    if code == 200:
+                        chunks.clear()
+                        downloaded_len = 0
+                        final_content_type = response.headers.get("Content-Type", "").lower()
+                        exp_hdr = response.headers.get("Content-Length")
+                        if exp_hdr and exp_hdr.isdigit():
+                            total_expected_len = int(exp_hdr)
+                    elif code == 206:
+                        if not final_content_type:
+                            final_content_type = response.headers.get("Content-Type", "").lower()
+                        cr = response.headers.get("Content-Range", "")
+                        if "/" in cr:
+                            tot_str = cr.split("/")[-1].strip()
+                            if tot_str.isdigit():
+                                total_expected_len = int(tot_str)
+
+                    for block in response.iter_content(chunk_size=256 * 1024):
                         if not block:
                             continue
-                        size += len(block)
-                        if size > MAX_ARCHIVE_BYTES:
+                        downloaded_len += len(block)
+                        if downloaded_len > MAX_ARCHIVE_BYTES:
                             return "failed", b"", "", "Source archive exceeded 128 MiB safety limit"
                         chunks.append(block)
-                    return "ok", b"".join(chunks), content_type, ""
+
+                    if total_expected_len is not None and downloaded_len < total_expected_len:
+                        raise requests.RequestException(
+                            f"IncompleteRead({downloaded_len} bytes read, {total_expected_len - downloaded_len} more expected)"
+                        )
+
+                    return "ok", b"".join(chunks), final_content_type, ""
             finally:
                 response.close()
-        except requests.RequestException as exc:
+        except (requests.RequestException, http.client.IncompleteRead) as exc:
             error = f"Network failure: {exc}"
+
         if attempt + 1 < attempts:
             delay = retry_after if retry_after is not None else min(2 ** (attempt + 1), 60)
+            if downloaded_len > 0:
+                print(f"[Versions] Reconnecting {url} at byte {downloaded_len} in {delay:.1f}s ({error})", flush=True)
             time.sleep(max(config.ARXIV_MIN_INTERVAL, delay) + random.uniform(0, 0.5))
         else:
             return "failed", b"", "", error
@@ -399,66 +441,67 @@ def run_version_downloads(
     attempts = 0
     total_candidates = plan["summary"].get("to_download", 0)
     progress_total = min(max_downloads, total_candidates) if max_downloads else total_candidates
-    for task in plan["worklist"]:
-        paper_id, version = task["arxiv_id"], task["version"]
-        if task["action"] == "conflict":
-            counts["conflicts"] += 1
-            print(f"[Versions] CONFLICT {paper_id}/{version}: {task['reason']}", flush=True)
-            continue
-        if max_downloads and attempts >= max_downloads:
-            break
-        # Recheck immediately before each network request (resume, crash safety).
-        current = _status_record(raw, paper_id, version)
-        if current is not None:
-            counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
-            continue
-        url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
-        attempts += 1
-        start = time.monotonic()
-        print(f"[Versions] {attempts}/{max_downloads or 'all'} GET {url}", flush=True)
-        try:
-            if fetch is not None:
-                state, body, content_type, error = fetch(url)
-            else:
-                state, body, content_type, error = _request_source(url, limiter=limiter)
-            if state == "ok":
-                status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
-                with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
-                    stage = Path(tmp)
-                    if status == "success":
-                        extracted, has_tex = extract_source_archive(body, stage)
-                        if not extracted or not has_tex:
-                            raise ValueError("Source archive has no valid LaTeX (.tex)")
-                    marker = _make_marker(stage, paper_id, version, status, url, len(body))
-                    output = _publish_version(stage, raw, paper_id, version)
-                    # Verify published marker and every TeX/Bib hash, not just staging.
-                    checked = _status_record(raw, paper_id, version)
-                    if not checked or checked["status"] != status:
-                        raise RuntimeError(f"Published files failed verification: {output}")
-                event = _event(paper_id, version, status, marker=marker,
-                               elapsed=time.monotonic() - start)
-            else:
-                event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
-                               error=error or state, elapsed=time.monotonic() - start,
-                               previous_attempts=task.get("previous_attempts", 0))
-        except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
-            # An existing final directory or an unverified stage must not be
-            # replaced or deleted. Record failure, then continue.
-            event = _event(paper_id, version, "failed",
-                           error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
-                           previous_attempts=task.get("previous_attempts", 0))
-        # Append event only after publication; a later run can recover from the marker.
-        recovery.durable_append(data / "versions_manifest.jsonl", event)
-        events.append(event)
-        counts[event["status"]] += 1
-        print(f"[Versions] {paper_id}/{version}: {event['status']} "
-              f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
-        if progress_callback is not None:
+    with requests.Session() as session:
+        for task in plan["worklist"]:
+            paper_id, version = task["arxiv_id"], task["version"]
+            if task["action"] == "conflict":
+                counts["conflicts"] += 1
+                print(f"[Versions] CONFLICT {paper_id}/{version}: {task['reason']}", flush=True)
+                continue
+            if max_downloads and attempts >= max_downloads:
+                break
+            # Recheck immediately before each network request (resume, crash safety).
+            current = _status_record(raw, paper_id, version)
+            if current is not None:
+                counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
+                continue
+            url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
+            attempts += 1
+            start = time.monotonic()
+            print(f"[Versions] {attempts}/{max_downloads or 'all'} GET {url}", flush=True)
             try:
-                progress_callback(attempts, progress_total, event)
-            except Exception as exc:
-                # Progress UI is best-effort; never turn a recorded download into a failure.
-                print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
+                if fetch is not None:
+                    state, body, content_type, error = fetch(url)
+                else:
+                    state, body, content_type, error = _request_source(url, session=session, limiter=limiter)
+                if state == "ok":
+                    status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
+                    with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
+                        stage = Path(tmp)
+                        if status == "success":
+                            extracted, has_tex = extract_source_archive(body, stage)
+                            if not extracted or not has_tex:
+                                raise ValueError("Source archive has no valid LaTeX (.tex)")
+                        marker = _make_marker(stage, paper_id, version, status, url, len(body))
+                        output = _publish_version(stage, raw, paper_id, version)
+                        # Verify published marker and every TeX/Bib hash, not just staging.
+                        checked = _status_record(raw, paper_id, version)
+                        if not checked or checked["status"] != status:
+                            raise RuntimeError(f"Published files failed verification: {output}")
+                    event = _event(paper_id, version, status, marker=marker,
+                                   elapsed=time.monotonic() - start)
+                else:
+                    event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
+                                   error=error or state, elapsed=time.monotonic() - start,
+                                   previous_attempts=task.get("previous_attempts", 0))
+            except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
+                # An existing final directory or an unverified stage must not be
+                # replaced or deleted. Record failure, then continue.
+                event = _event(paper_id, version, "failed",
+                               error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
+                               previous_attempts=task.get("previous_attempts", 0))
+            # Append event only after publication; a later run can recover from the marker.
+            recovery.durable_append(data / "versions_manifest.jsonl", event)
+            events.append(event)
+            counts[event["status"]] += 1
+            print(f"[Versions] {paper_id}/{version}: {event['status']} "
+                  f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
+            if progress_callback is not None:
+                try:
+                    progress_callback(attempts, progress_total, event)
+                except Exception as exc:
+                    # Progress UI is best-effort; never turn a recorded download into a failure.
+                    print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
     return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
