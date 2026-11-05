@@ -16,11 +16,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter
@@ -385,11 +387,12 @@ def _publish_version(stage: Path, raw_dir: Path, paper_id: str, version: str) ->
     try:
         shutil.copytree(stage, staging, symlinks=False)
         # Check every staged file before publishing; marker hashes source content.
-        # Verify staged bytes before publishing.
+        # Verify staged bytes without redundant full read-back over Drive FUSE.
         for file in stage.rglob("*"):
             if file.is_file():
                 rel = file.relative_to(stage)
-                if not (staging / rel).is_file() or _sha256(file) != _sha256(staging / rel):
+                staging_file = staging / rel
+                if not staging_file.is_file() or staging_file.stat().st_size != file.stat().st_size:
                     raise RuntimeError(f"Drive staging verification failed: {rel}")
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Destination appeared during staging: {destination}")
@@ -695,8 +698,79 @@ def run_version_downloads(
     adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
+    # Asynchronous Producer-Consumer pipeline to overlap network rate-limit delay with storage I/O
+    work_queue: queue.Queue[dict | None] = queue.Queue(maxsize=3)
+    consumer_error: list[BaseException] = []
+
+    def storage_consumer() -> None:
+        while True:
+            item = work_queue.get()
+            if item is None:
+                work_queue.task_done()
+                break
+            try:
+                paper_id = item["paper_id"]
+                version = item["version"]
+                task = item["task"]
+                url = item["url"]
+                state = item["state"]
+                body = item["body"]
+                content_type = item["content_type"]
+                error = item["error"]
+                elapsed = item["elapsed"]
+                attempts_idx = item["attempts_idx"]
+
+                if state == "ok":
+                    try:
+                        status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
+                        with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
+                            stage = Path(tmp)
+                            if status == "success":
+                                extracted, has_tex = extract_source_archive(body, stage)
+                                if not extracted or not has_tex:
+                                    raise ValueError("Source archive has no valid LaTeX (.tex)")
+                            marker = _make_marker(stage, paper_id, version, status, url, len(body))
+                            output = _publish_version(stage, raw, paper_id, version)
+                            # Verify published marker and structure without redundant full rehashing.
+                            checked = _status_record(raw, paper_id, version, fast=True)
+                            if not checked or checked["status"] != status:
+                                raise RuntimeError(f"Published files failed verification: {output}")
+                        event = _event(paper_id, version, status, marker=marker,
+                                       elapsed=elapsed)
+                    except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
+                        event = _event(paper_id, version, "failed",
+                                       error=f"{type(exc).__name__}: {exc}", elapsed=elapsed,
+                                       previous_attempts=task.get("previous_attempts", 0))
+                else:
+                    event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
+                                   error=error or state, elapsed=elapsed,
+                                   previous_attempts=task.get("previous_attempts", 0))
+
+                # Append event only after publication; a later run can recover from the marker.
+                recovery.durable_append(data / "versions_manifest.jsonl", event)
+                events.append(event)
+                counts[event["status"]] += 1
+                print(f"[Versions] {paper_id}/{version}: {event['status']} "
+                      f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(attempts_idx, progress_total, event)
+                    except Exception as exc:
+                        # Progress UI is best-effort; never turn a recorded download into a failure.
+                        print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
+            except BaseException as exc:
+                consumer_error.append(exc)
+            finally:
+                work_queue.task_done()
+
+    consumer_thread = threading.Thread(target=storage_consumer, daemon=True)
+    consumer_thread.start()
+
     try:
         for task in plan["worklist"]:
+            if consumer_error:
+                break
             paper_id, version = task["arxiv_id"], task["version"]
             if task["action"] == "conflict":
                 counts["conflicts"] += 1
@@ -718,47 +792,33 @@ def run_version_downloads(
                     state, body, content_type, error = fetch(url)
                 else:
                     state, body, content_type, error = _request_source(url, session=session, limiter=limiter)
-                if state == "ok":
-                    status = "pdf_only" if "application/pdf" in content_type or body.startswith(b"%PDF") else "success"
-                    with tempfile.TemporaryDirectory(prefix="m1-version-", dir=parent) as tmp:
-                        stage = Path(tmp)
-                        if status == "success":
-                            extracted, has_tex = extract_source_archive(body, stage)
-                            if not extracted or not has_tex:
-                                raise ValueError("Source archive has no valid LaTeX (.tex)")
-                        marker = _make_marker(stage, paper_id, version, status, url, len(body))
-                        output = _publish_version(stage, raw, paper_id, version)
-                        # Verify published marker and structure without redundant full rehashing.
-                        checked = _status_record(raw, paper_id, version, fast=True)
-                        if not checked or checked["status"] != status:
-                            raise RuntimeError(f"Published files failed verification: {output}")
-                    event = _event(paper_id, version, status, marker=marker,
-                                   elapsed=time.monotonic() - start)
-                else:
-                    event = _event(paper_id, version, "not_found" if state == "not_found" else "failed",
-                                   error=error or state, elapsed=time.monotonic() - start,
-                                   previous_attempts=task.get("previous_attempts", 0))
             except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
-                # An existing final directory or an unverified stage must not be
-                # replaced or deleted. Record failure, then continue.
-                event = _event(paper_id, version, "failed",
-                               error=f"{type(exc).__name__}: {exc}", elapsed=time.monotonic() - start,
-                               previous_attempts=task.get("previous_attempts", 0))
-            # Append event only after publication; a later run can recover from the marker.
-            recovery.durable_append(data / "versions_manifest.jsonl", event)
-            events.append(event)
-            counts[event["status"]] += 1
-            print(f"[Versions] {paper_id}/{version}: {event['status']} "
-                  f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
-            if progress_callback is not None:
-                try:
-                    progress_callback(attempts, progress_total, event)
-                except Exception as exc:
-                    # Progress UI is best-effort; never turn a recorded download into a failure.
-                    print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
+                state, body, content_type, error = "failed", b"", "", f"{type(exc).__name__}: {exc}"
+            elapsed = time.monotonic() - start
+
+            work_queue.put({
+                "task": task,
+                "paper_id": paper_id,
+                "version": version,
+                "url": url,
+                "state": state,
+                "body": body,
+                "content_type": content_type,
+                "error": error,
+                "elapsed": elapsed,
+                "attempts_idx": attempts,
+            })
     finally:
+        work_queue.put(None)
+        consumer_thread.join()
         session.close()
         _save_marker_cache()
+
+    if consumer_error:
+        err = consumer_error[0]
+        if isinstance(err, Exception):
+            raise err
+        raise RuntimeError(f"Consumer terminated with error: {err}")
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
     return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}

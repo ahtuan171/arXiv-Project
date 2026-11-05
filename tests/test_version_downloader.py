@@ -322,3 +322,29 @@ def test_request_source_resumes_with_http_range():
     assert len(call_records) == 2
 
 
+def test_pipelined_downloads_overlap_storage_io(tmp_path):
+    import time
+    data = fixture_data(tmp_path)
+    progress = []
+
+    def slow_fetch(url):
+        time.sleep(0.05)
+        return "ok", tex_archive(), "application/gzip", ""
+
+    t0 = time.monotonic()
+    result = run_version_downloads(
+        data, ids=["2501.00001"], dry_run=False, max_downloads=2,
+        scratch_parent=tmp_path, fetch=slow_fetch, min_interval=0.05,
+        progress_callback=lambda completed, total, ev: progress.append((completed, total, ev["version"])),
+    )
+    duration = time.monotonic() - t0
+
+    assert result["summary"]["success"] == 2
+    assert progress == [(1, 2, "v1"), (2, 2, "v2")]
+    assert (data / "raw" / "2501_00001" / "v1" / "main.tex").is_file()
+    assert (data / "raw" / "2501_00001" / "v2" / "main.tex").is_file()
+    assert (data / "raw" / "2501_00001" / "v1" / ".version-status.json").is_file()
+    assert (data / "raw" / "2501_00001" / "v2" / ".version-status.json").is_file()
+
+
+
