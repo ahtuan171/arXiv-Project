@@ -66,7 +66,7 @@ def _paper_id(value: Any) -> str:
     return canonical
 
 
-def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
+def _status_record(raw_dir: Path, paper_id: str, version: str, *, check_hashes: bool = True) -> dict | None:
     """Verify one known target, without scanning any other legacy raw folder."""
     target = raw_dir / paper_id / version
     if not target.exists() and not target.is_symlink():
@@ -86,6 +86,11 @@ def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
         records = payload["files"]
         if not isinstance(records, list):
             raise ValueError("marker files missing")
+
+        # Fast path: when check_hashes is False, return valid status and marker payload immediately
+        if not check_hashes:
+            return {"status": status, "marker": payload}
+
         seen = set()
         tex_count = 0
         for record in records:
@@ -96,7 +101,7 @@ def _status_record(raw_dir: Path, paper_id: str, version: str) -> dict | None:
             if ".." in parts or rel in seen:
                 raise ValueError("duplicate or traversing file path")
             seen.add(rel)
-            if not (rel.lower().endswith(".tex") or rel.lower().endswith(".bib")):
+            if not (rel.lower().endswith(".tex") or rel.lower().endswith(".bib") or rel.lower().endswith(".bbl")):
                 raise ValueError("not a permitted source type")
             item = target / rel
             if item.is_symlink() or not item.is_file():
@@ -132,7 +137,7 @@ def _make_marker(
             raise ValueError(f"Unsafe extracted symlink: {file}")
         if not file.is_file() or file.name == _MARKER:
             continue
-        if file.suffix.lower() not in {".tex", ".bib"}:
+        if file.suffix.lower() not in {".tex", ".bib", ".bbl"}:
             raise ValueError(f"Unexpected extracted source: {file}")
         records.append({
             "path": file.relative_to(stage).as_posix(),
@@ -289,6 +294,7 @@ def plan_version_downloads(
     *,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    check_hashes: bool = True,
 ) -> dict:
     """Plan attempts using verified vN directories and the last manifest event.
 
@@ -318,7 +324,7 @@ def plan_version_downloads(
             counts["invalid_versions"] += 1
             continue
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version)
+            current = _status_record(data / "raw", paper_id, version, check_hashes=check_hashes)
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -366,6 +372,7 @@ def run_version_downloads(
     progress_callback: ProgressFn | None = None,
     retry_errors: bool = False,
     retry_not_found: bool = False,
+    check_hashes: bool = True,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -381,7 +388,8 @@ def run_version_downloads(
         raise ValueError("max_downloads must be >= 0")
     data = Path(data_dir)
     plan = plan_version_downloads(
-        data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found
+        data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found,
+        check_hashes=check_hashes,
     )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
@@ -408,7 +416,7 @@ def run_version_downloads(
         if max_downloads and attempts >= max_downloads:
             break
         # Recheck immediately before each network request (resume, crash safety).
-        current = _status_record(raw, paper_id, version)
+        current = _status_record(raw, paper_id, version, check_hashes=False)
         if current is not None:
             counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
             continue

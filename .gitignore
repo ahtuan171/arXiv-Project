@@ -31,3 +31,7 @@ Project_description/
 
 # Agent plans & scratch
 docs/superpowers/
+
+# Automated tests
+tests/
+

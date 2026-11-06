@@ -44,6 +44,7 @@ ProgressFn = Callable[[int, int, dict], None]
 def audit_version_downloads(
     data_dir: str | Path, *, sample_size: int = 10,
     progress_callback: ProgressFn | None = None,
+    fast_check: bool = False,
 ) -> dict[str, Any]:
     """Verify every expected version and return one in-memory row per key.
 
@@ -93,7 +94,7 @@ def audit_version_downloads(
             expected.add(key)
             event = history.get(key, {})
             manifest_status = str(event.get("status") or "")
-            state = _status_record(root / "raw", paper_id, version)
+            state = _status_record(root / "raw", paper_id, version, check_hashes=not fast_check)
             url = f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}"
             record = {
                 "arxiv_id": paper_id, "version": version,
