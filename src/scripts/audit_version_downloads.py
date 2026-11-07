@@ -255,6 +255,112 @@ def export_download_stats_csv(report: dict[str, Any], *, csv_path: str | Path | 
     return dest
 
 
+def sync_download_stats_from_manifest(data_dir: str | Path) -> tuple[Path | None, Path | None]:
+    """Atomically update Table 2 (m1_download_stats.csv) and version CSV directly from manifest.
+
+    Fast path: zero filesystem / SHA-256 checks on Google Drive.
+    """
+    root = Path(data_dir)
+    manifest_path = root / "versions_manifest.jsonl"
+    if not manifest_path.is_file():
+        return None, None
+
+    history = _latest_version_events(manifest_path)
+    if not history:
+        return None, None
+
+    csv_dir = root / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Generate version-level rows
+    version_rows = []
+    grouped: dict[str, list[dict]] = {}
+    for (paper_id, version), event in sorted(history.items()):
+        status = event.get("status") or "pending"
+        raw_size = int(event.get("raw_size_bytes") or 0)
+        clean_size = int(event.get("cleaned_size_bytes") or 0)
+        num_tex = int(event.get("num_tex_files") or 0)
+        dl_time = float(event.get("download_time_sec") or 0.0)
+
+        v_row = {
+            "arxiv_id": paper_id,
+            "version": version,
+            "status": status,
+            "verification": "verified" if status in {"success", "pdf_only"} else "unverified",
+            "manifest_status": status,
+            "source_url": event.get("source_url") or f"{SOURCE_BASE_URL}/{_network_id(paper_id)}{version}",
+            "raw_path": event.get("raw_path") or (f"raw/{paper_id}/{version}" if status in {"success", "pdf_only"} else ""),
+            "raw_size_bytes": raw_size,
+            "cleaned_size_bytes": clean_size,
+            "num_tex_files": num_tex,
+            "download_time_sec": round(dl_time, 4),
+            "attempts": event.get("attempts", ""),
+            "fetched_at": event.get("fetched_at", ""),
+            "error": event.get("error", ""),
+        }
+        version_rows.append(v_row)
+        grouped.setdefault(paper_id, []).append(v_row)
+
+    # 2. Write m1_download_versions.csv atomically
+    v_dest = csv_dir / "m1_download_versions.csv"
+    fd_v, name_v = tempfile.mkstemp(prefix=f".{v_dest.name}.", dir=csv_dir)
+    try:
+        with os.fdopen(fd_v, "w", encoding="utf-8", newline="") as h_v:
+            writer_v = csv.DictWriter(h_v, fieldnames=COLUMNS, extrasaction="raise")
+            writer_v.writeheader()
+            writer_v.writerows(version_rows)
+            h_v.flush()
+            os.fsync(h_v.fileno())
+        os.replace(name_v, v_dest)
+    finally:
+        Path(name_v).unlink(missing_ok=True)
+
+    # 3. Aggregate paper-level rows for Table 2 (m1_download_stats.csv)
+    paper_rows = []
+    for aid, versions in sorted(grouped.items()):
+        statuses = [v.get("status") for v in versions]
+        if any(s == "success" for s in statuses):
+            status = "success"
+        elif any(s == "pdf_only" for s in statuses):
+            status = "pdf_only"
+        elif any(s == "not_found" for s in statuses):
+            status = "failed"
+        else:
+            status = "failed"
+
+        raw_sum = sum(int(v.get("raw_size_bytes") or 0) for v in versions)
+        clean_sum = sum(int(v.get("cleaned_size_bytes") or 0) for v in versions)
+        tex_files = sum(int(v.get("num_tex_files") or 0) for v in versions)
+        time_sum = sum(float(v.get("download_time_sec") or 0.0) for v in versions)
+        has_tex = tex_files > 0 and status == "success"
+
+        paper_rows.append({
+            "arxiv_id": _network_id(aid),
+            "download_status": status,
+            "has_tex": has_tex,
+            "raw_size_bytes": raw_sum,
+            "cleaned_size_bytes": clean_sum,
+            "num_tex_files": tex_files,
+            "download_time_sec": round(time_sum, 4),
+        })
+
+    # 4. Write m1_download_stats.csv atomically
+    dest = csv_dir / "m1_download_stats.csv"
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", dir=csv_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=DOWNLOAD_STATS_COLUMNS, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(paper_rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, dest)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+    return dest, v_dest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
