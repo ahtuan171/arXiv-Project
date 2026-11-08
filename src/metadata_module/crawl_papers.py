@@ -345,6 +345,8 @@ def crawl_papers(
         try:
             for b_idx in range(0, len(todo), batch_size):
                 batch_ids = todo[b_idx : b_idx + batch_size]
+                print(f"[Metadata] Đang hỏi arXiv: batch {b_idx // batch_size + 1}, "
+                      f"ID {batch_ids[0]} đến {batch_ids[-1]}", flush=True)
                 if rate_limiter is not None:
                     rate_limiter.wait()
                 t0 = time.perf_counter()
@@ -402,6 +404,10 @@ def crawl_papers(
                     recovery.durable_append_many(jsonl_stats_p, batch_stats)
                 if batch_ledger:
                     ledger.record_many(batch_ledger)
+                done = b_idx + len(batch_ids)
+                percent = 100 * done / len(todo) if todo else 100
+                print(f"[Metadata] Đã ghi {done}/{len(todo)} ({percent:.1f}%) | "
+                      f"thành công: {success}, lỗi/không tìm thấy: {error}", flush=True)
         finally:
             # Ctrl-C still leaves a clean current snapshot; a hard crash is
             # recovered from the journal by both resume and the metadata reader.

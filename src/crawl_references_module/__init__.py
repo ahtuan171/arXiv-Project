@@ -1,6 +1,12 @@
 """Crawl references module: crawl, parse, and monitor references from Semantic Scholar."""
 
 from src.crawl_references_module.crawler import crawl_references, crawl_references_range, paths_for
+from src.crawl_references_module.raw_reference_collector import (
+    collect_raw_references,
+    export_raw_reference_stats,
+    publish_references,
+    prune_unverified_references,
+)
 from src.crawl_references_module.read_ref import load_references
 from src.crawl_references_module.s2_api_client import S2ApiClient
 from src.crawl_references_module.s2_client import S2BrowserClient
@@ -11,6 +17,10 @@ __all__ = [
     "crawl_references_range",
     "paths_for",
     "load_references",
+    "collect_raw_references",
+    "export_raw_reference_stats",
+    "publish_references",
+    "prune_unverified_references",
     "S2ApiClient",
     "S2BrowserClient",
     "CrawlStats",

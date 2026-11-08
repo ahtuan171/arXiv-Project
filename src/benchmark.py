@@ -51,6 +51,109 @@ def current_process_ram_mb() -> float:
         return 0.0
 
 
+def _fast_data_dir_storage(path: Path) -> tuple[int, int] | None:
+    """Fast size calculation for pipeline data directory without recursive Drive scan."""
+    try:
+        if not path.is_dir():
+            return None
+
+        # Check if this is a pipeline data directory
+        is_data_dir = (
+            (path / "raw").is_dir()
+            or (path / "csv").is_dir()
+            or (path / "papers.jsonl").is_file()
+            or (path / "versions_manifest.jsonl").is_file()
+        )
+        if not is_data_dir:
+            return None
+
+        csv_dir = path / "csv"
+        stat_csv = csv_dir / "m1_download_stats.csv"
+        version_csv = csv_dir / "m1_download_versions.csv"
+        manifest_file = path / "versions_manifest.jsonl"
+
+        total = 0
+        max_raw = 0
+        import csv
+        import json
+
+        # Priority 1: Read from Table 2 stats CSV or version CSV if already exported
+        target_csv = stat_csv if stat_csv.is_file() else (version_csv if version_csv.is_file() else None)
+        if target_csv is not None:
+            try:
+                with target_csv.open("r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        try:
+                            total += int(row.get("cleaned_size_bytes") or 0)
+                            max_raw = max(max_raw, int(row.get("raw_size_bytes") or 0))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                target_csv = None
+
+        # Priority 2: If CSV is not available, read directly from versions_manifest.jsonl
+        if target_csv is None and manifest_file.is_file():
+            try:
+                latest_events = {}
+                with manifest_file.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                            k = (ev.get("arxiv_id"), ev.get("version"))
+                            if k[0] and k[1]:
+                                latest_events[k] = ev
+                        except Exception:
+                            pass
+                for ev in latest_events.values():
+                    try:
+                        total += int(ev.get("cleaned_size_bytes") or 0)
+                        max_raw = max(max_raw, int(ev.get("raw_size_bytes") or 0))
+                    except (ValueError, TypeError):
+                        pass
+            except Exception:
+                pass
+
+        # Top-level pipeline files (avoid open-ended scandir over FUSE)
+        top_files = [
+            path / "papers.jsonl",
+            path / "papers.jsonl.journal",
+            path / "versions_manifest.jsonl",
+            path / "references.jsonl",
+            path / "references_raw.jsonl",
+            path / "references_raw_ledger.jsonl",
+        ]
+        for f in top_files:
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+
+        # Known CSV files in data_dir / "csv"
+        known_csvs = [
+            csv_dir / "m1_download_stats.csv",
+            csv_dir / "m1_download_versions.csv",
+            csv_dir / "m1_discovery_stats.csv",
+            csv_dir / "m1_references_stats.csv",
+            csv_dir / "m1_system_benchmark.csv",
+            csv_dir / "m1_version_pipeline_benchmark.csv",
+        ]
+        for f in known_csvs:
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+
+        return total, max_raw
+    except Exception:
+        return None
+
+
 def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
     """Calculate total size of all files across given paths in megabytes."""
     total_bytes = 0
@@ -59,46 +162,51 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
         if not p.exists():
             continue
 
-        # Fast path: try 'du -sb' on Linux systems (up to 100x faster than recursive scandir)
-        used_fast = False
-        if sys.platform.startswith("linux"):
-            try:
-                res = subprocess.run(
-                    ["du", "-sb", str(p)],
-                    capture_output=True,
-                    text=True,
-                    timeout=5.0,
-                    check=True,
-                )
-                output = res.stdout.strip()
-                if output:
-                    total_bytes += int(output.split()[0])
-                    used_fast = True
-            except Exception:
-                used_fast = False
+        # Fast path 1: Check if this is a pipeline data directory with existing stats CSV or manifest
+        fast_result = _fast_data_dir_storage(p)
+        if fast_result is not None:
+            total_bytes += fast_result[0]
+            continue
 
-        if not used_fast:
-            if p.is_file():
-                try:
-                    total_bytes += p.stat().st_size
-                except OSError:
-                    pass
-            else:
-                stack = [str(p)]
-                while stack:
-                    curr = stack.pop()
+        # Pure string detection of Google Drive to avoid slow or blocking p.resolve()
+        p_str = str(p).replace("\\", "/").lower()
+        is_drive = "/content/drive" in p_str or "/drive" in p_str or "gdrive" in p_str
+
+        if p.is_file():
+            try:
+                total_bytes += p.stat().st_size
+            except OSError:
+                pass
+        elif is_drive:
+            # On Google Drive FUSE, only shallow non-recursive scan to avoid FUSE lockup
+            try:
+                for entry in os.scandir(p):
                     try:
-                        with os.scandir(curr) as it:
-                            for entry in it:
-                                try:
-                                    if entry.is_file(follow_symlinks=False):
-                                        total_bytes += entry.stat(follow_symlinks=False).st_size
-                                    elif entry.is_dir(follow_symlinks=False):
-                                        stack.append(entry.path)
-                                except OSError:
-                                    pass
+                        if entry.is_file(follow_symlinks=False):
+                            total_bytes += entry.stat(follow_symlinks=False).st_size
                     except OSError:
                         pass
+            except OSError:
+                pass
+        else:
+            # Local directory: safe time-bounded shallow/recursive scan (max 1.0s)
+            stack = [str(p)]
+            start_scan = time.monotonic()
+            while stack and (time.monotonic() - start_scan < 1.0):
+                curr = stack.pop()
+                try:
+                    with os.scandir(curr) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    total_bytes += entry.stat(follow_symlinks=False).st_size
+                                elif entry.is_dir(follow_symlinks=False):
+                                    stack.append(entry.path)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+
     return round(total_bytes / (1024 * 1024), 4)
 
 
@@ -109,7 +217,7 @@ class SystemBenchmarkTracker:
         self,
         storage_dirs: Optional[Iterable[Union[Path, str]]] = None,
         sample_interval_sec: float = 0.5,
-        disk_sample_interval_sec: float = 10.0,
+        disk_sample_interval_sec: float = 0.0,
     ) -> None:
         if storage_dirs is None:
             self.storage_dirs = [config.DATA_DIR]
@@ -205,20 +313,45 @@ class SystemBenchmarkTracker:
         if final_ram > 0:
             self._ram_samples.append(final_ram)
 
-        # Avoid slow recursive du -sb / os.scandir over network filesystems / Google Drive
+        # Avoid slow recursive du / os.scandir over network filesystems / Google Drive
         now = time.monotonic()
+        peak_extra_mb = 0.0
+        final_storage = 0.0
+
         if final_storage_mb is not None:
             final_storage = max(0.0, float(final_storage_mb))
-        elif self.disk_sample_interval_sec == 0.0:
-            final_storage = self._peak_disk_mb
-        elif self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
-            final_storage = self._peak_disk_mb
+            for d in self.storage_dirs:
+                fast_res = _fast_data_dir_storage(Path(d))
+                if fast_res is not None and fast_res[1] > 0:
+                    extra = round(fast_res[1] / (1024 * 1024), 2)
+                    if extra > peak_extra_mb:
+                        peak_extra_mb = extra
         else:
-            final_storage = calculate_storage_mb(self.storage_dirs)
-            self._last_disk_time = time.monotonic()
+            # Single-pass fast calculation for all storage dirs (never scans twice)
+            fast_found = False
+            for d in self.storage_dirs:
+                fast_res = _fast_data_dir_storage(Path(d))
+                if fast_res is not None:
+                    fast_found = True
+                    final_storage += round(fast_res[0] / (1024 * 1024), 4)
+                    if fast_res[1] > 0:
+                        extra = round(fast_res[1] / (1024 * 1024), 2)
+                        if extra > peak_extra_mb:
+                            peak_extra_mb = extra
+
+            if not fast_found:
+                if self.disk_sample_interval_sec == 0.0:
+                    final_storage = self._peak_disk_mb
+                elif self._peak_disk_mb > 0 and (now - self._last_disk_time < 3.0):
+                    final_storage = self._peak_disk_mb
+                else:
+                    final_storage = calculate_storage_mb(self.storage_dirs)
+                    self._last_disk_time = time.monotonic()
 
         if final_storage > self._peak_disk_mb:
             self._peak_disk_mb = final_storage
+        if (final_storage + peak_extra_mb) > self._peak_disk_mb:
+            self._peak_disk_mb = round(final_storage + peak_extra_mb, 2)
 
         total_wall_time = max(0.0, self._end_time - self._start_time) if self._start_time > 0 else 0.0
         peak_ram = max(self._ram_samples) if self._ram_samples else current_process_ram_mb()

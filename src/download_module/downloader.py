@@ -115,8 +115,8 @@ def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool
                     continue
 
                 lower_name = member.name.lower()
-                # Strictly keep ONLY .tex and .bib files
-                if not member.isfile() or not (lower_name.endswith(".tex") or lower_name.endswith(".bib")):
+                # Strictly keep ONLY .tex, .bib, and .bbl files
+                if not member.isfile() or not (lower_name.endswith(".tex") or lower_name.endswith(".bib") or lower_name.endswith(".bbl")):
                     continue
 
                 if lower_name.endswith(".tex"):
