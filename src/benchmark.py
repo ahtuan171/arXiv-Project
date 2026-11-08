@@ -56,41 +56,90 @@ def _fast_data_dir_storage(path: Path) -> tuple[int, int] | None:
     try:
         if not path.is_dir():
             return None
+
+        # Check if this is a pipeline data directory
+        is_data_dir = (
+            (path / "raw").is_dir()
+            or (path / "csv").is_dir()
+            or (path / "papers.jsonl").is_file()
+            or (path / "versions_manifest.jsonl").is_file()
+        )
+        if not is_data_dir:
+            return None
+
         csv_dir = path / "csv"
         stat_csv = csv_dir / "m1_download_stats.csv"
         version_csv = csv_dir / "m1_download_versions.csv"
-        target_csv = stat_csv if stat_csv.is_file() else (version_csv if version_csv.is_file() else None)
-        if target_csv is None:
-            return None
+        manifest_file = path / "versions_manifest.jsonl"
 
         total = 0
         max_raw = 0
         import csv
-        with target_csv.open("r", encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh)
-            for row in reader:
-                try:
-                    total += int(row.get("cleaned_size_bytes") or 0)
-                    max_raw = max(max_raw, int(row.get("raw_size_bytes") or 0))
-                except (ValueError, TypeError):
-                    pass
+        import json
+
+        # Priority 1: Read from Table 2 stats CSV or version CSV if already exported
+        target_csv = stat_csv if stat_csv.is_file() else (version_csv if version_csv.is_file() else None)
+        if target_csv is not None:
+            try:
+                with target_csv.open("r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        try:
+                            total += int(row.get("cleaned_size_bytes") or 0)
+                            max_raw = max(max_raw, int(row.get("raw_size_bytes") or 0))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                target_csv = None
+
+        # Priority 2: If CSV is not available, read directly from versions_manifest.jsonl
+        if target_csv is None and manifest_file.is_file():
+            try:
+                latest_events = {}
+                with manifest_file.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                            k = (ev.get("arxiv_id"), ev.get("version"))
+                            if k[0] and k[1]:
+                                latest_events[k] = ev
+                        except Exception:
+                            pass
+                for ev in latest_events.values():
+                    try:
+                        total += int(ev.get("cleaned_size_bytes") or 0)
+                        max_raw = max(max_raw, int(ev.get("raw_size_bytes") or 0))
+                    except (ValueError, TypeError):
+                        pass
+            except Exception:
+                pass
 
         # Add top-level files in data_dir (e.g. papers.jsonl, references.jsonl, manifests)
-        for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
-                try:
-                    total += entry.stat(follow_symlinks=False).st_size
-                except OSError:
-                    pass
-
-        # Add CSV files in data_dir / "csv"
-        if csv_dir.is_dir():
-            for entry in os.scandir(csv_dir):
+        try:
+            for entry in os.scandir(path):
                 if entry.is_file(follow_symlinks=False):
                     try:
                         total += entry.stat(follow_symlinks=False).st_size
                     except OSError:
                         pass
+        except OSError:
+            pass
+
+        # Add CSV files in data_dir / "csv"
+        if csv_dir.is_dir():
+            try:
+                for entry in os.scandir(csv_dir):
+                    if entry.is_file(follow_symlinks=False):
+                        try:
+                            total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
         return total, max_raw
     except Exception:
         return None
@@ -110,9 +159,21 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
             total_bytes += fast_result[0]
             continue
 
-        # Fast path 2: try 'du -sb' on Linux systems (up to 100x faster than recursive scandir)
+        # Detect Google Drive / FUSE to prevent D-state process hang
+        try:
+            resolved_p = str(p.resolve())
+        except Exception:
+            resolved_p = str(p)
+        is_drive = (
+            resolved_p.startswith(("/content/drive", "/content/gdrive", "/drive", "/mnt/drive"))
+            or "/content/drive" in resolved_p
+            or "/content/gdrive" in resolved_p
+            or "/drive/" in resolved_p
+        )
+
+        # Fast path 2: try 'du -sb' on Linux systems for LOCAL drives only
         used_fast = False
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") and not is_drive:
             try:
                 res = subprocess.run(
                     ["du", "-sb", str(p)],
@@ -134,10 +195,21 @@ def calculate_storage_mb(paths: Iterable[Union[Path, str]]) -> float:
                     total_bytes += p.stat().st_size
                 except OSError:
                     pass
+            elif is_drive:
+                # On Google Drive FUSE, avoid recursive scans that freeze FUSE
+                try:
+                    for entry in os.scandir(p):
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total_bytes += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
             else:
                 stack = [str(p)]
                 start_scan = time.monotonic()
-                # Time-bound recursive scan to 2.0s max to prevent infinite freezing on Google Drive FUSE
+                # Time-bound recursive scan to 2.0s max to prevent infinite freezing on non-drive filesystems
                 while stack and (time.monotonic() - start_scan < 2.0):
                     curr = stack.pop()
                     try:
