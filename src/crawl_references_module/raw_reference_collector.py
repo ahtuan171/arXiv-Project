@@ -281,11 +281,14 @@ def collect_raw_references(
     client: Any = None,
     progress_callback: ProgressFn | None = None,
     export_csv: bool = True,
+    fast_skip: bool = True,
 ) -> dict:
     """Opt-in bounded collection; retry/resume keys are publication IDs.
 
     A reference is recorded with version=None: Semantic Scholar does not prove
     which revision cites it. max_papers counts network attempts, not skips.
+    fast_skip=True avoids parsing the heavy raw references dataset when checking
+    already completed papers in the ledger.
     """
     if max_papers < 0:
         raise ValueError("max_papers must be >= 0")
@@ -293,19 +296,55 @@ def collect_raw_references(
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise ValueError("Unsafe data directory")
     requested = list(dict.fromkeys(_network_id(str(x)) for x in ids))
-    raw, ledger = _load_state(root)
-    plan = []
-    skipped = Counter()
-    for paper_id in requested:
-        aid = utils.canonical_arxiv_id(paper_id)
-        reason = _should_skip(
-            ledger.get(aid, {}), raw.get(aid, {}),
-            retry_errors=retry_errors, retry_not_found=retry_not_found,
-        )
-        if reason:
-            skipped[reason] += 1
-        else:
+
+    if fast_skip:
+        # Fast path: load only lightweight ledger (500KB) into memory
+        ledger: dict[str, dict] = {}
+        for event in _read_records(root / "references_raw_ledger.jsonl"):
+            aid = event.get("arxiv_id")
+            if isinstance(aid, str):
+                canonical = utils.canonical_arxiv_id(aid) if utils.is_valid_arxiv_id(aid) else aid
+                ledger[canonical] = event
+                ledger[aid] = event
+        raw = None
+        plan = []
+        skipped = Counter()
+        for paper_id in requested:
+            aid = utils.canonical_arxiv_id(paper_id)
+            ev = ledger.get(aid, {}) or ledger.get(paper_id, {})
+            status = ev.get("status")
+            if status == "ok":
+                skipped["verified_existing"] += 1
+                continue
+            if status == "not_found" and not retry_not_found:
+                skipped["known_not_found"] += 1
+                continue
+            if status == "blocked" and not retry_errors:
+                skipped["blocked_errors"] += 1
+                continue
+            if status == "error" and not retry_errors:
+                try:
+                    if float(ev.get("next_retry_at") or 0) > time.time():
+                        skipped["deferred_retry"] += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
             plan.append(paper_id)
+    else:
+        raw, ledger = _load_state(root)
+        plan = []
+        skipped = Counter()
+        for paper_id in requested:
+            aid = utils.canonical_arxiv_id(paper_id)
+            reason = _should_skip(
+                ledger.get(aid, {}), raw.get(aid, {}),
+                retry_errors=retry_errors, retry_not_found=retry_not_found,
+            )
+            if reason:
+                skipped[reason] += 1
+            else:
+                plan.append(paper_id)
+
     total = min(len(plan), max_papers) if max_papers else len(plan)
     summary = {"requested_papers": len(requested), "to_fetch": len(plan),
                "planned_this_run": total, **dict(skipped)}
@@ -322,6 +361,9 @@ def collect_raw_references(
                 "csv_path": str(csv_file) if csv_file else None}
     if (root / "references_raw.jsonl").is_symlink() or (root / "references_raw_ledger.jsonl").is_symlink():
         raise ValueError("Refusing to write through a symlink")
+
+    if raw is None:
+        raw, ledger = _load_state(root)
 
     async def _execute() -> list[dict]:
         active = client if client is not None else S2ApiClient()

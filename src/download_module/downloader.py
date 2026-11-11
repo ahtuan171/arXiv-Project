@@ -158,7 +158,20 @@ def extract_source_archive(archive_bytes: bytes, target_dir: Path) -> tuple[bool
 
 def _has_source(directory: Path) -> bool:
     """Completion requires a nonempty TeX file, not just an existing folder."""
-    return directory.is_dir() and any(
+    if not directory.is_dir():
+        return False
+    # Short-circuit shallow check first to prevent deep recursive rglob traversal over FUSE
+    try:
+        for f in directory.iterdir():
+            if f.is_file() and f.suffix.lower() == ".tex" and f.stat().st_size > 0:
+                return True
+            if f.is_dir():
+                for sub_f in f.iterdir():
+                    if sub_f.is_file() and sub_f.suffix.lower() == ".tex" and sub_f.stat().st_size > 0:
+                        return True
+    except OSError:
+        pass
+    return any(
         f.is_file() and f.suffix.lower() == ".tex" and f.stat().st_size > 0
         for f in directory.rglob("*")
     )

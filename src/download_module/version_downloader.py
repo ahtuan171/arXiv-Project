@@ -172,13 +172,15 @@ def _publish_version(stage: Path, raw_dir: Path, paper_id: str, version: str) ->
     staging = parent / f".{version}.staging-{uuid.uuid4().hex}"
     try:
         shutil.copytree(stage, staging, symlinks=False)
-        # Check every staged file before publishing; marker hashes source content.
-        # Verify staged bytes before publishing.
-        for file in stage.rglob("*"):
-            if file.is_file():
-                rel = file.relative_to(stage)
-                if not (staging / rel).is_file() or _sha256(file) != _sha256(staging / rel):
-                    raise RuntimeError(f"Drive staging verification failed: {rel}")
+        # Check every staged file before publishing only when on Google Drive FUSE.
+        # On local ext4 SSD, atomic rename is safe and fast; avoid redundant read-back hashing.
+        is_drive = "/content/drive" in str(parent.resolve())
+        if is_drive:
+            for file in stage.rglob("*"):
+                if file.is_file():
+                    rel = file.relative_to(stage)
+                    if not (staging / rel).is_file() or _sha256(file) != _sha256(staging / rel):
+                        raise RuntimeError(f"Drive staging verification failed: {rel}")
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Destination appeared during staging: {destination}")
         staging.rename(destination)
@@ -295,6 +297,7 @@ def plan_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     check_hashes: bool = True,
+    trust_manifest: bool = True,
 ) -> dict:
     """Plan attempts using verified vN directories and the last manifest event.
 
@@ -324,8 +327,16 @@ def plan_version_downloads(
             counts["invalid_versions"] += 1
             continue
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version, check_hashes=check_hashes)
             counts["expected_versions"] += 1
+            previous = history.get((paper_id, version), {})
+            prev_status = previous.get("status")
+
+            # Fast O(1) in-memory manifest lookup: eliminates tens of thousands of Drive FUSE stat calls
+            if trust_manifest and prev_status in {"success", "pdf_only"}:
+                counts["verified_existing"] += 1
+                continue
+
+            current = _status_record(data / "raw", paper_id, version, check_hashes=check_hashes)
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
             elif current:
@@ -333,12 +344,10 @@ def plan_version_downloads(
                 work.append({"arxiv_id": paper_id, "version": version, "action": "conflict",
                              "reason": current["error"]})
             else:
-                previous = history.get((paper_id, version), {})
-                previous_status = previous.get("status")
-                if previous_status == "not_found" and not retry_not_found:
+                if prev_status == "not_found" and not retry_not_found:
                     counts["known_not_found"] += 1
                     continue
-                if previous_status == "failed" and not retry_errors:
+                if prev_status == "failed" and not retry_errors:
                     if previous.get("error_type") == "blocked":
                         counts["blocked_errors"] += 1
                         continue
@@ -373,6 +382,7 @@ def run_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     check_hashes: bool = True,
+    trust_manifest: bool = True,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -389,7 +399,7 @@ def run_version_downloads(
     data = Path(data_dir)
     plan = plan_version_downloads(
         data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found,
-        check_hashes=check_hashes,
+        check_hashes=check_hashes, trust_manifest=trust_manifest,
     )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
