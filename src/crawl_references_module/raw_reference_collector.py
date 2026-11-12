@@ -32,7 +32,7 @@ from urllib.parse import quote
 from src import config, recovery, utils
 from src.crawl_references_module.s2_api_client import (
     S2ApiAuthError, S2ApiClient, S2ApiError, S2ApiNotFound,
-    S2ApiPermanentError,
+    S2ApiPermanentError, S2ApiRateLimited,
 )
 
 SOURCE_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper/arXiv:{id}/references"
