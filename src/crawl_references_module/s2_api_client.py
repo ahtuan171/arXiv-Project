@@ -24,7 +24,7 @@ from urllib.parse import quote
 
 import httpx
 
-from src import config
+from src import config, recovery
 from src.crawl_references_module.s2_client import (
     S2AuthError,
     S2Error,
@@ -306,7 +306,10 @@ class S2ApiClient:
                     raise S2ApiPayloadTooLarge(f"HTTP 413 from Semantic Scholar API: payload too large for {path}")
                 if status == 429:
                     self.rate_limit_hits += 1
-                    last_error = S2ApiRateLimited("rate limited (HTTP 429)")
+                    retry_hdr = response.headers.get("Retry-After") or response.headers.get("retry-after")
+                    retry_after = recovery.parse_retry_after(retry_hdr) if retry_hdr else None
+                    msg = f"rate limited (HTTP 429, Retry-After={retry_after:.1f}s)" if retry_after else "rate limited (HTTP 429)"
+                    last_error = S2ApiRateLimited(msg, retry_after=retry_after)
                 elif 500 <= status < 600:
                     last_error = S2ApiTransientError(f"HTTP {status} from Semantic Scholar API")
                 elif status >= 400:
@@ -338,14 +341,18 @@ class S2ApiClient:
 
             is_rate_limited = isinstance(last_error, S2ApiRateLimited)
             if is_rate_limited:
-                base_wait = max(config.S2_RATE_LIMIT_COOLDOWN, config.BACKOFF_BASE)
-                delay = base_wait * (config.BACKOFF_BASE ** (attempt - 1))
+                retry_after = getattr(last_error, "retry_after", None)
+                if retry_after is not None and retry_after > 0:
+                    delay = min(float(retry_after), config.MAX_BACKOFF)
+                else:
+                    base_wait = max(float(getattr(config, "S2_RATE_LIMIT_COOLDOWN", 15.0)), 12.0)
+                    delay = min(base_wait * (config.BACKOFF_BASE ** (attempt - 1)), config.MAX_BACKOFF)
             else:
-                delay = config.BACKOFF_BASE ** attempt
+                delay = min(config.BACKOFF_BASE ** attempt, config.MAX_BACKOFF)
 
             # Capped exponential backoff (thời gian trần) + random jitter
             delay = min(max(delay, 0.0), config.MAX_BACKOFF)
-            delay += random.uniform(0.0, config.RETRY_JITTER)
+            delay += random.uniform(0.5, config.RETRY_JITTER + 1.0)
 
             if is_rate_limited:
                 self.rate_limiter.block(delay)

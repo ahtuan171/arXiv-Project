@@ -450,6 +450,10 @@ def collect_raw_references(
                     except S2ApiAuthError:
                         raise
                     except Exception as exc:
+                        if isinstance(exc, S2ApiRateLimited) or "429" in str(exc):
+                            cooldown = max(float(getattr(config, "S2_RATE_LIMIT_COOLDOWN", 15.0)), 20.0)
+                            print(f"[Raw references] Gặp rate limit (429); tạm nghỉ {cooldown:.1f}s để quota phục hồi...", flush=True)
+                            await asyncio.sleep(cooldown)
                         print(f"[Raw references] Lỗi batch ({exc}); chuyển sang xử lý tuần tự từng bài...", flush=True)
                         for offset, pid in enumerate(batch_papers):
                             await _fetch_and_record_single(pid, b_start + offset + 1)

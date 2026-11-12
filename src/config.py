@@ -69,7 +69,10 @@ try:
     S2_WEB_MIN_INTERVAL = max(0.0, float(os.environ.get("S2_WEB_MIN_INTERVAL", "3.2")))
 except ValueError:
     S2_WEB_MIN_INTERVAL = 3.2
-S2_RATE_LIMIT_COOLDOWN = 2.2  # shared pause after any 429 response
+try:
+    S2_RATE_LIMIT_COOLDOWN = max(5.0, float(os.environ.get("S2_RATE_LIMIT_COOLDOWN", "15.0")))
+except ValueError:
+    S2_RATE_LIMIT_COOLDOWN = 15.0  # shared pause after any 429 response (CloudFront window is 20-30s)
 S2_WAF_COOLDOWN = 30.0  # longer pause after an AWS WAF challenge
 S2_PAGE_SIZE = 1000
 S2_BATCH_SIZE = 100
