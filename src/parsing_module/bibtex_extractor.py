@@ -134,24 +134,49 @@ def parse_author_list(raw_authors: str) -> list[str]:
     """Parse raw author string into a cleaned list of author names.
 
     Handles 'and' separated lists, 'Last, First' vs 'First Last',
-    and removes 'others' / 'et al.'.
+    English prose lists ('A, B, and C'), and removes 'others' / 'et al.'.
     """
     if not raw_authors:
         return []
 
-    cleaned = clean_latex_text(raw_authors)
+    cleaned = clean_latex_text(raw_authors).strip()
     cleaned = re.sub(r"\bet\s+al\.?\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bothers\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.rstrip(".").strip()
 
-    raw_list = re.split(r"\s+and\s+|\s*;\s*", cleaned, flags=re.IGNORECASE)
-    if len(raw_list) == 1 and "," in raw_list[0] and raw_list[0].count(",") > 1:
-        parts = [p.strip() for p in raw_list[0].split(",") if p.strip()]
-        if all(len(p.split()) <= 3 for p in parts):
+    and_parts = [p.strip() for p in re.split(r"\s+and\s+|\s*;\s*", cleaned, flags=re.IGNORECASE) if p.strip()]
+
+    raw_list: list[str] = []
+    if len(and_parts) == 2 and "," in and_parts[0]:
+        part0 = and_parts[0].rstrip(",")
+        part1 = and_parts[1].rstrip(",")
+        sub_parts = [p.strip() for p in part0.split(",") if p.strip()]
+        if len(sub_parts) > 1:
+            if "," not in part1:
+                raw_list = sub_parts + [part1]
+            elif len(sub_parts) == 2:
+                # e.g. "Vaswani, Ashish and Shazeer, Noam"
+                raw_list = [part0, part1]
+            elif len(sub_parts) % 2 == 0:
+                # e.g. "Nijdam, S., Teunissen, J., and Ebert, U."
+                paired = [f"{sub_parts[i]}, {sub_parts[i+1]}" for i in range(0, len(sub_parts), 2)]
+                raw_list = paired + [part1]
+            else:
+                raw_list = sub_parts + [part1]
+        else:
+            raw_list = [part0, part1]
+    elif len(and_parts) == 1 and "," in and_parts[0] and and_parts[0].count(",") > 1:
+        parts = [p.strip() for p in and_parts[0].split(",") if p.strip()]
+        if all(len(p.split()) <= 4 for p in parts):
             raw_list = parts
+        else:
+            raw_list = and_parts
+    else:
+        raw_list = and_parts
 
     authors: list[str] = []
     for item in raw_list:
-        name = item.strip().strip(",")
+        name = item.strip().strip(",").strip(".")
         if not name:
             continue
         if "," in name:
@@ -161,6 +186,7 @@ def parse_author_list(raw_authors: str) -> list[str]:
             else:
                 name = parts[0]
         name = re.sub(r"\s+", " ", name).strip()
+        name = name.rstrip(".").strip()
         if name and name.lower() not in ("and", "&", "others", "et al"):
             authors.append(name)
     return authors
