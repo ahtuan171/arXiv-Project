@@ -453,32 +453,37 @@ def collect_raw_references(
                         is_429 = isinstance(exc, S2ApiRateLimited) or "429" in str(exc)
                         if is_429:
                             cooldown = max(float(getattr(config, "S2_RATE_LIMIT_COOLDOWN", 25.0)), 25.0)
-                            print(f"[Raw references] Gặp rate limit (429) ở batch; tạm nghỉ {cooldown:.1f}s để quota phục hồi rồi thử lại batch...", flush=True)
+                            print(f"[Raw references] Gặp rate limit (429) ở batch ({len(batch_papers)} bài); tạm nghỉ {cooldown:.1f}s để quota phục hồi...", flush=True)
                             await asyncio.sleep(cooldown)
-                            try:
-                                batch_out = await _fetch_batch_papers(active, batch_papers)
-                            except Exception as retry_exc:
-                                print(f"[Raw references] Batch vẫn gặp lỗi sau khi thử lại ({retry_exc}); ghi nhận lỗi tạm thời và tiếp tục...", flush=True)
-                                now = datetime.now(timezone.utc).isoformat()
-                                for offset, pid in enumerate(batch_papers):
-                                    aid = utils.canonical_arxiv_id(pid)
-                                    event = {
-                                        "arxiv_id": aid,
-                                        "status": "error",
-                                        "raw_refs_total": 0,
-                                        "refs_with_arxiv_id": 0,
-                                        "ref_time_sec": 0.0,
-                                        "fetched_at": now,
-                                        "error": f"Batch rate limited (429): {retry_exc}",
-                                    }
-                                    recovery.durable_append(root / "references_raw_ledger.jsonl", event)
-                                    ledger[aid] = event
-                                    results.append(event)
-                                continue
                         else:
-                            print(f"[Raw references] Lỗi batch không phải 429 ({exc}); chuyển sang xử lý tuần tự từng bài...", flush=True)
+                            print(f"[Raw references] Lỗi batch ({exc}); tạm nghỉ 5.0s và thử lại batch...", flush=True)
+                            await asyncio.sleep(5.0)
+
+                        # Thử lại đúng batch đó — TUYỆT ĐỐI KHÔNG xé lẻ cào tuần tự từng bài để tránh bão rate limit
+                        try:
+                            batch_out = await _fetch_batch_papers(active, batch_papers)
+                        except Exception as retry_exc:
+                            print(f"[Raw references] ⚠️ Batch ({len(batch_papers)} bài) vẫn gặp lỗi ({retry_exc}). Bỏ qua cào tuần tự, ghi nhận lỗi vào ledger để không làm tê liệt quota.", flush=True)
+                            now = datetime.now(timezone.utc).isoformat()
                             for offset, pid in enumerate(batch_papers):
-                                await _fetch_and_record_single(pid, b_start + offset + 1)
+                                aid = utils.canonical_arxiv_id(pid)
+                                event = {
+                                    "arxiv_id": aid,
+                                    "status": "error",
+                                    "raw_refs_total": 0,
+                                    "refs_with_arxiv_id": 0,
+                                    "ref_time_sec": 0.0,
+                                    "fetched_at": now,
+                                    "error": f"Batch fetch failed: {retry_exc}",
+                                }
+                                recovery.durable_append(root / "references_raw_ledger.jsonl", event)
+                                ledger[aid] = event
+                                results.append(event)
+                                if progress_callback is not None:
+                                    try:
+                                        progress_callback(b_start + offset + 1, total, event)
+                                    except Exception:
+                                        pass
                             continue
 
                     batch_elapsed = max(0.0, time.perf_counter() - t0)
