@@ -295,8 +295,6 @@ class S2ApiClient:
                 )
             except httpx.HTTPError as error:
                 last_error = S2ApiTransientError(f"API request failed: {error}")
-            finally:
-                self.rate_limiter._last_call = time.monotonic()
             else:
                 status = response.status_code
                 logger.debug("S2 API %s %s -> %d", method, path, status)
@@ -337,6 +335,8 @@ class S2ApiClient:
                             last_error = S2ApiTransientError("unexpected API response shape")
                         else:
                             return data
+            finally:
+                self.rate_limiter._last_call = time.monotonic()
 
             if attempt == self.max_retries:
                 assert last_error is not None
