@@ -1,6 +1,6 @@
 """Parsing and standardization module for Milestone 2."""
 
-from src.parsing_module.bibtex_extractor import (
+from src.parser_module.bibtex_extractor import (
     BIBTEX_COLUMNS,
     BibtexEntry,
     clean_latex_text,
