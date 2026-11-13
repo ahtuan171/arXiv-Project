@@ -450,14 +450,36 @@ def collect_raw_references(
                     except S2ApiAuthError:
                         raise
                     except Exception as exc:
-                        if isinstance(exc, S2ApiRateLimited) or "429" in str(exc):
-                            cooldown = max(float(getattr(config, "S2_RATE_LIMIT_COOLDOWN", 15.0)), 20.0)
-                            print(f"[Raw references] Gặp rate limit (429); tạm nghỉ {cooldown:.1f}s để quota phục hồi...", flush=True)
+                        is_429 = isinstance(exc, S2ApiRateLimited) or "429" in str(exc)
+                        if is_429:
+                            cooldown = max(float(getattr(config, "S2_RATE_LIMIT_COOLDOWN", 25.0)), 25.0)
+                            print(f"[Raw references] Gặp rate limit (429) ở batch; tạm nghỉ {cooldown:.1f}s để quota phục hồi rồi thử lại batch...", flush=True)
                             await asyncio.sleep(cooldown)
-                        print(f"[Raw references] Lỗi batch ({exc}); chuyển sang xử lý tuần tự từng bài...", flush=True)
-                        for offset, pid in enumerate(batch_papers):
-                            await _fetch_and_record_single(pid, b_start + offset + 1)
-                        continue
+                            try:
+                                batch_out = await _fetch_batch_papers(active, batch_papers)
+                            except Exception as retry_exc:
+                                print(f"[Raw references] Batch vẫn gặp lỗi sau khi thử lại ({retry_exc}); ghi nhận lỗi tạm thời và tiếp tục...", flush=True)
+                                now = datetime.now(timezone.utc).isoformat()
+                                for offset, pid in enumerate(batch_papers):
+                                    aid = utils.canonical_arxiv_id(pid)
+                                    event = {
+                                        "arxiv_id": aid,
+                                        "status": "error",
+                                        "raw_refs_total": 0,
+                                        "refs_with_arxiv_id": 0,
+                                        "ref_time_sec": 0.0,
+                                        "fetched_at": now,
+                                        "error": f"Batch rate limited (429): {retry_exc}",
+                                    }
+                                    recovery.durable_append(root / "references_raw_ledger.jsonl", event)
+                                    ledger[aid] = event
+                                    results.append(event)
+                                continue
+                        else:
+                            print(f"[Raw references] Lỗi batch không phải 429 ({exc}); chuyển sang xử lý tuần tự từng bài...", flush=True)
+                            for offset, pid in enumerate(batch_papers):
+                                await _fetch_and_record_single(pid, b_start + offset + 1)
+                            continue
 
                     batch_elapsed = max(0.0, time.perf_counter() - t0)
                     per_item_time = round(batch_elapsed / max(1, len(batch_papers)), 4)

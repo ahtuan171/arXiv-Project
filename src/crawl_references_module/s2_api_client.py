@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterable, Optional
@@ -294,6 +295,8 @@ class S2ApiClient:
                 )
             except httpx.HTTPError as error:
                 last_error = S2ApiTransientError(f"API request failed: {error}")
+            finally:
+                self.rate_limiter._last_call = time.monotonic()
             else:
                 status = response.status_code
                 logger.debug("S2 API %s %s -> %d", method, path, status)
