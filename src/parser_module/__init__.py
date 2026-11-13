@@ -1,10 +1,15 @@
 """Parsing and standardization module for Milestone 2."""
 
-from src.parser_module.bib_parser import (
+from .bib_parser import (
+    BIB_STATS_COLUMNS,
     BIBTEX_COLUMNS,
+    BibStats,
     BibtexEntry,
+    batch_process_corpus_references,
     clean_latex_text,
+    compute_missing_fields_count,
     deduplicate_bibtex_entries,
+    export_bib_stats,
     export_bibtex_table,
     extract_bib_file_entries,
     extract_bibitem_entries,
@@ -14,14 +19,20 @@ from src.parser_module.bib_parser import (
     extract_year,
     find_compilation_files,
     parse_author_list,
+    process_and_export_publication_references,
     process_publication_references,
 )
 
 __all__ = [
+    "BIB_STATS_COLUMNS",
     "BIBTEX_COLUMNS",
+    "BibStats",
     "BibtexEntry",
+    "batch_process_corpus_references",
     "clean_latex_text",
+    "compute_missing_fields_count",
     "deduplicate_bibtex_entries",
+    "export_bib_stats",
     "export_bibtex_table",
     "extract_bib_file_entries",
     "extract_bibitem_entries",
@@ -31,5 +42,6 @@ __all__ = [
     "extract_year",
     "find_compilation_files",
     "parse_author_list",
+    "process_and_export_publication_references",
     "process_publication_references",
 ]

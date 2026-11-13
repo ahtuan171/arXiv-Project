@@ -6,13 +6,24 @@ from LaTeX sources (.tex, .bbl, and .bib files) into the Milestone 2 `bibtex` ta
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
+import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 import pandas as pd
+
+try:
+    from src import config, utils
+except ImportError:
+    config = None  # type: ignore[assignment]
+    utils = None  # type: ignore[assignment]
 
 # Schema column order specified in Milestone 2
 BIBTEX_COLUMNS = [
@@ -26,6 +37,40 @@ BIBTEX_COLUMNS = [
     "journal",
     "url",
 ]
+
+# Schema column order for Milestone 2 Table m2_bib_stats
+BIB_STATS_COLUMNS = [
+    "arxiv_id",
+    "bib_parse_status",
+    "bib_source_type",
+    "raw_bib_count",
+    "missing_fields_count",
+    "bib_parse_time_sec",
+]
+
+
+@dataclass
+class BibStats:
+    """Statistics for bibliography parsing matching Table m2_bib_stats."""
+
+    arxiv_id: str
+    bib_parse_status: str
+    bib_source_type: str
+    raw_bib_count: int
+    missing_fields_count: int
+    bib_parse_time_sec: float
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert stats to a 6-column dictionary conforming to m2_bib_stats."""
+        return {
+            "arxiv_id": str(self.arxiv_id).strip(),
+            "bib_parse_status": str(self.bib_parse_status).strip(),
+            "bib_source_type": str(self.bib_source_type).strip(),
+            "raw_bib_count": int(self.raw_bib_count),
+            "missing_fields_count": int(self.missing_fields_count),
+            "bib_parse_time_sec": round(float(self.bib_parse_time_sec), 4),
+        }
 
 
 @dataclass
@@ -43,6 +88,7 @@ class BibtexEntry:
     url: str = ""
     version: Optional[str] = None
     raw_text: Optional[str] = None
+    source_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert entry to the 9-column dictionary conforming to Milestone 2 table."""
@@ -387,6 +433,7 @@ def extract_bibitem_entries(
                 url=url,
                 version=version,
                 raw_text=item_raw,
+                source_type="inline_bibitem",
             )
         )
 
@@ -552,6 +599,7 @@ def extract_bib_file_entries(
                 url=url,
                 version=version,
                 raw_text=bib_content[match.start() : i],
+                source_type="bib_file",
             )
         )
 
@@ -968,6 +1016,7 @@ def deduplicate_bibtex_entries(
                     url=entry.url,
                     version=entry.version,
                     raw_text=entry.raw_text,
+                    source_type=entry.source_type,
                 ),
             )
             clusters.append(new_cluster)
@@ -999,44 +1048,146 @@ def deduplicate_bibtex_entries(
 
 # --- Publication-Level Pipeline & Export -------------------------------------
 
+def compute_missing_fields_count(df: pd.DataFrame) -> int:
+    """Count entries in bibtex table missing critical fields (title, authors, or year)."""
+    if df.empty:
+        return 0
+    missing = 0
+    for _, row in df.iterrows():
+        title = str(row.get("title") or "").strip()
+        authors = row.get("authors")
+        has_authors = bool(authors) if isinstance(authors, (list, tuple)) else bool(str(authors or "").strip())
+        year = row.get("year")
+        has_year = year is not None and not pd.isna(year)
+        if not title or not has_authors or not has_year:
+            missing += 1
+    return missing
+
+
 def process_publication_references(
     pub_dir: Path | str,
     arxiv_id: str = "",
-) -> tuple[pd.DataFrame, dict[str, str]]:
+    return_stats: bool = False,
+) -> tuple[pd.DataFrame, dict[str, str]] | tuple[pd.DataFrame, dict[str, str], BibStats]:
     """Process all versions of a publication directory, extracting and deduplicating references.
 
     Args:
         pub_dir: Path to publication directory containing version subdirectories (v1, v2...)
                  or directly containing source files.
         arxiv_id: Publication arXiv ID. If empty, tries to infer from directory name.
+        return_stats: If True, also returns BibStats for Table m2_bib_stats.
 
     Returns:
-        (bibtex_df, rename_map)
+        (bibtex_df, rename_map) if return_stats is False,
+        else (bibtex_df, rename_map, bib_stats).
     """
+    start_time = time.perf_counter()
     pub_path = Path(pub_dir)
     if not arxiv_id:
         arxiv_id = pub_path.name
+    if utils is not None and hasattr(utils, "normalize_arxiv_id"):
+        norm_id = utils.normalize_arxiv_id(arxiv_id)
+        if norm_id:
+            arxiv_id = norm_id
 
-    version_dirs = [
-        d
-        for d in pub_path.iterdir()
-        if d.is_dir() and re.match(r"^v\d+$", d.name, re.IGNORECASE)
-    ]
+    # Handle non-existent or invalid publication directory
+    if not pub_path.exists() or not pub_path.is_dir():
+        empty_df = pd.DataFrame(columns=BIBTEX_COLUMNS)
+        elapsed = round(time.perf_counter() - start_time, 4)
+        stats = BibStats(
+            arxiv_id=arxiv_id,
+            bib_parse_status="failed",
+            bib_source_type="none",
+            raw_bib_count=0,
+            missing_fields_count=0,
+            bib_parse_time_sec=elapsed,
+            error=f"Directory not found or invalid: {pub_dir}",
+        )
+        if return_stats:
+            return empty_df, {}, stats
+        return empty_df, {}
 
-    entries_by_ver: dict[str, list[BibtexEntry]] = {}
-    if version_dirs:
-        def _v_num(p: Path) -> int:
-            m = re.search(r"\d+", p.name)
-            return int(m.group(0)) if m else 0
+    try:
+        version_dirs = [
+            d
+            for d in pub_path.iterdir()
+            if d.is_dir() and re.match(r"^v\d+$", d.name, re.IGNORECASE)
+        ]
 
-        for v_dir in sorted(version_dirs, key=_v_num):
-            entries = extract_version_references(v_dir, arxiv_id=arxiv_id, version=v_dir.name)
-            entries_by_ver[v_dir.name] = entries
-    else:
-        entries = extract_version_references(pub_path, arxiv_id=arxiv_id, version="v1")
-        entries_by_ver["v1"] = entries
+        entries_by_ver: dict[str, list[BibtexEntry]] = {}
+        raw_count = 0
+        seen_source_types: set[str] = set()
 
-    return deduplicate_bibtex_entries(entries_by_ver, arxiv_id=arxiv_id)
+        if version_dirs:
+            def _v_num(p: Path) -> int:
+                m = re.search(r"\d+", p.name)
+                return int(m.group(0)) if m else 0
+
+            for v_dir in sorted(version_dirs, key=_v_num):
+                entries = extract_version_references(v_dir, arxiv_id=arxiv_id, version=v_dir.name)
+                entries_by_ver[v_dir.name] = entries
+                raw_count += len(entries)
+                for e in entries:
+                    if e.source_type:
+                        seen_source_types.add(e.source_type)
+        else:
+            entries = extract_version_references(pub_path, arxiv_id=arxiv_id, version="v1")
+            entries_by_ver["v1"] = entries
+            raw_count += len(entries)
+            for e in entries:
+                if e.source_type:
+                    seen_source_types.add(e.source_type)
+
+        df, rename_map = deduplicate_bibtex_entries(entries_by_ver, arxiv_id=arxiv_id)
+
+        # Determine source type
+        if "bib_file" in seen_source_types and "inline_bibitem" in seen_source_types:
+            source_type = "mixed"
+        elif "bib_file" in seen_source_types:
+            source_type = "bib_file"
+        elif "inline_bibitem" in seen_source_types:
+            source_type = "inline_bibitem"
+        else:
+            source_type = "none"
+
+        # Determine status
+        if len(df) > 0 or raw_count > 0:
+            status = "success"
+        else:
+            status = "no_bibitem"
+            source_type = "none"
+
+        missing_count = compute_missing_fields_count(df)
+        elapsed = round(time.perf_counter() - start_time, 4)
+
+        stats = BibStats(
+            arxiv_id=arxiv_id,
+            bib_parse_status=status,
+            bib_source_type=source_type,
+            raw_bib_count=raw_count,
+            missing_fields_count=missing_count,
+            bib_parse_time_sec=elapsed,
+        )
+
+        if return_stats:
+            return df, rename_map, stats
+        return df, rename_map
+
+    except Exception as exc:
+        empty_df = pd.DataFrame(columns=BIBTEX_COLUMNS)
+        elapsed = round(time.perf_counter() - start_time, 4)
+        stats = BibStats(
+            arxiv_id=arxiv_id,
+            bib_parse_status="failed",
+            bib_source_type="none",
+            raw_bib_count=0,
+            missing_fields_count=0,
+            bib_parse_time_sec=elapsed,
+            error=str(exc),
+        )
+        if return_stats:
+            return empty_df, {}, stats
+        return empty_df, {}
 
 
 def export_bibtex_table(
@@ -1061,6 +1212,192 @@ def export_bibtex_table(
         df.to_json(out, orient="records", lines=True, force_ascii=False)
     else:
         raise ValueError(f"Unsupported format: {format}")
+
+
+def export_bib_stats(
+    stats_data: BibStats | Sequence[BibStats | dict[str, Any]] | pd.DataFrame,
+    out_path: Path | str | None = None,
+    append: bool = False,
+) -> Path:
+    """Export m2_bib_stats statistics table to CSV with atomic write.
+
+    Args:
+        stats_data: Single BibStats, sequence of BibStats/dicts, or DataFrame.
+        out_path: Destination CSV path. Defaults to config.DATA_DIR / 'csv' / 'm2_bib_stats.csv'.
+        append: If True, preserves existing records and updates/appends by arxiv_id primary key.
+
+    Returns:
+        Path to written CSV file.
+    """
+    if out_path is None:
+        if config is not None and hasattr(config, "DATA_DIR"):
+            target_csv = Path(config.DATA_DIR) / "csv" / "m2_bib_stats.csv"
+        else:
+            target_csv = Path("data/csv/m2_bib_stats.csv")
+    else:
+        target_csv = Path(out_path)
+
+    target_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    new_rows: list[dict[str, Any]] = []
+    if isinstance(stats_data, BibStats):
+        new_rows = [stats_data.to_dict()]
+    elif isinstance(stats_data, pd.DataFrame):
+        for _, r in stats_data.iterrows():
+            new_rows.append({
+                "arxiv_id": str(r.get("arxiv_id", "")).strip(),
+                "bib_parse_status": str(r.get("bib_parse_status", "")).strip(),
+                "bib_source_type": str(r.get("bib_source_type", "")).strip(),
+                "raw_bib_count": int(r.get("raw_bib_count", 0)),
+                "missing_fields_count": int(r.get("missing_fields_count", 0)),
+                "bib_parse_time_sec": round(float(r.get("bib_parse_time_sec", 0.0)), 4),
+            })
+    elif isinstance(stats_data, Sequence):
+        for item in stats_data:
+            if isinstance(item, BibStats):
+                new_rows.append(item.to_dict())
+            elif isinstance(item, dict):
+                new_rows.append({
+                    "arxiv_id": str(item.get("arxiv_id", "")).strip(),
+                    "bib_parse_status": str(item.get("bib_parse_status", "")).strip(),
+                    "bib_source_type": str(item.get("bib_source_type", "")).strip(),
+                    "raw_bib_count": int(item.get("raw_bib_count", 0)),
+                    "missing_fields_count": int(item.get("missing_fields_count", 0)),
+                    "bib_parse_time_sec": round(float(item.get("bib_parse_time_sec", 0.0)), 4),
+                })
+    else:
+        raise TypeError(f"Unsupported stats_data type: {type(stats_data)}")
+
+    rows_by_id: dict[str, dict[str, Any]] = {}
+
+    if append and target_csv.is_file():
+        try:
+            with target_csv.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    aid = str(row.get("arxiv_id", "")).strip()
+                    if aid:
+                        rows_by_id[aid] = {
+                            "arxiv_id": aid,
+                            "bib_parse_status": str(row.get("bib_parse_status", "")).strip(),
+                            "bib_source_type": str(row.get("bib_source_type", "")).strip(),
+                            "raw_bib_count": int(row.get("raw_bib_count", 0)),
+                            "missing_fields_count": int(row.get("missing_fields_count", 0)),
+                            "bib_parse_time_sec": round(float(row.get("bib_parse_time_sec", 0.0)), 4),
+                        }
+        except Exception:
+            pass
+
+    for r in new_rows:
+        aid = r["arxiv_id"]
+        rows_by_id[aid] = r
+
+    final_rows = list(rows_by_id.values())
+
+    # Write atomically via tempfile
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{target_csv.name}.", dir=target_csv.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=BIB_STATS_COLUMNS)
+            writer.writeheader()
+            writer.writerows(final_rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, target_csv)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return target_csv
+
+
+def process_and_export_publication_references(
+    pub_dir: Path | str,
+    arxiv_id: str = "",
+    output_dir: Path | str | None = None,
+    stats_csv_path: Path | str | None = None,
+    bibtex_format: str = "parquet",
+) -> tuple[pd.DataFrame, dict[str, str], BibStats]:
+    """Process a single publication, export its bibtex table and update m2_bib_stats.csv."""
+    df, renames, stats = process_publication_references(pub_dir, arxiv_id=arxiv_id, return_stats=True)
+
+    if output_dir is not None:
+        out_d = Path(output_dir)
+        aid_clean = utils.clean_arxiv_id(stats.arxiv_id) if utils else stats.arxiv_id.replace(".", "_")
+        dest = out_d / aid_clean / f"bibtex.{bibtex_format}"
+        export_bibtex_table(df, dest, format=bibtex_format)
+
+    export_bib_stats(stats, out_path=stats_csv_path, append=True)
+    return df, renames, stats
+
+
+def batch_process_corpus_references(
+    data_dir: Path | str,
+    output_dir: Path | str | None = None,
+    stats_csv_path: Path | str | None = None,
+    bibtex_format: str = "parquet",
+) -> pd.DataFrame:
+    """Batch process multiple publication directories in data_dir, updating m2_bib_stats.csv.
+
+    Args:
+        data_dir: Directory containing individual publication folders.
+        output_dir: Optional directory to store individual bibtex table files.
+        stats_csv_path: Path to m2_bib_stats.csv.
+        bibtex_format: Format for exported bibtex files ('parquet', 'csv', 'jsonl').
+
+    Returns:
+        DataFrame representing all rows in m2_bib_stats.csv.
+    """
+    root = Path(data_dir)
+    stats_list: list[BibStats] = []
+
+    pub_dirs = [d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    for pub_dir in sorted(pub_dirs, key=lambda p: p.name):
+        _, _, stat = process_and_export_publication_references(
+            pub_dir=pub_dir,
+            output_dir=output_dir,
+            stats_csv_path=stats_csv_path,
+            bibtex_format=bibtex_format,
+        )
+        stats_list.append(stat)
+
+    if stats_csv_path is not None and Path(stats_csv_path).is_file():
+        return pd.read_csv(stats_csv_path)
+    return pd.DataFrame([s.to_dict() for s in stats_list])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract references and export m2_bib_stats for Milestone 2.")
+    parser.add_argument("--pub-dir", type=str, help="Single publication directory to process.")
+    parser.add_argument("--data-dir", type=str, help="Corpus directory containing multiple publication folders.")
+    parser.add_argument("--arxiv-id", type=str, default="", help="arXiv ID for single publication.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save bibtex output tables.")
+    parser.add_argument("--stats-csv", type=str, default=None, help="Path to m2_bib_stats.csv output.")
+    parser.add_argument("--format", type=str, default="parquet", choices=["parquet", "csv", "jsonl"], help="Bibtex export format.")
+    args = parser.parse_args()
+
+    if args.pub_dir:
+        df, _, stat = process_and_export_publication_references(
+            pub_dir=args.pub_dir,
+            arxiv_id=args.arxiv_id,
+            output_dir=args.output_dir,
+            stats_csv_path=args.stats_csv,
+            bibtex_format=args.format,
+        )
+        print(f"Processed {stat.arxiv_id}: status={stat.bib_parse_status}, entries={len(df)}, time={stat.bib_parse_time_sec}s")
+    elif args.data_dir:
+        res_df = batch_process_corpus_references(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            stats_csv_path=args.stats_csv,
+            bibtex_format=args.format,
+        )
+        print(f"Batch processed {len(res_df)} papers into m2_bib_stats.")
+    else:
+        parser.print_help()
 
 
 
