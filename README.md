@@ -3,10 +3,12 @@
 Đồ án *Nhập môn Khoa học dữ liệu* (HCMUS): thu thập (crawl), phân tích cấu trúc (parse) và ghép
 trích dẫn (reference matching) cho các bài báo arXiv.
 
-- **Báo cáo (Jupyter Book):** https://ahtuan171.github.io/arXiv-Project/
+- **Jupyter Book hiện tại (bản nháp):** https://ahtuan171.github.io/arXiv-Project/
 - **Đề bài:** https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/
 
-**Quyết định của nhóm:** notebook Colab, code và Jupyter Book đều ở một repository duy nhất. Xem [hướng dẫn notebook 12 cell](src/README.md).
+Notebook Colab và source code ở repository này; `book/` là bản nháp báo cáo. Theo đề bài,
+Jupyter Book nộp M1/M2 phải được xuất bản trong **một public repository riêng**. Cập nhật
+link báo cáo và build từ dữ liệu thật trước khi nộp. Xem [hướng dẫn notebook 12 cell](src/README.md).
 
 ## Cấu trúc repo
 
@@ -67,7 +69,23 @@ Push lên `main` sẽ tự build và deploy lên GitHub Pages (Settings → Page
 - Không commit trực tiếp lên `main`: tạo nhánh `ten-ban/ten-viec`, mở Pull Request, ít nhất một người review.
 - Commit nhỏ, message rõ ràng; lịch sử commit thể hiện đóng góp của từng người.
 - Chạy `python -m pytest -q` trước khi mở PR.
-- Code có type hints và docstring.
+- Code có type hints và docstring.  
+
+## Chạy notebook EDA
+
+Cần Python 3.10 trở lên. Tạo môi trường và cài thư viện:
+
+    python -m venv .venv
+    .venv\Scripts\activate
+    python -m pip install -r requirements.txt
+
+Trên PowerShell, dòng kích hoạt là `.venv\Scripts\Activate.ps1`. Trên macOS/Linux là `source .venv/bin/activate`.
+
+Các bước chạy:
+
+1. Đặt các file CSV và `papers*.jsonl` vào `notebooks/data/eda_input/`.
+2. Mở `notebooks/01_eda_m1.ipynb` trong VS Code, bấm Select Kernel và chọn `.venv`.
+3. Chạy Run All. Bảng, JSON và hình sinh tự động nằm trong `notebooks/data/eda_output/`; đây là output phân tích, không phải báo cáo diễn giải.
 
 ## Nhóm
 
