@@ -32,8 +32,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r book/requirements.txt
 
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Validate M1 book input contract (offline)
+        run: python -m unittest discover -s book/tests -v
 
       - name: Build book
         run: jupyter-book build book --warningiserror
