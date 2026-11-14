@@ -1,11 +1,35 @@
-"""LaTeX to Hierarchical Tree Parser Module (Milestone 2).
+"""LaTeX to Hierarchical Tree Parser and BibTeX Standardization Module (Milestone 2).
 
-Converts LaTeX source files into structured hierarchical trees:
+Converts LaTeX source files into structured hierarchical trees and extracts unified BibTeX entries:
   - Multi-file compilation gathering (resolves \\documentclass, \\input, \\include)
   - Math normalization & LaTeX cleanup
   - Tree construction: Document -> Headings -> Lists -> Items -> Leaf Elements (Sentences, Formulas, Figures)
+  - Reference extraction & deduplication into unified BibTeX entries
+  - Generation of dataset tables: elements, hierarchy, bibtex, and statistics tables
 """
 
+from src.parser_module.bib_parser import (
+    BIB_STATS_COLUMNS,
+    BIBTEX_COLUMNS,
+    BibStats,
+    BibtexEntry,
+    batch_process_corpus_references,
+    clean_latex_text,
+    compute_missing_fields_count,
+    deduplicate_bibtex_entries,
+    export_bib_stats,
+    export_bibtex_table,
+    extract_bib_file_entries,
+    extract_bibitem_entries,
+    extract_doi,
+    extract_url,
+    extract_version_references,
+    extract_year,
+    find_compilation_files,
+    parse_author_list,
+    process_and_export_publication_references,
+    process_publication_references,
+)
 from src.parser_module.cleaner import (
     clean_latex_markup,
     clean_text_content,
@@ -35,6 +59,27 @@ from src.parser_module.parser import (
 from src.parser_module.sentence_tokenizer import split_sentences
 
 __all__ = [
+    # BibTeX parsing and standardization
+    "BIB_STATS_COLUMNS",
+    "BIBTEX_COLUMNS",
+    "BibStats",
+    "BibtexEntry",
+    "batch_process_corpus_references",
+    "clean_latex_text",
+    "compute_missing_fields_count",
+    "deduplicate_bibtex_entries",
+    "export_bib_stats",
+    "export_bibtex_table",
+    "extract_bib_file_entries",
+    "extract_bibitem_entries",
+    "extract_doi",
+    "extract_url",
+    "extract_version_references",
+    "extract_year",
+    "find_compilation_files",
+    "parse_author_list",
+    "process_and_export_publication_references",
+    "process_publication_references",
     # Core parsing entrypoints
     "parse_tex_versions",
     "export_tree_stats",
