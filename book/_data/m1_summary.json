@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-11-14T07:50:51.422366+00:00",
+  "generated_at": "2026-11-14T10:33:59.280568+00:00",
   "integrity_status": "eda_table_checks_passed",
   "coverage": {
     "valid_metadata_papers": 24999,
@@ -33,11 +33,11 @@
       "total_wall_time_hours": 94.57,
       "avg_sec_per_paper": 13.62,
       "discovery_total_hours": 0.41,
-      "discovery_avg_sec_per_paper": 0.059,
+      "discovery_avg_sec_per_paper": 0.0593,
       "download_total_hours": 81.8,
       "download_avg_sec_per_paper": 11.78,
-      "reference_total_hours": 3.22,
-      "reference_avg_sec_per_paper": 0.46,
+      "reference_total_hours": 3.23,
+      "reference_avg_sec_per_paper": 0.4647,
       "peak_ram_mb": 5450.45,
       "weighted_avg_ram_mb": 410.78,
       "peak_disk_mb": 6277.25,
