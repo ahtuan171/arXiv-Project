@@ -6,9 +6,10 @@ trích dẫn (reference matching) cho các bài báo arXiv.
 - **Jupyter Book hiện tại (bản nháp):** https://ahtuan171.github.io/arXiv-Project/
 - **Đề bài:** https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/
 
-Notebook Colab và source code ở repository này; `book/` là bản nháp báo cáo. Theo đề bài,
-Jupyter Book nộp M1/M2 phải được xuất bản trong **một public repository riêng**. Cập nhật
-link báo cáo và build từ dữ liệu thật trước khi nộp. Xem [hướng dẫn notebook 12 cell](src/README.md).
+Repository này là kho lưu trữ chung (Monorepo) của toàn bộ dự án, bao gồm mã nguồn
+pipeline thu thập dữ liệu, các notebook phân tích EDA, và toàn bộ trang báo cáo Jupyter Book
+tại thư mục `book/` (được xây dựng và xuất bản trực tiếp lên GitHub Pages qua GitHub Actions
+tại https://ahtuan171.github.io/arXiv-Project/). Xem [hướng dẫn notebook 12 cell](src/README.md).
 
 ## Cấu trúc repo
 

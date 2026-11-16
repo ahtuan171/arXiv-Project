@@ -85,10 +85,10 @@ This document describes **new outputs**. It does not modify the existing dataset
 - Source coverage counts only verified vN marker/hash outcomes. Detailed sizes and complete-paper counts are calculated only if `m1_download_versions.csv` is currently verified and not stale. Compressed archive bytes and extracted TeX/Bib bytes are labelled as different measures, NOT uncompressed before/after figures.
 - Raw reference averages include only hash-verified S2 publication-level papers; missing samples yield `null`, not zero. Old discovery/reference statistics are labelled legacy.
 - Legacy `m1_system_benchmark.csv` cannot substantiate CPU-only performance of the new version-aware workflow. The report intentionally leaves official end-to-end runtime/peak RAM/mean RAM/peak disk/final storage and session provenance as missing evidence until measured on Colab.
-- `book/01_m1_crawling.ipynb` is now a dynamic **draft chapter**: build-time tables/plots use only a supplied `M1_SUMMARY_JSON`; with no data it visibly reports missing evidence (no fabricated 97/3 chart). **Course requires a separate public Jupyter Book repository**, so move/copy the report to the appropriate dedicated repository before official submission. Do not commit private raw data into the source-code repo.
+- `book/01_m1_crawling.ipynb` is now a dynamic **report chapter**: build-time tables/plots use only a supplied `M1_SUMMARY_JSON`; with no data it visibly reports missing evidence (no fabricated 97/3 chart). **The team agreed on a unified monorepo**, so the report is published directly from `book/` via GitHub Actions Pages. Do not commit private raw data into the repository.
 
 ## Seven-cell Colab pipeline (historical snapshot)
-- The seven-cell layout below describes an earlier pipeline revision. The current pipeline has 12 code cells (see the update below). The course requires the Jupyter Book report to be published in a separate public repository; `book/` in this repository is a development draft, not the final submission destination.
+- The seven-cell layout below describes an earlier pipeline revision. The current pipeline has 12 code cells (see the update below). Per team decision, the project adopts a unified monorepo with `book/` published via GitHub Actions Pages.
 - In that earlier revision, `src/milestone1_pipeline.ipynb` contained seven code cells: Setup, Config, Preflight, Version Download, Raw References, Validation and Summary. Defaults disabled API writes and snapshot exports.
 - Legacy comparison and old four CSV inspection move to notebooks/m1_legacy_debug.ipynb within the same repo, read-only.
 - New optional version_report and metadata_report parameters on audit_m1_integrity reuse full-dataset reports. Cell 6 hashes each vN file once; rerun validation after any data changes. Summary in cell 7 uses current integrity result.
@@ -97,7 +97,7 @@ This document describes **new outputs**. It does not modify the existing dataset
 ## Presentation matched to main (Vietnamese)
 - This section records the earlier **7-code-cell** presentation. The current notebook has 12 code cells, as described below.
 - Legacy CSVs appear for read-only comparison, explicitly labelled as legacy; source-vN CSV is separate and based on verified files.
-- Keep the public code repository and the public Jupyter Book repository separate for official submission, as required by the course statement.
+- The team unified the code and report into a single monorepo repository with automated GitHub Actions Pages deployment.
 
 ## Pipeline notebook update (2026-11-01)
 - The earlier seven-cell layout and historical cell 2.1–2.9 references above describe previous revisions. The primary notebook now has 12 code cells and starts from a selected arXiv ID range.
