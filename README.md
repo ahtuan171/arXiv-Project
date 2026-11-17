@@ -3,12 +3,12 @@
 Đồ án *Nhập môn Khoa học dữ liệu* (HCMUS): thu thập (crawl), phân tích cấu trúc (parse) và ghép
 trích dẫn (reference matching) cho các bài báo arXiv.
 
-- **Jupyter Book hiện tại (bản nháp):** https://ahtuan171.github.io/arXiv-Project/
+- **Jupyter Book (nội dung mới chỉ xuất bản sau khi nhánh `main` deploy thành công):** https://ahtuan171.github.io/arXiv-Project/
 - **Đề bài:** https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/
 
 Repository này là kho lưu trữ chung (Monorepo) của toàn bộ dự án, bao gồm mã nguồn
 pipeline thu thập dữ liệu, các notebook phân tích EDA, và toàn bộ trang báo cáo Jupyter Book
-tại thư mục `book/` (được xây dựng và xuất bản trực tiếp lên GitHub Pages qua GitHub Actions
+tại thư mục `book/` (được cấu hình build/deploy qua GitHub Actions sau khi tích hợp lên `main`
 tại https://ahtuan171.github.io/arXiv-Project/). Xem [hướng dẫn notebook 12 cell](src/README.md).
 
 ## Cấu trúc repo

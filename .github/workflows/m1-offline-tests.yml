@@ -1,4 +1,4 @@
-name: Milestone 1 report input checks
+name: Milestone 1 integrated report checks
 
 on:
   push:
@@ -25,14 +25,14 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-      - name: Test report contract
+      - name: Test integrated EDA/report contract
         run: python -m unittest discover -s book/tests -v
       - name: Validate notebook layout
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          for path in ("src/milestone1_pipeline.ipynb", "book/01_m1_crawling.ipynb"):
+          for path in ("src/milestone1_pipeline.ipynb", "book/01_m1_crawling.ipynb", "notebooks/01_eda_m1.ipynb"):
               obj = json.loads(Path(path).read_text(encoding="utf-8"))
               assert obj["nbformat"] == 4, path
               assert all("cell_type" in cell and "source" in cell for cell in obj["cells"])

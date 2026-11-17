@@ -11,7 +11,17 @@
   Duy's cells/output after handoff. Do not rewrite Duy's notebook in parallel.
 - **Team:** record missing/failed/not-found instead of fabricating complete data.
 
-This file is a preparation contract, **not evidence that EDA is finished**.
+This handoff was integrated into **Draft PR #11** on 2026-11-17 from Duy's PR #13 (fix commit `a4af010`). It is a review candidate, **not final source-hash verification or a successful publication claim**.
+
+## Integrated review candidate — 2026-11-17
+
+- Imported `notebooks/01_eda_m1.ipynb`, aggregate CSVs, and `book/_data/m1_summary.json` from PR #13.
+- `book/01_m1_crawling.ipynb` calls `book/_m1_report.py` to fail the book build on contradictory/malformed input.
+- Scope: **25,000 assigned**, **24,999 collected**; report names the missing ID only when that range is represented.
+- Benchmark: **36 batch rows** across five source ranges; summed batch wall-time is **not** a continuous end-to-end measurement.
+- Raw references with `ref_status == success` remain *resolved*, not SHA-256 verified; verified count is `null` without per-file hash evidence.
+- GitHub Actions must pass, the Duy/TV5 handoff needs leader sign-off, and only then may PR #11 be merged to main and Pages deployed. **PR #11 remains Draft pending review.**
+
 
 ## Data Duy should hand off
 

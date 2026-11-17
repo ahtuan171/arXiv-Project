@@ -32,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r book/requirements.txt
 
-      - name: Validate M1 book input contract (offline)
+      - name: Validate integrated M1 report input contract (offline)
         run: python -m unittest discover -s book/tests -v
 
       - name: Build book
