@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_at": "2026-11-16T16:28:29.204008+00:00",
-  "integrity_status": "eda_table_checks_passed",
+  "integrity_status": "eda_table_audit_recorded",
   "scope": {
     "assigned_target_papers": 25000,
     "actual_collected_papers": 24999,
@@ -16,23 +16,23 @@
     "assigned_scope_papers": 25000,
     "valid_metadata_papers": 24999,
     "expected_versions": 41551,
-    "source_resolved_versions": 41551,
     "tex_source_versions": 37992,
     "pdf_only_versions": 2816,
     "source_coverage_pct": 91.43,
     "raw_reference_papers_crawled_or_resolved": 24941,
-    "raw_reference_papers_verified": 24941,
-    "hash_verified_status": "fast_check_mode (bỏ qua hash SHA-256 sâu trong pipeline nộp bài để tối ưu I/O Drive)"
+    "raw_reference_papers_verified": null,
+    "hash_verified_status": "not_verified: fast-check only; no per-paper SHA-256 evidence",
+    "source_status_recorded_versions": 41551
   },
   "source_statuses": {
     "tex_source_success": 37992,
     "pdf_only": 2816,
-    "source_resolved": 41551,
     "pending": 0,
     "failed": 595,
     "not_found": 148,
     "conflicts": 0,
-    "missing_files": 0
+    "missing_files": 0,
+    "status_recorded": 41551
   },
   "source_file_statistics": {
     "mean_raw_compressed_archive_bytes_tex_papers": 7419802.8,
@@ -42,9 +42,10 @@
     "interpretation_note": "Archive nén và .tex/.bib đã giải nén; không quy đổi trực tiếp toàn bộ độ lệch thành dung lượng ảnh bị xóa."
   },
   "benchmark_evidence": {
-    "official_version_pipeline_metrics": {
-      "testbed": "Google Colab CPU-only",
-      "benchmark_type": "batch_aggregated (tổng hợp từ 11 batch độc lập)",
+    "legacy_run_count": 36,
+    "batch_aggregated_metrics": {
+      "testbed": "Google Colab CPU-only (team-reported; session evidence unverified)",
+      "benchmark_type": "batch_aggregated (tổng hợp từ 36 batch độc lập)",
       "methodology": {
         "total_wall_time": "Tổng thời gian chạy thực tế của 11 batch",
         "weighted_avg_ram": "Trung bình gia quyền theo thời gian chạy của từng batch",
@@ -116,12 +117,13 @@
           "peak_disk_mb": 6277.25,
           "final_storage_mb": 6057.78
         }
-      }
-    },
-    "legacy_run_count": 36
+      },
+      "batch_count": 36
+    }
   },
   "missing_evidence": [
-    "Raw archive nén và .tex/.bib đã giải nén không phải phép đo trực tiếp trước/sau loại hình (phản ánh cả tỷ lệ nén gzip và loại bỏ file phụ trợ/ảnh)."
+    "Raw archive nén và .tex/.bib đã giải nén không phải phép đo trực tiếp trước/sau loại hình (phản ánh cả tỷ lệ nén gzip và loại bỏ file phụ trợ/ảnh).",
+    "Benchmark tổng hợp từ batch CSV; thiếu provenance session/log thô độc lập để xác nhận benchmark CPU-only end-to-end chính thức."
   ],
   "data_integrity_audit": {
     "papers_jsonl": {
@@ -139,13 +141,13 @@
       "duplicate_versions_dropped": 338,
       "unique_versions_retained": 41551
     },
-    "csv_null_checks": "passed",
+    "csv_null_checks": "id_nonnull_checked_only",
     "csv_duplicate_id_checks": "passed"
   },
   "eda_metrics": {
     "papers_total": 24999,
     "discovery_success": 24999,
-    "discovery_success_rate": 1.0,
+    "discovery_success_rate": 1,
     "download_tex": 22658,
     "tex_rate": 0.9064,
     "pdf_only": 2063,
@@ -158,7 +160,7 @@
     "avg_crawled_refs_per_successful_paper": 34.74,
     "avg_arxiv_refs_per_successful_paper": 16.7,
     "ref_success_rate_status": 0.9977,
-    "ref_record_coverage": 1.0,
+    "ref_record_coverage": 1,
     "ref_nonempty_rate_successful": 0.756,
     "arxiv_ref_nonempty_rate_successful": 0.7059,
     "mean_versions": 1.662,
@@ -405,7 +407,7 @@
       "member": "2501.07642-2501.12641",
       "batch": 6,
       "sec_per_paper": 19.78,
-      "peak_ram_mb": 1949.0,
+      "peak_ram_mb": 1949,
       "final_storage_mb": 1312.96
     },
     {
@@ -418,7 +420,7 @@
     {
       "member": "2501.07642-2501.12641",
       "batch": 8,
-      "sec_per_paper": 9.0,
+      "sec_per_paper": 9,
       "peak_ram_mb": 2615.12,
       "final_storage_mb": 1766.02
     },
@@ -523,7 +525,7 @@
     {
       "member": "2502.13235-2502.18234",
       "batch": 2,
-      "sec_per_paper": 27.0,
+      "sec_per_paper": 27,
       "peak_ram_mb": 2148.76,
       "final_storage_mb": 2845.93
     },
@@ -594,7 +596,7 @@
         279
       ],
       "crawled_edges": [
-        0.0,
+        0,
         3.700500000000011,
         7.401000000000022,
         11.101500000000033,
@@ -679,7 +681,7 @@
         276
       ],
       "arxiv_edges": [
-        0.0,
+        0,
         2.375,
         4.75,
         7.125,
@@ -687,7 +689,7 @@
         11.875,
         14.25,
         16.625,
-        19.0,
+        19,
         21.375,
         23.75,
         26.125,
@@ -695,7 +697,7 @@
         30.875,
         33.25,
         35.625,
-        38.0,
+        38,
         40.375,
         42.75,
         45.125,
@@ -703,7 +705,7 @@
         49.875,
         52.25,
         54.625,
-        57.0,
+        57,
         59.375,
         61.75,
         64.125,
@@ -711,7 +713,7 @@
         68.875,
         71.25,
         73.625,
-        76.0,
+        76,
         78.375,
         80.75,
         83.125,
@@ -719,7 +721,7 @@
         87.875,
         90.25,
         92.625,
-        95.0
+        95
       ]
     },
     "sizes": {
@@ -877,7 +879,7 @@
         247
       ],
       "edges": [
-        1.0,
+        1,
         3.8572000000000117,
         6.7144000000000235,
         9.571600000000036,
@@ -1012,7 +1014,7 @@
           "3": 1303.81,
           "4": 1523.56,
           "5": 1626.77,
-          "6": 1949.0,
+          "6": 1949,
           "7": 1982.32,
           "8": 2615.12,
           "9": 2977.62,
