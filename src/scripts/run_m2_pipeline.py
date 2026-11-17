@@ -111,6 +111,49 @@ def _append_or_write_csv(rows: list[dict[str, Any]], csv_path: Path, columns: li
             writer.writerow(filtered)
 
 
+def find_paper_folders(raw_path: Path) -> list[Path]:
+    """Find all paper folders under raw_path, auto-resolving nested subdirectories.
+    
+    Handles cases like:
+    - raw_path / <arxiv_id> / v1 / ...
+    - raw_path / raw / <arxiv_id> / v1 / ...
+    - raw_path / data / raw / <arxiv_id> / v1 / ...
+    """
+    if not raw_path.exists():
+        return []
+
+    ignored = {"__MACOSX", ".ipynb_checkpoints", ".git"}
+    subdirs = sorted([d for d in raw_path.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name not in ignored])
+
+    # If raw_path contains only a single container folder like 'raw' or 'data', unwrap it
+    if len(subdirs) == 1 and subdirs[0].name.lower() in ("raw", "data"):
+        return find_paper_folders(subdirs[0])
+
+    # If raw_path has a 'raw' folder containing subdirectories
+    if (raw_path / "raw").is_dir():
+        raw_sub = raw_path / "raw"
+        nested_papers = [d for d in raw_sub.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name not in ignored]
+        if nested_papers:
+            return find_paper_folders(raw_sub)
+
+    # Check if subdirs look like paper folders (contain version dirs like v1, .tex files, or arXiv ID naming)
+    paper_folders = []
+    for d in subdirs:
+        if d.name.lower() in ("raw", "data"):
+            continue
+        has_versions = any(v.is_dir() and v.name.startswith("v") for v in d.iterdir())
+        has_tex = any(f.suffix == ".tex" for f in d.iterdir())
+        has_id_pattern = (
+            bool(re.search(r"\d{4}[._]\d{4,5}", d.name))
+            or bool(re.match(r"^[a-zA-Z\-]+(\.[a-zA-Z]{2})?\d{7}$", d.name))
+            or any(char.isdigit() for char in d.name)
+        )
+        if has_versions or has_tex or has_id_pattern:
+            paper_folders.append(d)
+
+    return paper_folders or subdirs
+
+
 def run_m2_pipeline(
     raw_dir: Path | str,
     processed_dir: Path | str,
@@ -138,11 +181,11 @@ def run_m2_pipeline(
     proc_path = Path(processed_dir)
     proc_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Discover paper folders
+    # 1. Discover paper folders with nested container auto-resolution
     if not raw_path.exists():
         raise FileNotFoundError(f"Raw sources directory does not exist: {raw_path}")
 
-    all_folders = sorted([d for d in raw_path.iterdir() if d.is_dir()])
+    all_folders = find_paper_folders(raw_path)
     if paper_ids:
         filter_set = {str(pid).replace(".", "_") for pid in paper_ids} | {str(pid).replace("_", ".") for pid in paper_ids}
         target_folders = [d for d in all_folders if d.name in filter_set or d.name.replace("_", ".") in filter_set]
@@ -243,7 +286,7 @@ def run_m2_pipeline(
     try:
         if workers == 1:
             for fpath in target_folders:
-                res = process_single_paper(str(fpath), str(raw_path))
+                res = process_single_paper(str(fpath), str(fpath.parent))
                 batch_elements.append(res["elements_df"])
                 batch_hierarchy.append(res["hierarchy_df"])
                 batch_bibtex.append(res["bibtex_df"])
@@ -258,7 +301,7 @@ def run_m2_pipeline(
         else:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 future_to_id = {
-                    executor.submit(process_single_paper, str(fpath), str(raw_path)): fpath.name
+                    executor.submit(process_single_paper, str(fpath), str(fpath.parent)): fpath.name
                     for fpath in target_folders
                 }
                 for future in as_completed(future_to_id):
