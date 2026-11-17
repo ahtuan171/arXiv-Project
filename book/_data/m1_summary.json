@@ -47,7 +47,7 @@
       "testbed": "Google Colab CPU-only (team-reported; session evidence unverified)",
       "benchmark_type": "batch_aggregated (tổng hợp từ 36 batch độc lập)",
       "methodology": {
-        "total_wall_time": "Tổng thời gian chạy thực tế của 11 batch",
+        "total_wall_time": "Tổng wall-time của 36 batch độc lập, không phải một run end-to-end",
         "weighted_avg_ram": "Trung bình gia quyền theo thời gian chạy của từng batch",
         "peak_ram_and_disk": "Giá trị lớn nhất ghi nhận trên toàn bộ các batch",
         "final_storage": "Tổng dung lượng lưu trữ thành phẩm của 5 thành viên"
