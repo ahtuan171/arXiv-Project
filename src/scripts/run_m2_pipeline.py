@@ -222,12 +222,14 @@ def run_m2_pipeline(
     )
     tracker.start()
 
-    workers = max(1, min(os.cpu_count() or 1, max_workers or 4))
+    default_workers = 2 if sys.platform.startswith("linux") else 4
+    workers = max(1, min(os.cpu_count() or 1, max_workers or default_workers))
     log.info("Running on %d CPU worker processes...", workers)
 
     batch_idx = 0
     completed_count = 0
     parquet_parts: list[tuple[Path, Path, Path]] = []
+    PAPER_TIMEOUT_SEC = 45.0
 
     # Batch accumulator
     batch_elements: list[pd.DataFrame] = []
@@ -244,10 +246,14 @@ def run_m2_pipeline(
         batch_idx += 1
         t_flush_start = time.perf_counter()
 
-        # 1. Flush Parquet chunk
-        chunk_elem_df = pd.concat(batch_elements, ignore_index=True) if batch_elements else pd.DataFrame(columns=ELEMENT_COLUMNS)
-        chunk_hier_df = pd.concat(batch_hierarchy, ignore_index=True) if batch_hierarchy else pd.DataFrame(columns=HIERARCHY_COLUMNS)
-        chunk_bib_df = pd.concat(batch_bibtex, ignore_index=True) if batch_bibtex else pd.DataFrame(columns=BIBTEX_COLUMNS)
+        # 1. Flush Parquet chunk (filter empty frames to prevent pandas FutureWarning)
+        valid_elems = [df for df in batch_elements if not df.empty]
+        valid_hiers = [df for df in batch_hierarchy if not df.empty]
+        valid_bibs = [df for df in batch_bibtex if not df.empty]
+
+        chunk_elem_df = pd.concat(valid_elems, ignore_index=True) if valid_elems else pd.DataFrame(columns=ELEMENT_COLUMNS)
+        chunk_hier_df = pd.concat(valid_hiers, ignore_index=True) if valid_hiers else pd.DataFrame(columns=HIERARCHY_COLUMNS)
+        chunk_bib_df = pd.concat(valid_bibs, ignore_index=True) if valid_bibs else pd.DataFrame(columns=BIBTEX_COLUMNS)
 
         elem_part = proc_path / f"elements_part_{batch_idx:04d}.parquet"
         hier_part = proc_path / f"hierarchy_part_{batch_idx:04d}.parquet"
@@ -306,11 +312,33 @@ def run_m2_pipeline(
                 }
                 for future in as_completed(future_to_id):
                     paper_name = future_to_id[future]
+                    arxiv_id = paper_name.replace("_", ".")
                     try:
-                        res = future.result()
+                        res = future.result(timeout=PAPER_TIMEOUT_SEC)
+                    except TimeoutError:
+                        log.warning("Paper %s TIMED OUT (>%.1fs). Skipping to prevent pipeline hang...", arxiv_id, PAPER_TIMEOUT_SEC)
+                        res = {
+                            "arxiv_id": arxiv_id,
+                            "elements_df": pd.DataFrame(columns=ELEMENT_COLUMNS),
+                            "hierarchy_df": pd.DataFrame(columns=HIERARCHY_COLUMNS),
+                            "bibtex_df": pd.DataFrame(columns=BIBTEX_COLUMNS),
+                            "tree_stats": {
+                                "arxiv_id": arxiv_id, "parse_status": "timeout",
+                                "total_tex_versions": 0, "parsed_versions": 0, "version_coverage": 0.0,
+                                "raw_elements_count": 0, "max_tree_depth": 0, "parse_time_sec": PAPER_TIMEOUT_SEC,
+                            },
+                            "bib_stats": {
+                                "arxiv_id": arxiv_id, "bib_parse_status": "timeout", "bib_source_type": "none",
+                                "raw_bib_count": 0, "missing_fields_count": 0, "bib_parse_time_sec": PAPER_TIMEOUT_SEC,
+                            },
+                            "dedup_stats": {
+                                "arxiv_id": arxiv_id, "dedup_status": "timeout", "dedup_elements_count": 0,
+                                "element_dedup_ratio": 0.0, "dedup_bib_count": 0, "output_size_bytes": 0,
+                                "dedup_time_sec": PAPER_TIMEOUT_SEC,
+                            },
+                        }
                     except Exception as exc:
                         log.error("Fatal error processing %s: %s", paper_name, exc)
-                        arxiv_id = paper_name.replace("_", ".")
                         res = {
                             "arxiv_id": arxiv_id,
                             "elements_df": pd.DataFrame(columns=ELEMENT_COLUMNS),
@@ -357,13 +385,23 @@ def run_m2_pipeline(
 
         if parquet_parts:
             log.info("Consolidating %d batch Parquet files into master tables...", len(parquet_parts))
-            elem_dfs = [pd.read_parquet(p[0]) for p in parquet_parts]
-            hier_dfs = [pd.read_parquet(p[1]) for p in parquet_parts]
-            bib_dfs = [pd.read_parquet(p[2]) for p in parquet_parts]
+            elem_dfs = [pd.read_parquet(p[0]) for p in parquet_parts if p[0].exists() and p[0].stat().st_size > 0]
+            hier_dfs = [pd.read_parquet(p[1]) for p in parquet_parts if p[1].exists() and p[1].stat().st_size > 0]
+            bib_dfs = [pd.read_parquet(p[2]) for p in parquet_parts if p[2].exists() and p[2].stat().st_size > 0]
 
-            pd.concat(elem_dfs, ignore_index=True).to_parquet(final_elements_p, index=False, engine="pyarrow", compression="snappy")
-            pd.concat(hier_dfs, ignore_index=True).to_parquet(final_hierarchy_p, index=False, engine="pyarrow", compression="snappy")
-            pd.concat(bib_dfs, ignore_index=True).to_parquet(final_bibtex_p, index=False, engine="pyarrow", compression="snappy")
+            valid_elem = [df for df in elem_dfs if not df.empty]
+            valid_hier = [df for df in hier_dfs if not df.empty]
+            valid_bib = [df for df in bib_dfs if not df.empty]
+
+            (pd.concat(valid_elem, ignore_index=True) if valid_elem else pd.DataFrame(columns=ELEMENT_COLUMNS)).to_parquet(
+                final_elements_p, index=False, engine="pyarrow", compression="snappy"
+            )
+            (pd.concat(valid_hier, ignore_index=True) if valid_hier else pd.DataFrame(columns=HIERARCHY_COLUMNS)).to_parquet(
+                final_hierarchy_p, index=False, engine="pyarrow", compression="snappy"
+            )
+            (pd.concat(valid_bib, ignore_index=True) if valid_bib else pd.DataFrame(columns=BIBTEX_COLUMNS)).to_parquet(
+                final_bibtex_p, index=False, engine="pyarrow", compression="snappy"
+            )
 
             log.info("Master Parquet tables created at %s", proc_path)
 

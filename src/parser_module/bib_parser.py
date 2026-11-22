@@ -112,6 +112,8 @@ _LATEX_COMMAND_CONTENT = re.compile(
     r"\\(?:textbf|textit|emph|underline|textsc|textsl|texttt|textmd|textnormal)\{([^}]*)\}"
 )
 _LATEX_FONT_SWITCH = re.compile(r"\{\\(?:em|it|bf|sl|sc|rm)\s+([^}]*)\}")
+_BIB_TWO_ARG_UNWRAP = re.compile(r"\\(?:bibinfo|bibfield)\*?\{[^{}]*\}\{([^{}]*)\}")
+_BIB_ONE_ARG_UNWRAP = re.compile(r"\\(?:bibfnamefont|bibnamefont|citenamefont|person|showarticletitle)\*?\{([^{}]*)\}")
 _URL_HREF_REGEX = re.compile(r"\\href\{([^}]+)\}(?:\{[^}]*\})?")
 _URL_CMD_REGEX = re.compile(r"\\url\{([^}]+)\}")
 _RAW_URL_REGEX = re.compile(r"https?://[^\s{}<>\"]+")
@@ -157,10 +159,13 @@ def clean_latex_text(text: str) -> str:
         lines.append(line)
     cleaned = " ".join(lines)
 
-    for _ in range(3):
+    for _ in range(4):
         prev = cleaned
         cleaned = _LATEX_COMMAND_CONTENT.sub(r"\1", cleaned)
         cleaned = _LATEX_FONT_SWITCH.sub(r"\1", cleaned)
+        cleaned = _BIB_ONE_ARG_UNWRAP.sub(r"\1", cleaned)
+        cleaned = _BIB_TWO_ARG_UNWRAP.sub(r"\1", cleaned)
+        cleaned = re.sub(r"\{([^{}]*)\}", r"\1", cleaned)
         if cleaned == prev:
             break
 
@@ -284,7 +289,7 @@ def extract_year(text: str) -> Optional[int]:
 # --- \\bibitem Parsing -------------------------------------------------------
 
 _BIBITEM_REGEX = re.compile(
-    r"\\bibitem(?:\[[^\]]*\])?\{([^}]+)\}",
+    r"\\bibitem\s*(?:\[[^\]]*\])?(?:\s*%.*?\n)*\s*\{([^}]+)\}",
     re.MULTILINE,
 )
 _QUOTE_TITLE_REGEX = re.compile(r"(?:``|\"|“)(.*?)(?:’’|''|\"|”)", re.DOTALL)
@@ -352,6 +357,11 @@ def extract_bibitem_entries(
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(search_text)
         item_raw = search_text[start:end].strip()
 
+        # Safeguard: cap raw item length to avoid catastrophic runaway when format is corrupt
+        MAX_ITEM_RAW_LEN = 4000
+        if len(item_raw) > MAX_ITEM_RAW_LEN:
+            item_raw = item_raw[:MAX_ITEM_RAW_LEN]
+
         doi = extract_doi(item_raw)
         url = extract_url(item_raw)
         year = extract_year(item_raw)
@@ -361,16 +371,56 @@ def extract_bibitem_entries(
         authors: list[str] = []
         journal = ""
 
+        # Check for \bibinfo{title} or \showarticletitle
+        m_bibinfo_title = re.search(r"\\(?:bibinfo\{title\}|showarticletitle)\{([^}]+)\}", item_raw)
+        if m_bibinfo_title:
+            title = clean_latex_text(m_bibinfo_title.group(1))
+
+        # Check for \bibinfo{journal} or \bibfield{journal}
+        m_bibinfo_journal = re.search(r"\\(?:bibinfo\{journal\}|bibfield\{journal\})\s*(?:\{[^}]*\})?\{([^}]+)\}", item_raw)
+        if m_bibinfo_journal:
+            journal = clean_latex_text(m_bibinfo_journal.group(1))
+
+        # Check for structured \bibinfo{author} or \bibinfo{person}
+        if r"\bibinfo{author}" in item_raw or r"\bibinfo{person}" in item_raw:
+            author_names = []
+            for tag in (r"\bibinfo{author}", r"\bibinfo{person}"):
+                cur_pos = 0
+                while True:
+                    found = item_raw.find(tag, cur_pos)
+                    if found == -1:
+                        break
+                    b_start = item_raw.find("{", found + len(tag))
+                    if b_start == -1:
+                        break
+                    depth = 1
+                    i = b_start + 1
+                    while i < len(item_raw) and depth > 0:
+                        if item_raw[i] == "{" and (i == 0 or item_raw[i - 1] != "\\"):
+                            depth += 1
+                        elif item_raw[i] == "}" and (i == 0 or item_raw[i - 1] != "\\"):
+                            depth -= 1
+                        i += 1
+                    b_content = item_raw[b_start + 1 : i - 1 if depth == 0 else i]
+                    name = clean_latex_text(b_content).strip()
+                    if name and name.lower() not in ("and", "&", "others", "et al"):
+                        author_names.append(name)
+                    cur_pos = i
+            if author_names:
+                authors = author_names
+
         if r"\newblock" in item_raw:
             blocks = [b.strip() for b in re.split(r"\\newblock", item_raw) if b.strip()]
             if len(blocks) >= 2:
-                authors = parse_author_list(blocks[0])
-                title = clean_latex_text(blocks[1])
-                if len(blocks) >= 3:
+                if not authors:
+                    authors = parse_author_list(blocks[0])
+                if not title:
+                    title = clean_latex_text(blocks[1])
+                if len(blocks) >= 3 and not journal:
                     journal = clean_latex_text(blocks[2])
                     # Clean out leading "In " or "in " from venue
                     journal = re.sub(r"^(?:in\s+)+", "", journal, flags=re.IGNORECASE).strip()
-            elif len(blocks) == 1:
+            elif len(blocks) == 1 and not title:
                 title = clean_latex_text(blocks[0])
 
         # If title not found via \newblock, check for quotes
@@ -378,25 +428,29 @@ def extract_bibitem_entries(
             q_match = _QUOTE_TITLE_REGEX.search(item_raw)
             if q_match:
                 title = clean_latex_text(q_match.group(1))
-                prefix = item_raw[: q_match.start()]
-                authors = parse_author_list(prefix)
+                if not authors:
+                    prefix = item_raw[: q_match.start()]
+                    authors = parse_author_list(prefix)
                 suffix = item_raw[q_match.end() :]
-                emph_m = _EMPH_REGEX.search(suffix)
-                if emph_m:
-                    journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
-                else:
-                    journal = clean_latex_text(suffix)
+                if not journal:
+                    emph_m = _EMPH_REGEX.search(suffix)
+                    if emph_m:
+                        journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
+                    else:
+                        journal = clean_latex_text(suffix)
 
         # Fallback: check for \emph (journal) and split around it
         if not title:
             emph_m = _EMPH_REGEX.search(item_raw)
             if emph_m:
-                journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
+                if not journal:
+                    journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
                 prefix = item_raw[: emph_m.start()].strip()
                 # Split prefix by sentence/dot or year
                 sentences = [s.strip() for s in re.split(r"\.\s+", prefix) if s.strip()]
                 if len(sentences) >= 2:
-                    authors = parse_author_list(sentences[0])
+                    if not authors:
+                        authors = parse_author_list(sentences[0])
                     title = clean_latex_text(". ".join(sentences[1:]))
                 elif len(sentences) == 1:
                     title = clean_latex_text(sentences[0])
@@ -408,9 +462,10 @@ def extract_bibitem_entries(
                     if s.strip()
                 ]
                 if len(sentences) >= 2:
-                    authors = parse_author_list(sentences[0])
+                    if not authors:
+                        authors = parse_author_list(sentences[0])
                     title = sentences[1]
-                    if len(sentences) >= 3:
+                    if len(sentences) >= 3 and not journal:
                         journal = ". ".join(sentences[2:])
                 elif len(sentences) == 1:
                     title = sentences[0]
@@ -443,6 +498,7 @@ def extract_bibitem_entries(
 # --- .bib File Parsing -------------------------------------------------------
 
 _BIB_ENTRY_START = re.compile(r"@([a-zA-Z]+)\s*\{", re.MULTILINE)
+_FIELD_ASSIGN_RE = re.compile(r"([a-zA-Z0-9_\-]+)\s*=")
 
 
 def _parse_bib_fields(body: str) -> dict[str, str]:
@@ -458,8 +514,8 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
         if i >= n:
             break
 
-        # Read field name
-        name_match = re.match(r"([a-zA-Z0-9_\-]+)\s*=", body[i:])
+        # Read field name using match with pos to avoid substring allocations
+        name_match = _FIELD_ASSIGN_RE.match(body, i)
         if not name_match:
             # Skip until next comma or line
             while i < n and body[i] not in ",\n":
@@ -469,7 +525,7 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
             continue
 
         field_name = name_match.group(1).lower().strip()
-        i += name_match.end()
+        i = name_match.end()
 
         # Skip whitespace before value
         while i < n and body[i] in " \t\r\n":
