@@ -16,7 +16,7 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -95,6 +95,48 @@ def process_single_paper(paper_path_str: str, raw_dir_str: str = "") -> dict[str
         "tree_stats": tree_stats,
         "bib_stats": bib_stats.to_dict(),
         "dedup_stats": dedup_stats,
+    }
+
+
+def _make_error_result(
+    arxiv_id: str,
+    status: str = "failed",
+    error_msg: str = "",
+    timeout_sec: float = 0.0,
+) -> dict[str, Any]:
+    """Create standardized fallback structure when a paper errors or times out."""
+    return {
+        "arxiv_id": arxiv_id,
+        "elements_df": pd.DataFrame(columns=ELEMENT_COLUMNS),
+        "hierarchy_df": pd.DataFrame(columns=HIERARCHY_COLUMNS),
+        "bibtex_df": pd.DataFrame(columns=BIBTEX_COLUMNS),
+        "tree_stats": {
+            "arxiv_id": arxiv_id,
+            "parse_status": status,
+            "total_tex_versions": 0,
+            "parsed_versions": 0,
+            "version_coverage": 0.0,
+            "raw_elements_count": 0,
+            "max_tree_depth": 0,
+            "parse_time_sec": timeout_sec,
+        },
+        "bib_stats": {
+            "arxiv_id": arxiv_id,
+            "bib_parse_status": status,
+            "bib_source_type": "none",
+            "raw_bib_count": 0,
+            "missing_fields_count": 0,
+            "bib_parse_time_sec": timeout_sec,
+        },
+        "dedup_stats": {
+            "arxiv_id": arxiv_id,
+            "dedup_status": status,
+            "dedup_elements_count": 0,
+            "element_dedup_ratio": 0.0,
+            "dedup_bib_count": 0,
+            "output_size_bytes": 0,
+            "dedup_time_sec": timeout_sec,
+        },
     }
 
 
@@ -289,10 +331,61 @@ def run_m2_pipeline(
         batch_dedup_stats.clear()
         gc.collect()
 
+    failed_papers: list[dict[str, Any]] = []
+
+    def _notify(
+        event: str,
+        done: int,
+        total: int,
+        arxiv_id: str,
+        status: str = "running",
+        elapsed_sec: float = 0.0,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(
+                event=event,
+                done=done,
+                total=total,
+                arxiv_id=arxiv_id,
+                status=status,
+                elapsed_sec=elapsed_sec,
+                details=details,
+            )
+        except TypeError:
+            # Fallback for legacy 3-parameter callback: (done, total, cur_id)
+            if event == "done":
+                try:
+                    progress_callback(done, total, arxiv_id)
+                except Exception:
+                    pass
+
     try:
         if workers == 1:
             for fpath in target_folders:
-                res = process_single_paper(str(fpath), str(fpath.parent))
+                p_name = fpath.name
+                a_id = p_name.replace("_", ".")
+                t_start = time.perf_counter()
+                _notify(
+                    event="start",
+                    done=completed_count,
+                    total=total_papers,
+                    arxiv_id=a_id,
+                    status="running",
+                )
+                try:
+                    res = process_single_paper(str(fpath), str(fpath.parent))
+                    status = "success"
+                    err_msg = ""
+                except Exception as exc:
+                    log.error("Fatal error processing %s: %s", p_name, exc)
+                    status = "failed"
+                    err_msg = str(exc)
+                    res = _make_error_result(a_id, status="syntax_error", error_msg=err_msg)
+
+                elapsed = time.perf_counter() - t_start
                 batch_elements.append(res["elements_df"])
                 batch_hierarchy.append(res["hierarchy_df"])
                 batch_bibtex.append(res["bibtex_df"])
@@ -300,76 +393,150 @@ def run_m2_pipeline(
                 batch_bib_stats.append(res["bib_stats"])
                 batch_dedup_stats.append(res["dedup_stats"])
                 completed_count += 1
-                if progress_callback:
-                    progress_callback(completed_count, total_papers, res["arxiv_id"])
+                if status != "success":
+                    failed_papers.append({
+                        "arxiv_id": a_id,
+                        "status": status,
+                        "error": err_msg,
+                        "elapsed_sec": round(elapsed, 2),
+                    })
+
+                _notify(
+                    event="done",
+                    done=completed_count,
+                    total=total_papers,
+                    arxiv_id=a_id,
+                    status=status,
+                    elapsed_sec=elapsed,
+                    details={
+                        "error": err_msg,
+                        "elem_count": len(res["elements_df"]),
+                        "bib_count": len(res["bibtex_df"]),
+                    },
+                )
                 if len(batch_tree_stats) >= batch_size:
                     _flush_batch()
         else:
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                future_to_id = {
-                    executor.submit(process_single_paper, str(fpath), str(fpath.parent)): fpath.name
-                    for fpath in target_folders
-                }
-                for future in as_completed(future_to_id):
-                    paper_name = future_to_id[future]
-                    arxiv_id = paper_name.replace("_", ".")
+                paper_iter = iter(target_folders)
+                # Maps future -> (paper_name, arxiv_id, submit_time)
+                active_futures: dict[Any, tuple[str, str, float]] = {}
+
+                def _submit_next() -> bool:
                     try:
-                        res = future.result(timeout=PAPER_TIMEOUT_SEC)
-                    except TimeoutError:
-                        log.warning("Paper %s TIMED OUT (>%.1fs). Skipping to prevent pipeline hang...", arxiv_id, PAPER_TIMEOUT_SEC)
-                        res = {
-                            "arxiv_id": arxiv_id,
-                            "elements_df": pd.DataFrame(columns=ELEMENT_COLUMNS),
-                            "hierarchy_df": pd.DataFrame(columns=HIERARCHY_COLUMNS),
-                            "bibtex_df": pd.DataFrame(columns=BIBTEX_COLUMNS),
-                            "tree_stats": {
-                                "arxiv_id": arxiv_id, "parse_status": "timeout",
-                                "total_tex_versions": 0, "parsed_versions": 0, "version_coverage": 0.0,
-                                "raw_elements_count": 0, "max_tree_depth": 0, "parse_time_sec": PAPER_TIMEOUT_SEC,
-                            },
-                            "bib_stats": {
-                                "arxiv_id": arxiv_id, "bib_parse_status": "timeout", "bib_source_type": "none",
-                                "raw_bib_count": 0, "missing_fields_count": 0, "bib_parse_time_sec": PAPER_TIMEOUT_SEC,
-                            },
-                            "dedup_stats": {
-                                "arxiv_id": arxiv_id, "dedup_status": "timeout", "dedup_elements_count": 0,
-                                "element_dedup_ratio": 0.0, "dedup_bib_count": 0, "output_size_bytes": 0,
-                                "dedup_time_sec": PAPER_TIMEOUT_SEC,
-                            },
-                        }
-                    except Exception as exc:
-                        log.error("Fatal error processing %s: %s", paper_name, exc)
-                        res = {
-                            "arxiv_id": arxiv_id,
-                            "elements_df": pd.DataFrame(columns=ELEMENT_COLUMNS),
-                            "hierarchy_df": pd.DataFrame(columns=HIERARCHY_COLUMNS),
-                            "bibtex_df": pd.DataFrame(columns=BIBTEX_COLUMNS),
-                            "tree_stats": {
-                                "arxiv_id": arxiv_id, "parse_status": "syntax_error",
-                                "total_tex_versions": 0, "parsed_versions": 0, "version_coverage": 0.0,
-                                "raw_elements_count": 0, "max_tree_depth": 0, "parse_time_sec": 0.0,
-                            },
-                            "bib_stats": {
-                                "arxiv_id": arxiv_id, "bib_parse_status": "failed", "bib_source_type": "none",
-                                "raw_bib_count": 0, "missing_fields_count": 0, "bib_parse_time_sec": 0.0,
-                            },
-                            "dedup_stats": {
-                                "arxiv_id": arxiv_id, "dedup_status": "failed", "dedup_elements_count": 0,
-                                "element_dedup_ratio": 0.0, "dedup_bib_count": 0, "output_size_bytes": 0,
-                                "dedup_time_sec": 0.0,
-                            },
-                        }
+                        next_fpath = next(paper_iter)
+                    except StopIteration:
+                        return False
+                    next_pname = next_fpath.name
+                    next_aid = next_pname.replace("_", ".")
+                    t_sub = time.perf_counter()
+                    _notify(
+                        event="start",
+                        done=completed_count,
+                        total=total_papers,
+                        arxiv_id=next_aid,
+                        status="running",
+                    )
+                    fut = executor.submit(process_single_paper, str(next_fpath), str(next_fpath.parent))
+                    active_futures[fut] = (next_pname, next_aid, t_sub)
+                    return True
 
-                    batch_elements.append(res["elements_df"])
-                    batch_hierarchy.append(res["hierarchy_df"])
-                    batch_bibtex.append(res["bibtex_df"])
-                    batch_tree_stats.append(res["tree_stats"])
-                    batch_bib_stats.append(res["bib_stats"])
-                    batch_dedup_stats.append(res["dedup_stats"])
-                    completed_count += 1
+                # Pre-fill active pool with up to `workers` tasks
+                for _ in range(workers):
+                    if not _submit_next():
+                        break
 
-                    if progress_callback:
-                        progress_callback(completed_count, total_papers, res["arxiv_id"])
+                while active_futures:
+                    done_set, _ = wait(active_futures.keys(), timeout=0.5, return_when=FIRST_COMPLETED)
+                    now = time.perf_counter()
+
+                    for fut in done_set:
+                        p_name, a_id, t_sub = active_futures.pop(fut)
+                        elapsed = now - t_sub
+                        try:
+                            res = fut.result()
+                            status = "success"
+                            err_msg = ""
+                        except Exception as exc:
+                            log.error("Fatal error processing %s: %s", p_name, exc)
+                            status = "failed"
+                            err_msg = str(exc)
+                            res = _make_error_result(a_id, status="syntax_error", error_msg=err_msg)
+
+                        batch_elements.append(res["elements_df"])
+                        batch_hierarchy.append(res["hierarchy_df"])
+                        batch_bibtex.append(res["bibtex_df"])
+                        batch_tree_stats.append(res["tree_stats"])
+                        batch_bib_stats.append(res["bib_stats"])
+                        batch_dedup_stats.append(res["dedup_stats"])
+                        completed_count += 1
+                        if status != "success":
+                            failed_papers.append({
+                                "arxiv_id": a_id,
+                                "status": status,
+                                "error": err_msg,
+                                "elapsed_sec": round(elapsed, 2),
+                            })
+
+                        _notify(
+                            event="done",
+                            done=completed_count,
+                            total=total_papers,
+                            arxiv_id=a_id,
+                            status=status,
+                            elapsed_sec=elapsed,
+                            details={
+                                "error": err_msg,
+                                "elem_count": len(res["elements_df"]),
+                                "bib_count": len(res["bibtex_df"]),
+                            },
+                        )
+
+                        _submit_next()
+
+                    # Check for in-flight tasks exceeding PAPER_TIMEOUT_SEC
+                    now = time.perf_counter()
+                    timed_out_futs = [
+                        f for f, (p_name, a_id, t_sub) in active_futures.items()
+                        if (now - t_sub) > PAPER_TIMEOUT_SEC
+                    ]
+                    for fut in timed_out_futs:
+                        p_name, a_id, t_sub = active_futures.pop(fut)
+                        elapsed = now - t_sub
+                        log.warning("Paper %s TIMED OUT (>%.1fs). Skipping to prevent pipeline hang...", a_id, PAPER_TIMEOUT_SEC)
+                        status = "timeout"
+                        err_msg = f"Timed out after {elapsed:.1f}s (limit {PAPER_TIMEOUT_SEC}s)"
+                        res = _make_error_result(a_id, status="timeout", error_msg=err_msg, timeout_sec=PAPER_TIMEOUT_SEC)
+
+                        batch_elements.append(res["elements_df"])
+                        batch_hierarchy.append(res["hierarchy_df"])
+                        batch_bibtex.append(res["bibtex_df"])
+                        batch_tree_stats.append(res["tree_stats"])
+                        batch_bib_stats.append(res["bib_stats"])
+                        batch_dedup_stats.append(res["dedup_stats"])
+                        completed_count += 1
+                        failed_papers.append({
+                            "arxiv_id": a_id,
+                            "status": status,
+                            "error": err_msg,
+                            "elapsed_sec": round(elapsed, 2),
+                        })
+
+                        _notify(
+                            event="done",
+                            done=completed_count,
+                            total=total_papers,
+                            arxiv_id=a_id,
+                            status=status,
+                            elapsed_sec=elapsed,
+                            details={
+                                "error": err_msg,
+                                "elem_count": 0,
+                                "bib_count": 0,
+                            },
+                        )
+
+                        _submit_next()
 
                     if len(batch_tree_stats) >= batch_size:
                         _flush_batch()
@@ -422,6 +589,9 @@ def run_m2_pipeline(
 
     return {
         "total_papers": completed_count,
+        "success_count": completed_count - len(failed_papers),
+        "failed_count": len(failed_papers),
+        "failed_papers": failed_papers,
         "tree_stats_csv": str(tree_csv),
         "bib_stats_csv": str(bib_csv),
         "dedup_stats_csv": str(dedup_csv),
