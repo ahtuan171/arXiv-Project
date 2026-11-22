@@ -293,7 +293,9 @@ _BIBITEM_REGEX = re.compile(
     re.MULTILINE,
 )
 _QUOTE_TITLE_REGEX = re.compile(r"(?:``|\"|“)(.*?)(?:’’|''|\"|”)", re.DOTALL)
-_EMPH_REGEX = re.compile(r"\\(?:emph|textit)\{([^}]*)\}|\{\\em\s+([^}]*)\}")
+_EMPH_REGEX = re.compile(
+    r"\\(?:emph|textit)\{([^}]*)\}|\{\\em\s+([^}]*)\}|\{\\it\s+([^}]*)\}"
+)
 
 
 def _infer_entry_type(journal: str, text: str) -> str:
@@ -435,25 +437,26 @@ def extract_bibitem_entries(
                 if not journal:
                     emph_m = _EMPH_REGEX.search(suffix)
                     if emph_m:
-                        journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
+                        journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
                     else:
                         journal = clean_latex_text(suffix)
 
-        # Fallback: check for \emph (journal) and split around it
+        # Fallback: check for \emph / \textit / {\it ...} (title/booktitle)
         if not title:
             emph_m = _EMPH_REGEX.search(item_raw)
             if emph_m:
+                title = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
+                prefix = item_raw[: emph_m.start()].strip().rstrip(",")
+                suffix = item_raw[emph_m.end() :].strip().lstrip(",")
+                if not authors:
+                    authors = parse_author_list(prefix)
                 if not journal:
-                    journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
-                prefix = item_raw[: emph_m.start()].strip()
-                # Split prefix by sentence/dot or year
-                sentences = [s.strip() for s in re.split(r"\.\s+", prefix) if s.strip()]
-                if len(sentences) >= 2:
-                    if not authors:
-                        authors = parse_author_list(sentences[0])
-                    title = clean_latex_text(". ".join(sentences[1:]))
-                elif len(sentences) == 1:
-                    title = clean_latex_text(sentences[0])
+                    # Check if there is a second emph (e.g. \textit{Title}, in \textit{Journal})
+                    second_emph = _EMPH_REGEX.search(suffix)
+                    if second_emph:
+                        journal = clean_latex_text(second_emph.group(1) or second_emph.group(2) or second_emph.group(3) or "")
+                    else:
+                        journal = clean_latex_text(suffix)
             else:
                 # Fallback to sentence split
                 sentences = [
