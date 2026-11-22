@@ -575,12 +575,37 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def extract_cited_keys_from_tex(tex_files: Sequence[Path]) -> set[str]:
+    """Extract all cited keys from reachable LaTeX source files."""
+    cited_keys: set[str] = set()
+    cite_pattern = re.compile(r"\\(?:cite[a-zA-Z]*)\*?(?:\[[^\]]*\])*\{([^}]+)\}")
+    for tex in tex_files:
+        try:
+            content = tex.read_text(encoding="utf-8", errors="ignore")
+            # Strip comments to ignore commented-out citations
+            uncommented = _strip_comments_from_tex(content)
+            for m in cite_pattern.finditer(uncommented):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        cited_keys.add(k)
+        except Exception:
+            continue
+    return cited_keys
+
+
 def extract_bib_file_entries(
     bib_content: str,
     arxiv_id: str = "",
     version: Optional[str] = None,
+    target_keys: Optional[set[str]] = None,
 ) -> list[BibtexEntry]:
-    """Parse standard BibTeX entries from .bib file content."""
+    """Parse standard BibTeX entries from .bib file content.
+    
+    If target_keys is provided, entries whose citation_key is not in target_keys
+    are skipped quickly without full field parsing to dramatically accelerate processing
+    for massive bibliography files (such as ACL Anthology .bib).
+    """
     if not bib_content:
         return []
 
@@ -619,6 +644,10 @@ def extract_bib_file_entries(
         key, body = entry_raw.split(",", 1)
         citation_key = key.strip()
         if not citation_key:
+            continue
+
+        # Fast filter: skip entries not cited if target_keys is specified
+        if target_keys is not None and citation_key not in target_keys:
             continue
 
         fields = _parse_bib_fields(body)
@@ -810,29 +839,36 @@ def extract_version_references(
 
     entries_map: dict[str, BibtexEntry] = {}
 
-    # 1. Parse .bib files (typically the most structured data)
-    for bib in bib_files:
+    # Extract all citation keys actually referenced in reachable LaTeX files
+    cited_keys = extract_cited_keys_from_tex(tex_files)
+
+    # 1. Parse .bbl files first if present (most accurate representation of rendered PDF)
+    bbl_files = list(version_dir.glob("*.bbl")) + list(version_dir.glob("*/*.bbl"))
+    for bbl in bbl_files:
         try:
-            content = bib.read_text(encoding="utf-8", errors="ignore")
-            for entry in extract_bib_file_entries(content, arxiv_id=arxiv_id, version=version):
+            content = bbl.read_text(encoding="utf-8", errors="ignore")
+            for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
                 key = entry.citation_key.strip()
                 if key:
                     entries_map[key] = entry
+                    cited_keys.add(key)
         except Exception:
             continue
 
-    # 2. Parse reachable .tex files
-    for tex in tex_files:
+    # 2. Parse .bib files (filtering entries if cited_keys is known or bib is large)
+    for bib in bib_files:
         try:
-            content = tex.read_text(encoding="utf-8", errors="ignore")
-            for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
+            is_large = bib.stat().st_size > 1024 * 1024  # > 1MB
+            target_filter = cited_keys if (cited_keys or is_large) else None
+            content = bib.read_text(encoding="utf-8", errors="ignore")
+            for entry in extract_bib_file_entries(content, arxiv_id=arxiv_id, version=version, target_keys=target_filter):
                 key = entry.citation_key.strip()
                 if not key:
                     continue
                 if key not in entries_map:
                     entries_map[key] = entry
                 else:
-                    # Unionize fields if bibitem has info that bib file lacked
+                    # Unionize fields into existing entry from .bbl
                     existing = entries_map[key]
                     if not existing.title and entry.title:
                         existing.title = entry.title
@@ -849,10 +885,10 @@ def extract_version_references(
         except Exception:
             continue
 
-    # 3. Check for .bbl files
-    for bbl in list(version_dir.glob("*.bbl")) + list(version_dir.glob("*/*.bbl")):
+    # 3. Parse reachable .tex files for inline \bibitem
+    for tex in tex_files:
         try:
-            content = bbl.read_text(encoding="utf-8", errors="ignore")
+            content = tex.read_text(encoding="utf-8", errors="ignore")
             for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
                 key = entry.citation_key.strip()
                 if not key:
@@ -861,12 +897,18 @@ def extract_version_references(
                     entries_map[key] = entry
                 else:
                     existing = entries_map[key]
-                    if not existing.doi and entry.doi:
-                        existing.doi = entry.doi
-                    if not existing.url and entry.url:
-                        existing.url = entry.url
+                    if not existing.title and entry.title:
+                        existing.title = entry.title
+                    if not existing.authors and entry.authors:
+                        existing.authors = entry.authors
                     if existing.year is None and entry.year is not None:
                         existing.year = entry.year
+                    if not existing.doi and entry.doi:
+                        existing.doi = entry.doi
+                    if not existing.journal and entry.journal:
+                        existing.journal = entry.journal
+                    if not existing.url and entry.url:
+                        existing.url = entry.url
         except Exception:
             continue
 
