@@ -66,10 +66,30 @@ def _paper_id(value: Any) -> str:
     return canonical
 
 
-def _status_record(raw_dir: Path, paper_id: str, version: str, *, check_hashes: bool = True) -> dict | None:
+def _status_record(
+    raw_dir: Path,
+    paper_id: str,
+    version: str,
+    *,
+    check_hashes: bool = True,
+    alt_raw_dir: Path | None = None,
+) -> dict | None:
     """Verify one known target, without scanning any other legacy raw folder."""
     target = raw_dir / paper_id / version
     if not target.exists() and not target.is_symlink():
+        if alt_raw_dir is not None:
+            alt_target = alt_raw_dir / paper_id / version
+            if alt_target.is_dir() and not alt_target.is_symlink():
+                alt_marker = alt_target / _MARKER
+                if alt_marker.is_file() and not alt_marker.is_symlink():
+                    try:
+                        payload = json.loads(alt_marker.read_text(encoding="utf-8"))
+                        if payload.get("arxiv_id") == paper_id and payload.get("version") == version:
+                            status = payload.get("status")
+                            if status in {"success", "pdf_only"}:
+                                return {"status": status, "marker": payload}
+                    except Exception:
+                        pass
         return None
     if target.is_symlink() or not target.is_dir():
         return {"status": "conflict", "error": "destination is not a regular directory"}
@@ -233,6 +253,8 @@ def _request_source(
         except requests.RequestException as exc:
             error = f"Network failure: {exc}"
         if attempt + 1 < attempts:
+            if code == 429 and retry_after is None and attempt >= 1:
+                return "failed", b"", "", error
             delay = retry_after if retry_after is not None else min(2 ** (attempt + 1), 60)
             time.sleep(max(config.ARXIV_MIN_INTERVAL, delay) + random.uniform(0, 0.5))
         else:
@@ -295,6 +317,7 @@ def plan_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     check_hashes: bool = True,
+    alt_raw_dir: str | Path | None = None,
 ) -> dict:
     """Plan attempts using verified vN directories and the last manifest event.
 
@@ -302,6 +325,7 @@ def plan_version_downloads(
     explicitly retried. Failed requests obey a persisted recovery cooldown.
     """
     data = Path(data_dir)
+    alt_raw = Path(alt_raw_dir) if alt_raw_dir is not None else None
     papers_path = data / "papers.jsonl"
     if not papers_path.is_file():
         raise FileNotFoundError(f"Metadata not found: {papers_path}")
@@ -324,7 +348,7 @@ def plan_version_downloads(
             counts["invalid_versions"] += 1
             continue
         for version in versions:
-            current = _status_record(data / "raw", paper_id, version, check_hashes=check_hashes)
+            current = _status_record(data / "raw", paper_id, version, check_hashes=check_hashes, alt_raw_dir=alt_raw)
             counts["expected_versions"] += 1
             if current and current["status"] in {"success", "pdf_only"}:
                 counts["verified_existing"] += 1
@@ -373,6 +397,7 @@ def run_version_downloads(
     retry_errors: bool = False,
     retry_not_found: bool = False,
     check_hashes: bool = True,
+    alt_raw_dir: str | Path | None = None,
 ) -> dict:
     """Process only NEW vN directories; dry-run by default. No legacy mutations.
 
@@ -387,14 +412,15 @@ def run_version_downloads(
     if max_downloads < 0:
         raise ValueError("max_downloads must be >= 0")
     data = Path(data_dir)
+    alt_raw = Path(alt_raw_dir) if alt_raw_dir is not None else None
     plan = plan_version_downloads(
         data, ids=ids, retry_errors=retry_errors, retry_not_found=retry_not_found,
-        check_hashes=check_hashes,
+        check_hashes=check_hashes, alt_raw_dir=alt_raw,
     )
     print("[Versions] Plan:", plan["summary"], flush=True)
     if dry_run:
         print("[Versions] DRY RUN: no download and no Drive changes.", flush=True)
-        return {"dry_run": True, "plan": plan, "processed": [], "summary": {"downloaded": 0}}
+        return {"dry_run": True, "plan": plan, "processed": [], "retry_queue": [], "summary": {"downloaded": 0}}
     raw = data / "raw"
     if raw.is_symlink() or (raw.exists() and not raw.is_dir()):
         raise ValueError("Unsafe raw directory")
@@ -403,6 +429,7 @@ def run_version_downloads(
         raise ValueError("Scratch must be a real local directory, not Drive")
     limiter = utils.RateLimiter(max(config.ARXIV_MIN_INTERVAL, min_interval))
     events = []
+    retry_queue: list[dict[str, Any]] = []
     counts = Counter()
     attempts = 0
     total_candidates = plan["summary"].get("to_download", 0)
@@ -416,7 +443,7 @@ def run_version_downloads(
         if max_downloads and attempts >= max_downloads:
             break
         # Recheck immediately before each network request (resume, crash safety).
-        current = _status_record(raw, paper_id, version, check_hashes=False)
+        current = _status_record(raw, paper_id, version, check_hashes=False, alt_raw_dir=alt_raw)
         if current is not None:
             counts["conflicts" if current["status"] == "conflict" else "already_present"] += 1
             continue
@@ -458,6 +485,17 @@ def run_version_downloads(
         # Append event only after publication; a later run can recover from the marker.
         recovery.durable_append(data / "versions_manifest.jsonl", event)
         events.append(event)
+        if event["status"] == "failed" and (
+            "429" in str(event.get("error", ""))
+            or event.get("error_type") == "transient"
+            or "Connection" in str(event.get("error", ""))
+            or "Network" in str(event.get("error", ""))
+        ):
+            retry_queue.append({
+                "arxiv_id": paper_id,
+                "version": version,
+                "error": event["error"],
+            })
         counts[event["status"]] += 1
         print(f"[Versions] {paper_id}/{version}: {event['status']} "
               f"({event['download_time_sec']:.1f}s) {event['error'][:130]}", flush=True)
@@ -469,4 +507,4 @@ def run_version_downloads(
                 print(f"[Versions] WARNING: progress callback failed: {exc}", flush=True)
     counts["network_attempts"] = attempts
     counts["remaining_candidates"] = plan["summary"].get("to_download", 0) - attempts
-    return {"dry_run": False, "plan": plan, "processed": events, "summary": dict(counts)}
+    return {"dry_run": False, "plan": plan, "processed": events, "retry_queue": retry_queue, "summary": dict(counts)}
