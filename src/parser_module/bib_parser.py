@@ -289,7 +289,7 @@ def extract_year(text: str) -> Optional[int]:
 # --- \\bibitem Parsing -------------------------------------------------------
 
 _BIBITEM_REGEX = re.compile(
-    r"\\bibitem\s*(?:\[[^\]]*\])?(?:\s*%.*?\n)*\s*\{([^}]+)\}",
+    r"\\bibitem\s*(?:\[[^\]]*\])?(?:\s*%.*?\n)*\s*\{([^}]*)\}",
     re.MULTILINE,
 )
 _QUOTE_TITLE_REGEX = re.compile(r"(?:``|\"|“)(.*?)(?:’’|''|\"|”)", re.DOTALL)
@@ -355,6 +355,8 @@ def extract_bibitem_entries(
     entries: list[BibtexEntry] = []
     for idx, match in enumerate(matches):
         key = match.group(1).strip()
+        if not key:
+            key = f"ref_{idx + 1}"
         start = match.end()
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(search_text)
         item_raw = search_text[start:end].strip()
@@ -425,6 +427,32 @@ def extract_bibitem_entries(
             elif len(blocks) == 1 and not title:
                 title = clean_latex_text(blocks[0])
 
+        # Check for APA / standard Author (Year). Title. Venue. pattern
+        if not title:
+            item_clean_one_line = re.sub(r"%.*", "", item_raw)
+            item_clean_one_line = re.sub(r"\s+", " ", item_clean_one_line).strip()
+            # Match Author(s) (Year). Title (which may include parens like (No. 123)). Venue.
+            m_apa = re.match(
+                r"^(.*?)\s*\((1[89]\d{2}|20\d{2}[a-z]?)\)\.\s*(.+?\))\.\s*(.*)$",
+                item_clean_one_line,
+            )
+            if not m_apa:
+                m_apa = re.match(
+                    r"^(.*?)\s*\((1[89]\d{2}|20\d{2}[a-z]?)\)\.\s*([^.]+?)\.\s*(.*)$",
+                    item_clean_one_line,
+                )
+            if m_apa:
+                if not authors:
+                    authors = parse_author_list(m_apa.group(1))
+                if year is None:
+                    try:
+                        year = int(m_apa.group(2)[:4])
+                    except (ValueError, TypeError):
+                        pass
+                title = clean_latex_text(m_apa.group(3))
+                if not journal:
+                    journal = clean_latex_text(m_apa.group(4) or "")
+
         # If title not found via \newblock, check for quotes
         if not title:
             q_match = _QUOTE_TITLE_REGEX.search(item_raw)
@@ -441,22 +469,36 @@ def extract_bibitem_entries(
                     else:
                         journal = clean_latex_text(suffix)
 
-        # Fallback: check for \emph / \textit / {\it ...} (title/booktitle)
+        # Fallback: check for \emph / \textit / {\it ...} (can be title or journal)
         if not title:
             emph_m = _EMPH_REGEX.search(item_raw)
             if emph_m:
-                title = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
-                prefix = item_raw[: emph_m.start()].strip().rstrip(",")
-                suffix = item_raw[emph_m.end() :].strip().lstrip(",")
-                if not authors:
-                    authors = parse_author_list(prefix)
-                if not journal:
-                    # Check if there is a second emph (e.g. \textit{Title}, in \textit{Journal})
-                    second_emph = _EMPH_REGEX.search(suffix)
-                    if second_emph:
-                        journal = clean_latex_text(second_emph.group(1) or second_emph.group(2) or second_emph.group(3) or "")
-                    else:
-                        journal = clean_latex_text(suffix)
+                emph_text = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
+                prefix = item_raw[: emph_m.start()].strip().rstrip(",.")
+                suffix = item_raw[emph_m.end() :].strip().lstrip(",.")
+
+                # Check if prefix contains sentence break (Authors. Title.)
+                # Negative lookbehind (?<!\b[A-Z]) avoids breaking on initials like 'Y. Antolin' or 'M. Blifstein'
+                parts = re.split(r"(?<!\b[A-Z])\.\s+", prefix)
+                if len(parts) >= 2:
+                    # Case 1: Standard format -> Authors. Title. \emph{Journal/Booktitle}
+                    if not authors:
+                        authors = parse_author_list(parts[0])
+                    title = clean_latex_text(". ".join(parts[1:]))
+                    if not journal:
+                        journal = emph_text
+                else:
+                    # Case 2: Math/Physics format -> Authors, \textit{Title}, Venue/Journal in suffix
+                    if not authors:
+                        authors = parse_author_list(prefix)
+                    title = emph_text
+                    if not journal:
+                        # Check if there is a second emph in suffix
+                        second_emph = _EMPH_REGEX.search(suffix)
+                        if second_emph:
+                            journal = clean_latex_text(second_emph.group(1) or second_emph.group(2) or second_emph.group(3) or "")
+                        else:
+                            journal = clean_latex_text(suffix)
             else:
                 # Fallback to sentence split
                 sentences = [
@@ -824,9 +866,16 @@ def find_compilation_files(version_dir: Path) -> tuple[list[Path], list[Path]]:
             if ref in bib_map and bib_map[ref] not in bib_files:
                 bib_files.append(bib_map[ref])
 
-    # If no referenced bib files matched or none referenced, include any found in dir
+    # If no referenced bib files matched or none referenced:
+    # Only fall back to all .bib files if the document does NOT contain an inline thebibliography environment.
+    # Otherwise, redundant auxiliary .bib files (not referenced via \bibliography) should be ignored.
     if not bib_files and all_bib:
-        bib_files.extend(all_bib)
+        has_inline_bib = any(
+            bool(re.search(r"\\begin\{thebibliography\}", t.read_text(encoding="utf-8", errors="ignore")))
+            for t in reachable_tex if t.is_file()
+        )
+        if not has_inline_bib:
+            bib_files.extend(all_bib)
 
     return reachable_tex, bib_files
 
@@ -858,11 +907,13 @@ def extract_version_references(
         except Exception:
             continue
 
-    # 2. Parse .bib files (filtering entries if cited_keys is known or bib is large)
+    # 2. Parse .bib files
+    # Only filter entries if the .bib file is massive (> 500KB, e.g. ACL Anthology .bib)
+    # to avoid parsing thousands of unneeded entries while preserving full references for normal papers.
     for bib in bib_files:
         try:
-            is_large = bib.stat().st_size > 1024 * 1024  # > 1MB
-            target_filter = cited_keys if (cited_keys or is_large) else None
+            is_large = bib.stat().st_size > 500 * 1024  # > 500KB
+            target_filter = cited_keys if (is_large and cited_keys) else None
             content = bib.read_text(encoding="utf-8", errors="ignore")
             for entry in extract_bib_file_entries(content, arxiv_id=arxiv_id, version=version, target_keys=target_filter):
                 key = entry.citation_key.strip()
