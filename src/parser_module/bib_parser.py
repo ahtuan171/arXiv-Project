@@ -112,6 +112,8 @@ _LATEX_COMMAND_CONTENT = re.compile(
     r"\\(?:textbf|textit|emph|underline|textsc|textsl|texttt|textmd|textnormal)\{([^}]*)\}"
 )
 _LATEX_FONT_SWITCH = re.compile(r"\{\\(?:em|it|bf|sl|sc|rm)\s+([^}]*)\}")
+_BIB_TWO_ARG_UNWRAP = re.compile(r"\\(?:bibinfo|bibfield)\*?\{[^{}]*\}\{([^{}]*)\}")
+_BIB_ONE_ARG_UNWRAP = re.compile(r"\\(?:bibfnamefont|bibnamefont|citenamefont|person|showarticletitle)\*?\{([^{}]*)\}")
 _URL_HREF_REGEX = re.compile(r"\\href\{([^}]+)\}(?:\{[^}]*\})?")
 _URL_CMD_REGEX = re.compile(r"\\url\{([^}]+)\}")
 _RAW_URL_REGEX = re.compile(r"https?://[^\s{}<>\"]+")
@@ -157,10 +159,13 @@ def clean_latex_text(text: str) -> str:
         lines.append(line)
     cleaned = " ".join(lines)
 
-    for _ in range(3):
+    for _ in range(4):
         prev = cleaned
         cleaned = _LATEX_COMMAND_CONTENT.sub(r"\1", cleaned)
         cleaned = _LATEX_FONT_SWITCH.sub(r"\1", cleaned)
+        cleaned = _BIB_ONE_ARG_UNWRAP.sub(r"\1", cleaned)
+        cleaned = _BIB_TWO_ARG_UNWRAP.sub(r"\1", cleaned)
+        cleaned = re.sub(r"\{([^{}]*)\}", r"\1", cleaned)
         if cleaned == prev:
             break
 
@@ -284,11 +289,13 @@ def extract_year(text: str) -> Optional[int]:
 # --- \\bibitem Parsing -------------------------------------------------------
 
 _BIBITEM_REGEX = re.compile(
-    r"\\bibitem(?:\[[^\]]*\])?\{([^}]+)\}",
+    r"\\bibitem\s*(?:\[[^\]]*\])?(?:\s*%.*?\n)*\s*\{([^}]+)\}",
     re.MULTILINE,
 )
 _QUOTE_TITLE_REGEX = re.compile(r"(?:``|\"|“)(.*?)(?:’’|''|\"|”)", re.DOTALL)
-_EMPH_REGEX = re.compile(r"\\(?:emph|textit)\{([^}]*)\}|\{\\em\s+([^}]*)\}")
+_EMPH_REGEX = re.compile(
+    r"\\(?:emph|textit)\{([^}]*)\}|\{\\em\s+([^}]*)\}|\{\\it\s+([^}]*)\}"
+)
 
 
 def _infer_entry_type(journal: str, text: str) -> str:
@@ -352,6 +359,11 @@ def extract_bibitem_entries(
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(search_text)
         item_raw = search_text[start:end].strip()
 
+        # Safeguard: cap raw item length to avoid catastrophic runaway when format is corrupt
+        MAX_ITEM_RAW_LEN = 4000
+        if len(item_raw) > MAX_ITEM_RAW_LEN:
+            item_raw = item_raw[:MAX_ITEM_RAW_LEN]
+
         doi = extract_doi(item_raw)
         url = extract_url(item_raw)
         year = extract_year(item_raw)
@@ -361,16 +373,56 @@ def extract_bibitem_entries(
         authors: list[str] = []
         journal = ""
 
+        # Check for \bibinfo{title} or \showarticletitle
+        m_bibinfo_title = re.search(r"\\(?:bibinfo\{title\}|showarticletitle)\{([^}]+)\}", item_raw)
+        if m_bibinfo_title:
+            title = clean_latex_text(m_bibinfo_title.group(1))
+
+        # Check for \bibinfo{journal} or \bibfield{journal}
+        m_bibinfo_journal = re.search(r"\\(?:bibinfo\{journal\}|bibfield\{journal\})\s*(?:\{[^}]*\})?\{([^}]+)\}", item_raw)
+        if m_bibinfo_journal:
+            journal = clean_latex_text(m_bibinfo_journal.group(1))
+
+        # Check for structured \bibinfo{author} or \bibinfo{person}
+        if r"\bibinfo{author}" in item_raw or r"\bibinfo{person}" in item_raw:
+            author_names = []
+            for tag in (r"\bibinfo{author}", r"\bibinfo{person}"):
+                cur_pos = 0
+                while True:
+                    found = item_raw.find(tag, cur_pos)
+                    if found == -1:
+                        break
+                    b_start = item_raw.find("{", found + len(tag))
+                    if b_start == -1:
+                        break
+                    depth = 1
+                    i = b_start + 1
+                    while i < len(item_raw) and depth > 0:
+                        if item_raw[i] == "{" and (i == 0 or item_raw[i - 1] != "\\"):
+                            depth += 1
+                        elif item_raw[i] == "}" and (i == 0 or item_raw[i - 1] != "\\"):
+                            depth -= 1
+                        i += 1
+                    b_content = item_raw[b_start + 1 : i - 1 if depth == 0 else i]
+                    name = clean_latex_text(b_content).strip()
+                    if name and name.lower() not in ("and", "&", "others", "et al"):
+                        author_names.append(name)
+                    cur_pos = i
+            if author_names:
+                authors = author_names
+
         if r"\newblock" in item_raw:
             blocks = [b.strip() for b in re.split(r"\\newblock", item_raw) if b.strip()]
             if len(blocks) >= 2:
-                authors = parse_author_list(blocks[0])
-                title = clean_latex_text(blocks[1])
-                if len(blocks) >= 3:
+                if not authors:
+                    authors = parse_author_list(blocks[0])
+                if not title:
+                    title = clean_latex_text(blocks[1])
+                if len(blocks) >= 3 and not journal:
                     journal = clean_latex_text(blocks[2])
                     # Clean out leading "In " or "in " from venue
                     journal = re.sub(r"^(?:in\s+)+", "", journal, flags=re.IGNORECASE).strip()
-            elif len(blocks) == 1:
+            elif len(blocks) == 1 and not title:
                 title = clean_latex_text(blocks[0])
 
         # If title not found via \newblock, check for quotes
@@ -378,28 +430,33 @@ def extract_bibitem_entries(
             q_match = _QUOTE_TITLE_REGEX.search(item_raw)
             if q_match:
                 title = clean_latex_text(q_match.group(1))
-                prefix = item_raw[: q_match.start()]
-                authors = parse_author_list(prefix)
+                if not authors:
+                    prefix = item_raw[: q_match.start()]
+                    authors = parse_author_list(prefix)
                 suffix = item_raw[q_match.end() :]
-                emph_m = _EMPH_REGEX.search(suffix)
-                if emph_m:
-                    journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
-                else:
-                    journal = clean_latex_text(suffix)
+                if not journal:
+                    emph_m = _EMPH_REGEX.search(suffix)
+                    if emph_m:
+                        journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
+                    else:
+                        journal = clean_latex_text(suffix)
 
-        # Fallback: check for \emph (journal) and split around it
+        # Fallback: check for \emph / \textit / {\it ...} (title/booktitle)
         if not title:
             emph_m = _EMPH_REGEX.search(item_raw)
             if emph_m:
-                journal = clean_latex_text(emph_m.group(1) or emph_m.group(2) or "")
-                prefix = item_raw[: emph_m.start()].strip()
-                # Split prefix by sentence/dot or year
-                sentences = [s.strip() for s in re.split(r"\.\s+", prefix) if s.strip()]
-                if len(sentences) >= 2:
-                    authors = parse_author_list(sentences[0])
-                    title = clean_latex_text(". ".join(sentences[1:]))
-                elif len(sentences) == 1:
-                    title = clean_latex_text(sentences[0])
+                title = clean_latex_text(emph_m.group(1) or emph_m.group(2) or emph_m.group(3) or "")
+                prefix = item_raw[: emph_m.start()].strip().rstrip(",")
+                suffix = item_raw[emph_m.end() :].strip().lstrip(",")
+                if not authors:
+                    authors = parse_author_list(prefix)
+                if not journal:
+                    # Check if there is a second emph (e.g. \textit{Title}, in \textit{Journal})
+                    second_emph = _EMPH_REGEX.search(suffix)
+                    if second_emph:
+                        journal = clean_latex_text(second_emph.group(1) or second_emph.group(2) or second_emph.group(3) or "")
+                    else:
+                        journal = clean_latex_text(suffix)
             else:
                 # Fallback to sentence split
                 sentences = [
@@ -408,9 +465,10 @@ def extract_bibitem_entries(
                     if s.strip()
                 ]
                 if len(sentences) >= 2:
-                    authors = parse_author_list(sentences[0])
+                    if not authors:
+                        authors = parse_author_list(sentences[0])
                     title = sentences[1]
-                    if len(sentences) >= 3:
+                    if len(sentences) >= 3 and not journal:
                         journal = ". ".join(sentences[2:])
                 elif len(sentences) == 1:
                     title = sentences[0]
@@ -443,6 +501,7 @@ def extract_bibitem_entries(
 # --- .bib File Parsing -------------------------------------------------------
 
 _BIB_ENTRY_START = re.compile(r"@([a-zA-Z]+)\s*\{", re.MULTILINE)
+_FIELD_ASSIGN_RE = re.compile(r"([a-zA-Z0-9_\-]+)\s*=")
 
 
 def _parse_bib_fields(body: str) -> dict[str, str]:
@@ -458,8 +517,8 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
         if i >= n:
             break
 
-        # Read field name
-        name_match = re.match(r"([a-zA-Z0-9_\-]+)\s*=", body[i:])
+        # Read field name using match with pos to avoid substring allocations
+        name_match = _FIELD_ASSIGN_RE.match(body, i)
         if not name_match:
             # Skip until next comma or line
             while i < n and body[i] not in ",\n":
@@ -469,7 +528,7 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
             continue
 
         field_name = name_match.group(1).lower().strip()
-        i += name_match.end()
+        i = name_match.end()
 
         # Skip whitespace before value
         while i < n and body[i] in " \t\r\n":
@@ -519,12 +578,37 @@ def _parse_bib_fields(body: str) -> dict[str, str]:
     return fields
 
 
+def extract_cited_keys_from_tex(tex_files: Sequence[Path]) -> set[str]:
+    """Extract all cited keys from reachable LaTeX source files."""
+    cited_keys: set[str] = set()
+    cite_pattern = re.compile(r"\\(?:cite[a-zA-Z]*)\*?(?:\[[^\]]*\])*\{([^}]+)\}")
+    for tex in tex_files:
+        try:
+            content = tex.read_text(encoding="utf-8", errors="ignore")
+            # Strip comments to ignore commented-out citations
+            uncommented = _strip_comments_from_tex(content)
+            for m in cite_pattern.finditer(uncommented):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        cited_keys.add(k)
+        except Exception:
+            continue
+    return cited_keys
+
+
 def extract_bib_file_entries(
     bib_content: str,
     arxiv_id: str = "",
     version: Optional[str] = None,
+    target_keys: Optional[set[str]] = None,
 ) -> list[BibtexEntry]:
-    """Parse standard BibTeX entries from .bib file content."""
+    """Parse standard BibTeX entries from .bib file content.
+    
+    If target_keys is provided, entries whose citation_key is not in target_keys
+    are skipped quickly without full field parsing to dramatically accelerate processing
+    for massive bibliography files (such as ACL Anthology .bib).
+    """
     if not bib_content:
         return []
 
@@ -563,6 +647,10 @@ def extract_bib_file_entries(
         key, body = entry_raw.split(",", 1)
         citation_key = key.strip()
         if not citation_key:
+            continue
+
+        # Fast filter: skip entries not cited if target_keys is specified
+        if target_keys is not None and citation_key not in target_keys:
             continue
 
         fields = _parse_bib_fields(body)
@@ -754,29 +842,36 @@ def extract_version_references(
 
     entries_map: dict[str, BibtexEntry] = {}
 
-    # 1. Parse .bib files (typically the most structured data)
-    for bib in bib_files:
+    # Extract all citation keys actually referenced in reachable LaTeX files
+    cited_keys = extract_cited_keys_from_tex(tex_files)
+
+    # 1. Parse .bbl files first if present (most accurate representation of rendered PDF)
+    bbl_files = list(version_dir.glob("*.bbl")) + list(version_dir.glob("*/*.bbl"))
+    for bbl in bbl_files:
         try:
-            content = bib.read_text(encoding="utf-8", errors="ignore")
-            for entry in extract_bib_file_entries(content, arxiv_id=arxiv_id, version=version):
+            content = bbl.read_text(encoding="utf-8", errors="ignore")
+            for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
                 key = entry.citation_key.strip()
                 if key:
                     entries_map[key] = entry
+                    cited_keys.add(key)
         except Exception:
             continue
 
-    # 2. Parse reachable .tex files
-    for tex in tex_files:
+    # 2. Parse .bib files (filtering entries if cited_keys is known or bib is large)
+    for bib in bib_files:
         try:
-            content = tex.read_text(encoding="utf-8", errors="ignore")
-            for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
+            is_large = bib.stat().st_size > 1024 * 1024  # > 1MB
+            target_filter = cited_keys if (cited_keys or is_large) else None
+            content = bib.read_text(encoding="utf-8", errors="ignore")
+            for entry in extract_bib_file_entries(content, arxiv_id=arxiv_id, version=version, target_keys=target_filter):
                 key = entry.citation_key.strip()
                 if not key:
                     continue
                 if key not in entries_map:
                     entries_map[key] = entry
                 else:
-                    # Unionize fields if bibitem has info that bib file lacked
+                    # Unionize fields into existing entry from .bbl
                     existing = entries_map[key]
                     if not existing.title and entry.title:
                         existing.title = entry.title
@@ -793,10 +888,10 @@ def extract_version_references(
         except Exception:
             continue
 
-    # 3. Check for .bbl files
-    for bbl in list(version_dir.glob("*.bbl")) + list(version_dir.glob("*/*.bbl")):
+    # 3. Parse reachable .tex files for inline \bibitem
+    for tex in tex_files:
         try:
-            content = bbl.read_text(encoding="utf-8", errors="ignore")
+            content = tex.read_text(encoding="utf-8", errors="ignore")
             for entry in extract_bibitem_entries(content, arxiv_id=arxiv_id, version=version):
                 key = entry.citation_key.strip()
                 if not key:
@@ -805,12 +900,18 @@ def extract_version_references(
                     entries_map[key] = entry
                 else:
                     existing = entries_map[key]
-                    if not existing.doi and entry.doi:
-                        existing.doi = entry.doi
-                    if not existing.url and entry.url:
-                        existing.url = entry.url
+                    if not existing.title and entry.title:
+                        existing.title = entry.title
+                    if not existing.authors and entry.authors:
+                        existing.authors = entry.authors
                     if existing.year is None and entry.year is not None:
                         existing.year = entry.year
+                    if not existing.doi and entry.doi:
+                        existing.doi = entry.doi
+                    if not existing.journal and entry.journal:
+                        existing.journal = entry.journal
+                    if not existing.url and entry.url:
+                        existing.url = entry.url
         except Exception:
             continue
 

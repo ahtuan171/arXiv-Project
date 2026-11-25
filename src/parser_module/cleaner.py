@@ -91,6 +91,9 @@ def clean_latex_markup(text: str) -> str:
     - Strips layout commands: \noindent, \newpage, \clearpage
     - Strips \label{...} from body text
     """
+    # Strip null bytes and replacement characters
+    text = text.replace("\x00", "").replace("\ufffd", "")
+
     # Placement options in environments: e.g. \begin{figure}[htpb] or \begin{table}[!t]
     text = re.sub(r"(\\begin\{(?:figure|figure\*|table|table\*)\})\s*\[[^\]]*\]", r"\1", text)
 

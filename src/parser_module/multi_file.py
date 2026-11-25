@@ -18,6 +18,17 @@ _INCLUDE_RE = re.compile(
 )
 
 
+def _read_tex_file(path: Path) -> str:
+    """Read a .tex file trying UTF-8 first, then cp1252/latin-1 to avoid U+FFFD."""
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            text = path.read_text(encoding=enc)
+            return text.replace("\x00", "")
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="ignore").replace("\x00", "")
+
+
 def find_root_tex_file(source_dir: Path) -> Path | None:
     """Find the root .tex file containing \\documentclass in the source directory.
     
@@ -32,7 +43,7 @@ def find_root_tex_file(source_dir: Path) -> Path | None:
 
     for tex_file in tex_files:
         try:
-            content = tex_file.read_text(encoding="utf-8", errors="replace")
+            content = _read_tex_file(tex_file)
             # Strip comments first so % \documentclass is ignored
             cleaned = strip_latex_comments(content)
             if re.search(r"\\(?:documentclass|documentstyle)\b", cleaned):
@@ -55,7 +66,7 @@ def find_root_tex_file(source_dir: Path) -> Path | None:
     # Next check which one has \begin{document}
     for c in candidates:
         try:
-            content = strip_latex_comments(c.read_text(encoding="utf-8", errors="replace"))
+            content = strip_latex_comments(_read_tex_file(c))
             if r"\begin{document}" in content:
                 return c
         except Exception:
@@ -101,7 +112,7 @@ def gather_compilation_path(root_tex: Path) -> list[Path]:
         order.append(canonical)
 
         try:
-            content = current_file.read_text(encoding="utf-8", errors="replace")
+            content = _read_tex_file(current_file)
             # Strip comments line by line so commented out \input is ignored
             uncommented = strip_latex_comments(content)
             for m in _INCLUDE_RE.finditer(uncommented):
@@ -131,7 +142,7 @@ def merge_tex_sources(root_tex: Path) -> str:
         visited.add(canonical)
 
         try:
-            raw_content = file_path.read_text(encoding="utf-8", errors="replace")
+            raw_content = _read_tex_file(file_path)
         except Exception as exc:
             log.warning("Could not read %s during inlining: %s", file_path, exc)
             return ""

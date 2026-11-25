@@ -35,7 +35,7 @@ HEADING_LEVELS = {
 }
 
 _HEADING_RE = re.compile(
-    r"\\(?P<cmd>part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\s*\{(?P<title>[^}]+)\}"
+    r"\\(?P<cmd>part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\s*(?:\[[^\]]*\]\s*)?\{"
 )
 
 _ENV_RE = re.compile(
@@ -154,11 +154,34 @@ def _extract_environment(text: str, start_pos: int, env_name: str) -> tuple[str,
     return text[start_pos:pos], pos
 
 
+def _extract_brace_arg(text: str, brace_start: int) -> tuple[str, int]:
+    """Extract content inside balanced {...} starting at brace_start."""
+    if brace_start < 0 or brace_start >= len(text) or text[brace_start] != "{":
+        return "", brace_start + 1
+    depth = 0
+    i = brace_start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start + 1 : i], i + 1
+        i += 1
+    return text[brace_start + 1 :], n
+
+
 def _clean_caption(env_content: str) -> str:
     """Extract and clean \\caption{...} from figure/table environments."""
-    cap_match = re.search(r"\\caption\*?\{([^}]+)\}", env_content)
+    cap_match = re.search(r"\\caption\*?\s*(?:\[[^\]]*\]\s*)?\{", env_content)
     if cap_match:
-        return clean_latex_markup(cap_match.group(1))
+        raw_cap, _ = _extract_brace_arg(env_content, cap_match.end() - 1)
+        return clean_latex_markup(raw_cap)
     return clean_latex_markup(env_content)
 
 
@@ -253,6 +276,7 @@ class HierarchyBuilder:
         # Tokenize body into headings, environments, and prose sentences
         pos = 0
         n = len(body)
+        in_references_level: int | None = None
 
         while pos < n:
             next_heading = _HEADING_RE.search(body, pos)
@@ -269,8 +293,8 @@ class HierarchyBuilder:
                 event = ("env", next_env)
                 event_pos = next_env.start()
 
-            # Process prose preceding the event
-            if event_pos > pos:
+            # Process prose preceding the event (unless inside excluded References section)
+            if event_pos > pos and in_references_level is None:
                 prose = body[pos:event_pos]
                 cleaned_prose = clean_latex_markup(prose)
                 if cleaned_prose:
@@ -303,8 +327,23 @@ class HierarchyBuilder:
             kind, match = event
             if kind == "heading":
                 cmd = match.group("cmd")
-                title = clean_latex_markup(match.group("title"))
+                raw_title, heading_end = _extract_brace_arg(body, match.end() - 1)
+                title = clean_latex_markup(raw_title)
                 level = HEADING_LEVELS.get(cmd, 2)
+                pos = heading_end
+
+                if title.strip().lower() in {"references", "bibliography"}:
+                    in_references_level = level
+                    continue
+
+                if in_references_level is not None:
+                    if level <= in_references_level:
+                        in_references_level = None
+                    else:
+                        continue
+
+                if not title:
+                    continue
 
                 # Pop stack until top level is strictly smaller than this heading level
                 while len(stack) > 1 and stack[-1][0] >= level:
@@ -321,16 +360,19 @@ class HierarchyBuilder:
                 parent.children.append(heading_node)
                 stack.append((level, heading_node))
 
-                pos = match.end()
-
             elif kind == "env":
                 env_name = match.group("env")
                 env_text, end_pos = _extract_environment(body, match.start(), env_name)
+                pos = end_pos
+                if in_references_level is not None:
+                    continue
                 parent = current_parent()
 
                 if "figure" in env_name or "table" in env_name:
                     # Figures and tables are leaf elements
                     caption = _clean_caption(env_text)
+                    if not caption:
+                        continue
                     fig_node = HierarchyNode(
                         node_id=self._next_id("figure"),
                         kind="figure",
@@ -342,10 +384,13 @@ class HierarchyBuilder:
 
                 elif any(m in env_name for m in ["equation", "align", "gather", "multline"]):
                     # Block formulas are leaf elements
+                    cleaned_formula = clean_latex_markup(env_text)
+                    if not cleaned_formula:
+                        continue
                     formula_node = HierarchyNode(
                         node_id=self._next_id("formula"),
                         kind="formula",
-                        content=clean_latex_markup(env_text),
+                        content=cleaned_formula,
                         level=parent.level + 1,
                         parent_id=parent.node_id,
                     )
@@ -362,8 +407,6 @@ class HierarchyBuilder:
                     )
                     parent.children.append(list_node)
                     self._parse_items_in_list(env_text, list_node)
-
-                pos = end_pos
 
         return LaTeXHierarchyTree(root=root, arxiv_id=self.arxiv_id, version=self.version)
 
