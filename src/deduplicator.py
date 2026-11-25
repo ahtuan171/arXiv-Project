@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re as _re
 import time
 from collections.abc import Iterable, Mapping
 from typing import Any, TypeAlias
@@ -54,12 +55,24 @@ def _string(value: Any) -> str:
     return "" if _missing(value) else str(value)
 
 
-def _version(value: Any) -> str:
-    """Normalise numeric version labels to the conventional ``vN`` form."""
+def _version(value: Any) -> int | None:
+    """Normalise a version label to a plain ``int`` as required by Schema v2.
+
+    Accepts inputs like ``1``, ``"1"``, ``"v1"``, ``"v2"``.
+    Returns ``None`` for missing/unparseable values.
+    Internal helper ``_version_key()`` produces the ``"vN"`` string used only
+    as a lookup key inside ``deduplicate_paper``.
+    """
     if _missing(value):
-        return ""
-    text = str(value).strip()
-    return f"v{text}" if text.isdigit() else text
+        return None
+    digits = _re.sub(r"\D", "", str(value))
+    return int(digits) if digits else None
+
+
+def _version_key(value: Any) -> str:
+    """Return the ``"vN"`` string key used internally for ID remapping."""
+    v = _version(value)
+    return f"v{v}" if v is not None else ""
 
 
 def _authors(value: Any) -> list[Any]:
@@ -166,27 +179,31 @@ def deduplicate_paper(
                 })
             old_id = _string(row.get("element_id"))
             if old_id:
-                version = _version(row.get("version"))
-                if version:
-                    id_map[(version, old_id)] = element_id
+                vkey = _version_key(row.get("version"))
+                if vkey:
+                    id_map[(vkey, old_id)] = element_id
                 fallback_id_map[old_id] = element_id
             fallback_id_map.setdefault(str(position), element_id)
 
         hierarchy: list[dict[str, Any]] = []
         for row in hierarchy_rows:
-            version = _version(row.get("version"))
+            vkey = _version_key(row.get("version"))
+            version_int = _version(row.get("version"))
             old_element = _string(row.get("element_id"))
             old_parent = _string(row.get("parent_id"))
-            new_element = id_map.get((version, old_element)) or fallback_id_map.get(
+            new_element = id_map.get((vkey, old_element)) or fallback_id_map.get(
                 old_element, old_element
             )
             new_parent = (
-                (id_map.get((version, old_parent)) or
+                (id_map.get((vkey, old_parent)) or
                  fallback_id_map.get(old_parent, old_parent))
                 if old_parent else ""
             )
+            # Skip self-loop edges (element_id == parent_id) — fix for 228 detected loops
+            if new_element and new_parent and new_element == new_parent:
+                continue
             hierarchy.append({
-                "arxiv_id": arxiv_id, "version": version,
+                "arxiv_id": arxiv_id, "version": version_int,
                 "element_id": new_element, "parent_id": new_parent,
             })
 
