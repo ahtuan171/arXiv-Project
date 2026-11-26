@@ -254,6 +254,14 @@ class HierarchyBuilder:
         )
         body = re.sub(r"\\bibliography\{[^}]*\}", "", body)
 
+        # Exclude literal source-code environments so code '$' symbols are not parsed as math prose
+        body = re.sub(
+            r"\\begin\{(verbatim\*?|lstlisting|minted|Code|code)\}.*?\\end\{\1\}",
+            "",
+            body,
+            flags=re.DOTALL,
+        )
+
         # 4. Math normalization
         body = normalize_math(body)
 

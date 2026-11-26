@@ -171,7 +171,7 @@ def deduplicate_paper(
             key = (kind, content)
             element_id = element_index.get(key)
             if element_id is None:
-                element_id = f"{arxiv_id}::element_{len(elements) + 1}"
+                element_id = f"{arxiv_id}#element_{len(elements) + 1}"
                 element_index[key] = element_id
                 elements.append({
                     "element_id": element_id, "arxiv_id": arxiv_id,

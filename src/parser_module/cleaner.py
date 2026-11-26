@@ -104,11 +104,11 @@ def clean_latex_markup(text: str) -> str:
     text = re.sub(r"\\(?:centering|raggedright|raggedleft|noindent|newpage|clearpage)\b", "", text)
 
     # Remove spacing commands
-    text = re.sub(r"\\(?:vspace\*?|hspace\*?)\{[^}]*\}", "", text)
+    text = re.sub(r"\\(?:vspace\*?|hspace\*?)\s*\{[^}]*\}", "", text)
     text = re.sub(r"\\(?:bigskip|medskip|smallskip|newline|linebreak)\b", "", text)
 
     # Remove \label{...} commands
-    text = re.sub(r"\\label\{[^}]*\}", "", text)
+    text = re.sub(r"\\label\s*\{[^}]*\}", "", text)
 
     # Normalize multiple whitespace characters (excluding inside special blocks if needed)
     text = re.sub(r"[ \t]+", " ", text)
