@@ -35,3 +35,8 @@ docs/superpowers/
 # Automated tests
 tests/
 
+# Helper scripts not used in milestone notebooks
+src/scripts/safe_scratch.py
+src/scripts/update_notebook.py
+src/scripts/jsonl_to_parquet.py
+
